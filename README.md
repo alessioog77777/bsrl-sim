@@ -35,14 +35,14 @@ everything. Game files are not included: you supply them.
 
 - Linux or WSL2 (developed on Ubuntu 24.04), Python 3.11+, PyTorch (CUDA or ROCm for real runs; CPU is fine for the
   self-checks).
-- The game build the host is made for (an APK you supply). `setup.sh` checks it against nirkt's checksum and never
-  downloads it.
+- The game build the host is made for. `setup.sh` downloads it once from nirkt's copy (or takes `APK=/path/to.apk`)
+  and checks it against nirkt's checksum.
 
 ## Setup
 
 ```bash
 git clone https://github.com/mlgdoggynoob/bsrl-sim && cd bsrl-sim
-APK=/path/to/nb_68.279_release_7c5c5152.apk ./setup.sh
+./setup.sh                  # or APK=/path/to/nb_68.279_release_7c5c5152.apk ./setup.sh
 source env.sh
 ```
 

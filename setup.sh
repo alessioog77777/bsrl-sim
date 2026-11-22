@@ -2,16 +2,19 @@
 # One-command setup: builds the battle host in deps/ (nirkt's code with this project's changes already applied), the
 # Python environment, and unpacks the game files. Safe to run again: every step skips what is already done.
 #
-#   APK=/path/to/nb_68.279_release_7c5c5152.apk ./setup.sh [--no-apt] [--no-python]
+#   ./setup.sh [--no-apt] [--no-python]
 #
 #   --no-apt      do not install system packages (you install the APT list below yourself)
 #   --no-python   do not create .venv (you manage numpy / torch / the requirements yourself)
-#   APK           the game build the host is made for (checked against deps/bulletlabels/native/LIBG_SHA256).
-#                 Only needed the first time; this script never downloads it.
+#   APK           a local copy of the game build the host is made for (checked against
+#                 deps/bulletlabels/native/LIBG_SHA256). Without it the build is downloaded once from APK_URL
+#                 into work/ (nirkt's copy, the link from nirkt's original setup.sh; not an official Null's Brawl host).
+#   APK_URL       where to download it from (default: nirkt's copy)
 #   SIM_VENV      where the venv goes (default .venv); TORCH_INDEX_URL picks the torch build (CUDA default, ROCm / CPU)
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")" && pwd); cd "$ROOT"
 BL=$ROOT/deps/bulletlabels; VENV=${SIM_VENV:-$ROOT/.venv}
+APK_URL=${APK_URL:-https://pub-3e0f25080eb949a08641fd278fad96d1.r2.dev/nb_68.279_release_7c5c5152.apk}
 APT=(gcc gcc-aarch64-linux-gnu libgles-dev libegl-dev ninja-build meson pkg-config flex bison libglib2.0-dev
      libpixman-1-dev zlib1g-dev libzstd-dev unzip xz-utils curl qemu-user python3-venv python3-pip)
 NOAPT=0; NOPY=0
@@ -40,14 +43,20 @@ fi
 
 say "game files ($BL/game)"
 if [ ! -f "$BL/game/lib/arm64-v8a/libg.so" ]; then
-  if [ -z "${APK:-}" ] || [ ! -f "$APK" ]; then
-    echo "Missing. Rerun with the game build the host is made for: APK=/path/to/the.apk ./setup.sh --no-apt"
-    echo "(its lib/arm64-v8a/libg.so must match deps/bulletlabels/native/LIBG_SHA256)"; exit 1
+  if [ -n "${APK:-}" ]; then
+    [ -f "$APK" ] || { echo "APK=$APK: no such file"; exit 1; }
+  else
+    APK=${SIM_WORK:-$ROOT/work}/$(basename "$APK_URL")
+    if [ ! -f "$APK" ]; then
+      echo "downloading $APK_URL"; mkdir -p "$(dirname "$APK")"
+      curl -fL --retry 3 -o "$APK.part" "$APK_URL" && mv "$APK.part" "$APK"
+    fi
   fi
   rm -rf "$BL/game" && mkdir -p "$BL/game" && unzip -q -o "$APK" 'lib/arm64-v8a/*' 'assets/*' -d "$BL/game"
 fi
 WANT=$(cut -d' ' -f1 "$BL/native/LIBG_SHA256"); HAVE=$(sha256sum "$BL/game/lib/arm64-v8a/libg.so" | cut -d' ' -f1)
-[ "$HAVE" = "$WANT" ] || { echo "wrong game build: libg.so sha256 $HAVE, the host needs $WANT"; exit 1; }
+[ "$HAVE" = "$WANT" ] || { rm -rf "$BL/game"   # so the next run unpacks again instead of keeping a bad build
+  echo "wrong game build: libg.so sha256 $HAVE, the host needs $WANT (delete or replace ${APK:-the APK})"; exit 1; }
 echo "game files ok"
 
 say "done"
