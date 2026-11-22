@@ -1,0 +1,27 @@
+# bsrl-sim: guide for coding agents
+
+RL environment + trainer for a top-down battle royale (see README.md). Python, numpy, PyTorch. Every module is flat at
+the repo root and is run as `python -m <module>` from the root after `source env.sh`.
+
+## Before you change anything
+- Read README.md (file map, setup) and the docstring at the top of the file you touch. The docstrings are the spec.
+- The battle host and nirkt's `nbpc` / `MAEnv` are external (NOTICE.md). Without them only the self-checks that
+  stay off the host run, and even those need `nbpc` importable. Don't vendor nirkt's code into this repo.
+- No game files, binaries, checkpoints, datasets or run outputs go into git (`.gitignore`).
+
+## Checks
+- Self-checks, no battle: `python -m obs_v5`, `python -m model`, `python -m fast_obs`, `python -m env_v5 --check`,
+  `python scorecard.py --check`, `python apply_noise.py --test`. Run the ones for the modules you touched.
+- Host checks (boot takes 60-90 s each, so batch your questions into one run): `python -m live_check`,
+  `python -m test_fast` (fast paths must stay bit-equal to the reference paths), `python -m train_ppo --run t --smoke`.
+- Every new module gets an assert self-check (`python -m <module>` or `--check`), like the existing ones.
+
+## Rules
+- The observation is a contract with whatever runs exported policies. Changing a shape, a class list, the slot layout or `cond` means bumping
+  `obs_v5.OBS_VERSION` and saying so in the PR. Old checkpoints must still load (zero-init new inputs, pad in
+  `load_state_dict`).
+- `fast_obs` / `fast_act` must match `obs_v5` / `model.act_stacked`: change both sides together, then run `test_fast`.
+- New trainer flags default to the current behaviour (off).
+- Keep docstrings current-state. Put the reason for a number in a short comment next to it.
+- Never run long GPU jobs or many host instances unless the person you work for asked for it.
+- Work on your own branch and open a pull request. Don't push to `main`.

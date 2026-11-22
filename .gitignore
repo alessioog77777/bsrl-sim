@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pt
+*.pth
+*.onnx
+*.npz
+runs/
+genmaps/
+HISTORY.md
+*.prof.txt
+.venv/
