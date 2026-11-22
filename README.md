@@ -6,10 +6,9 @@ classes, a set of detected entities with measured detector noise and latency, an
 testbed for training agents that have to act from imperfect perception, and policies trained here can run behind real
 vision models without retraining.
 
-This repository is the RL layer only. The battles themselves run in **nirkt's**
-[`bulletlabels`](https://github.com/nirkt/bulletlabels) host and [`nbrl-env`](https://github.com/nirkt/nbrl-env)
-(see [NOTICE.md](NOTICE.md)), which this code drives through its `MAEnv`. Neither that host nor any game file is
-included here, and nothing here runs without it.
+The battles run in **nirkt's** [`bulletlabels`](https://github.com/nirkt/bulletlabels) host and
+[`nbrl-env`](https://github.com/nirkt/nbrl-env) environment. Both come in as git submodules under `deps/`
+(see [NOTICE.md](NOTICE.md)), and `setup.sh` builds everything. Game files are not included: you supply them.
 
 ## What is here
 
@@ -28,29 +27,29 @@ included here, and nothing here runs without it.
 | `viz.html` | Run dashboard: training / eval curves, action histograms, battle replay with the policy's view. |
 | `hud_ui.npy` | Measured share of each tile hidden by the game HUD (used by the noisy observation). |
 | `env.sh` | Environment variables for the host, nirkt's packages and the work folder. |
-| `host/fair_view.patch` | Camera-view change for nirkt's `vendor/nbpc/fair.py` (SETUP.md). |
+| `setup.sh` | One-command setup: submodules, patches, host build, venv, game files (SETUP.md). |
+| `deps/` | nirkt's `bulletlabels` and `nbrl-env` (git submodules, pinned commits). |
+| `host/training_round.patch`, `host/fair_view.patch` | This project's changes to nirkt's host and camera rules. `setup.sh` applies them. |
 | `pro_strategies.md` | Community Showdown habits and what each means for the observation / reward. |
 
 ## Requirements
 
 - Linux or WSL2 (developed on Ubuntu 24.04), Python 3.11+, PyTorch (CUDA or ROCm for real runs; CPU is fine for the
   self-checks).
-- nirkt's `nbrl-env` (its `py/` and `train/` folders) and a built `bulletlabels` host with this project's round
-  applied. You supply the game files the host needs yourself. None are distributed here.
+- The game build the host is made for (an APK you supply). `setup.sh` checks it against nirkt's checksum and never
+  downloads it.
 
 ## Setup
 
-The full list of pieces and how to build the host: **[SETUP.md](SETUP.md)**. Once the host is built:
-
 ```bash
-export BULLETLABELS=/path/to/bulletlabels      # nirkt's host checkout, built
-export NBRL=/path/to/nbrl-env                  # nirkt's nbrl-env checkout
-export SIM_WORK=$HOME/bsrl-sim-work            # where runs/ and genmaps/ go
-export SIM_VENV=/path/to/venv                  # optional: activated if it exists
+git clone --recursive https://github.com/mlgdoggynoob/bsrl-sim && cd bsrl-sim
+APK=/path/to/nb_68.279_release_7c5c5152.apk ./setup.sh
 source env.sh
 ```
 
-Self-checks (need nirkt's `nbpc` on `PYTHONPATH`, which `env.sh` sets; no battle is booted):
+What `setup.sh` does, the pinned versions and troubleshooting: **[SETUP.md](SETUP.md)**.
+
+Self-checks (no battle is booted; `obs_v5` / `env_v5` read the game's data tables, so they need the game files):
 
 ```bash
 python -m obs_v5 && python -m model && python -m fast_obs && python -m env_v5 --check && python apply_noise.py --test

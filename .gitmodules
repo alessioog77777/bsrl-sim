@@ -1,0 +1,6 @@
+[submodule "deps/bulletlabels"]
+	path = deps/bulletlabels
+	url = https://github.com/nirkt/bulletlabels
+[submodule "deps/nbrl-env"]
+	path = deps/nbrl-env
+	url = https://github.com/nirkt/nbrl-env

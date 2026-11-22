@@ -1,54 +1,60 @@
 # Making the sim run
 
-The battles run in **nirkt's battle host** (`bulletlabels`), driven through nirkt's `MAEnv` (`nbrl-env`). This
-repository adds the observation, the battle randomisation and the trainer on top. You need all of the pieces below.
-Without the host, only the offline self-checks run.
+This repository is the master checkout: it pulls in **nirkt's** two repositories as git submodules under `deps/`
+and adds this project's changes on top. `setup.sh` does all of it.
 
-## What you need
-
-| Piece | From | Notes |
-|---|---|---|
-| `bulletlabels` at commit `52184b2` | [nirkt/bulletlabels](https://github.com/nirkt/bulletlabels) | Battle host: `native/loader` (host binary), `native/qemu` (patched `qemu-aarch64`), `vendor/nbpc` (Python side: instances, observation encoding, `MAEnv` glue). |
-| `nbrl-env` | [nirkt/nbrl-env](https://github.com/nirkt/nbrl-env) | `py/` (`models4`: network blocks, masked log-prob / entropy) and `train/`. |
-| Game data folder | you | Put it in `$BULLETLABELS/game`. Not distributed by anyone here. |
-| `host/fair_view.patch` | this repo | Camera-view window for `vendor/nbpc/fair.py` (measured trapezoid view, per-episode zoom, teammates never bush-hidden). |
-| Training-round host changes | maintainers | Team groups, summons / area effects in the observation, per-instance map folders, teammate respawn. Needed for duo / trio and generated maps; solo battles work without them. Not published yet. |
-| Linux x86-64 or WSL2 (Ubuntu 24.04), Python 3.11+ | | `numpy`, `torch` (CUDA or ROCm for real runs) and nirkt's Python requirements. |
-
-## Steps
+## Quick start (Linux x86-64 or WSL2 Ubuntu 24.04)
 
 ```bash
-# 1. nirkt's code
-git clone https://github.com/nirkt/bulletlabels bulletlabels && git -C bulletlabels checkout 52184b2
-git clone https://github.com/nirkt/nbrl-env nbrl-env
-git -C bulletlabels apply ../bsrl-sim/host/fair_view.patch
-
-# 2. build the host (nirkt's native/README.md has the details); the binary must be native/loader/nbhost_rl
-cd bulletlabels/native/loader && sed 's/nbhost_spawnfix2/nbhost_rl/g' build.sh | sh && cd -
-#    game data -> bulletlabels/game
-
-# 3. Python
-python3 -m venv ~/sim-venv && ~/sim-venv/bin/pip install numpy torch
-
-# 4. environment (every variable has a default; see env.sh)
-export BULLETLABELS=$PWD/bulletlabels NBRL=$PWD/nbrl-env SIM_WORK=$HOME/sim-work SIM_VENV=$HOME/sim-venv
-cd bsrl-sim && source env.sh
-
-# 5. checks
-python -m obs_v5 && python -m model && python -m env_v5 --check   # offline, no battle
-python -m env_v5 --n 2 --minutes 2 --agents 10                    # boots the host: random-action benchmark
-python -m live_check --n 2 --minutes 8                             # team / respawn checks (need the round changes)
+git clone --recursive https://github.com/mlgdoggynoob/bsrl-sim && cd bsrl-sim
+APK=/path/to/nb_68.279_release_7c5c5152.apk ./setup.sh     # ~10 min the first time
+source env.sh
+python -m obs_v5 && python -m model && python -m env_v5 --check   # self-checks: no battle, need the game files
+python -m live_check --n 2 --minutes 8                             # boots the host: teams, respawn, maps, HUD mask
+python -m train_ppo --run t --smoke                                # 3-update plumbing check of the trainer
 ```
 
-Then train: README "Setup".
+The game build is not distributed here and `setup.sh` never downloads it: you supply it. Its `lib/arm64-v8a/libg.so`
+must match `deps/bulletlabels/native/LIBG_SHA256`. `./setup.sh --no-apt` skips system packages, `--no-python` skips
+the venv. `TORCH_INDEX_URL` picks the torch build (for example ROCm or CPU wheels).
+
+## What setup.sh puts together
+
+| Piece | Where | From |
+|---|---|---|
+| Battle host: `native/loader` (host binary sources), `native/qemu` (patched `qemu-aarch64` build), `vendor/nbpc` (instances, observation encoding) | `deps/bulletlabels` @ `52184b2` | [nirkt/bulletlabels](https://github.com/nirkt/bulletlabels) |
+| Multi-agent environment `MAEnv` and camera rules (`py/nbpc/maenv.py`, `fair.py`), network blocks (`py/models4.py`) | `deps/nbrl-env` @ `7ff57bc` | [nirkt/nbrl-env](https://github.com/nirkt/nbrl-env) |
+| Training round of the host: team groups, summons and area effects in the observation, per-instance map folders, teammate respawn | `host/training_round.patch` | this repo |
+| Camera view window: measured trapezoid, per-episode zoom, teammates never bush-hidden | `host/fair_view.patch` | this repo |
+| Game files | `deps/bulletlabels/game` | you (`APK=`) |
+
+Steps, in order:
+1. `git submodule update --init` (nirkt's repos at the pinned commits).
+2. System packages (APT list at the top of `setup.sh`).
+3. Copy nirkt's `maenv.py` and `fair.py` from `deps/nbrl-env/py/nbpc` into `deps/bulletlabels/vendor/nbpc`, so one
+   `nbpc` package has the host side and the environment side.
+4. Apply `host/training_round.patch`, then `host/fair_view.patch`, to `deps/bulletlabels`.
+5. Build the host: `native/loader/build.sh` with the output named `nbhost_rl` (static ARM64 binary, runs under qemu).
+6. Build nirkt's patched qemu (~5 min). If that fails, `env.sh` uses the system `qemu-aarch64` (about 2x slower,
+   same results).
+7. `.venv` with nirkt's requirements and torch.
+8. Unpack the game files from the APK and check them against `LIBG_SHA256`.
+
+`env.sh` finds all of it under `deps/`. Each path can be overridden: `BULLETLABELS`, `NBRL`, `SIM_WORK`
+(runs and generated maps, default `work/`), `SIM_VENV`.
+
+The submodules are nirkt's code, unchanged in git. `setup.sh` only changes the working tree under `deps/`.
+`git -C deps/bulletlabels status` shows what it changed.
 
 ## Troubleshooting
 - **Nothing printed after start.** `MAEnv` retries a failed boot forever without a message. Boot one `nbpc.instance`
   with `log_dir=.` and read its `game_*.log`.
 - **Every boot dies at once.** `NB_PIX_CAP` (set in `env.sh`, `2400*1080*4`) must equal the frame slot the host was
-  built with.
+  built with (`NBE_PIX_CAP` in `native/loader/nbenv_proto.h`).
 - **Variables come out empty.** `env.sh` must have LF line endings (CRLF breaks every variable). From Windows, pass
   scripts to `wsl.exe ... bash -s` on stdin.
+- **A patch does not apply.** The submodule is not at the pinned commit: `git submodule update --init --force`, then
+  rerun `setup.sh`.
 - **Slow start.** One boot takes 60-90 s. Batch your checks into one run.
 - **A generated map crashes its instance (exit 139).** Layouts with a payload-track tile crash at boot.
   `env_v5.use_genmaps` skips them.

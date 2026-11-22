@@ -1,0 +1,446 @@
+diff --git a/native/loader/encode.c b/native/loader/encode.c
+index 0b307ea..3f56262 100644
+--- a/native/loader/encode.c
++++ b/native/loader/encode.c
+@@ -32,7 +32,7 @@
+ #define R_SCALE 3000.0
+ 
+ typedef struct {   /* map classes (state2.MapInfo) */
+-    int W, H; uint8_t *wall, *water, *bush;
++    int W, H; uint8_t *wall, *water, *bush, *tile;   /* tile (rl round): tiles.csv row + 1 */
+ } EncMap;
+ static const int WALL_ROWS[] = {1, 2, 3, 4, 6, 10, 12, 13, 14, 15, 16, 20, 21, 39, 40, 41, 42, 43, 44, 45, 46, 53, 54, 55, 56, 57, 58,
+                                 59, 60, 61, 62, 63, 65, 66, 69, 70, 71, 72, 73};
+@@ -40,10 +40,10 @@ static const int WATER_ROWS[] = {9, 11, 18};
+ static const int BUSH_ROWS[] = {7, 8, 17, 68};
+ static int in_rows(int id, const int *rows, int n) { for (int i = 0; i < n; i++) if (id == 27000000 + rows[i]) return 1; return 0; }
+ void enc_map_build(EncMap *m, const int32_t *tiles, int W, int H) {
+-    free(m->wall); free(m->water); free(m->bush);
+-    m->W = W; m->H = H; m->wall = calloc(W * H, 1); m->water = calloc(W * H, 1); m->bush = calloc(W * H, 1);
++    free(m->wall); free(m->water); free(m->bush); free(m->tile);
++    m->W = W; m->H = H; m->tile = calloc(W * H, 1); m->wall = calloc(W * H, 1); m->water = calloc(W * H, 1); m->bush = calloc(W * H, 1);
+     for (int i = 0; i < W * H; i++) {
+-        int id = tiles[i];
++        int id = tiles[i]; m->tile[i] = id >= 27000000 && id < 27000254 ? id - 27000000 + 1 : 1;
+         m->wall[i] = in_rows(id, WALL_ROWS, sizeof WALL_ROWS / 4);
+         m->water[i] = in_rows(id, WATER_ROWS, sizeof WATER_ROWS / 4);
+         m->bush[i] = in_rows(id, BUSH_ROWS, sizeof BUSH_ROWS / 4);
+@@ -55,6 +55,7 @@ typedef struct {
+     const int32_t (*cubes)[2]; int ncubes;      /* [char id, n] */
+     const int32_t (*jumps)[5]; int njumps;      /* [char id, t, T, x1, y1] */
+     const PrevPos *prev; int nprev, prev_tick;  /* previous dump's character positions (velocities) */
++    int hyper[16], hmax[16];                    /* rl round: hypercharge charge / max per player index */
+ } EncState;
+ 
+ static int floordiv(int a, int b) { int q = a / b; if ((a % b != 0) && ((a < 0) != (b < 0))) q--; return q; }
+@@ -72,6 +73,7 @@ static int is_brawler(const EncState *s, const int32_t *r) {
+     }
+     return r[0] == ((p[3] && p[3] != (int32_t)0x80000000) ? p[3] : p[2]);
+ }
++static int team_of(const EncState *s, int pidx) { for (int i = 0; i < s->npl; i++) if (s->pl[i * P2] == pidx) return s->pl[i * P2 + 1]; return -1000 - pidx; }
+ static int cubes_of(const EncState *s, int id) { for (int i = 0; i < s->ncubes; i++) if (s->cubes[i][0] == id) return s->cubes[i][1]; return 0; }
+ static int jumping(const EncState *s, int id) { for (int i = 0; i < s->njumps; i++) if (s->jumps[i][0] == id) return 1; return 0; }
+ static double super_frac(const EncState *s, int pidx) {
+@@ -123,20 +125,24 @@ int enc_encode(const EncMap *m, const EncState *s, int pidx, float *vec, float *
+         cd / 600.0, super_frac(s, pidx), cub / 10.0, me[11] > 0 ? 1.0 : 0.0,
+         (double)map_at(m, m->bush, tx, ty), (double)in_gas((int)mx, (int)my, tick, W, H), mx / (W * TILE), my / (H * TILE),
+         vx / 40.0, vy / 40.0, z / 700.0, jumping(s, mid) ? 1.0 : 0.0,
+-        (tick < 3000 ? tick : 3000) / 3000.0, nalive / 10.0, gas_step(tick) / 30.0, gas_next(tick) / 440.0,
++        (tick < 3000 ? tick : 3000) / 3000.0, nalive / 10.0,
++        /* rl round: [18] was gas_step / 30 -> the hypercharge fraction */
++        pidx >= 0 && pidx < 16 && s->hmax[pidx] > 0 ? (double)s->hyper[pidx] / s->hmax[pidx] : 0.0, gas_next(tick) / 440.0,
+         (W * TILE / 2.0 - mx) / (W * TILE / 2.0), (H * TILE / 2.0 - my) / (H * TILE / 2.0)};
+     for (int i = 0; i < F_SELF; i++) vec[i] = (float)fs[i];
+     float *o = vec + F_SELF;
+-    /* enemies */
+-    static Row rows[4096]; int n = 0;
++    /* other brawlers; rl round: + summons (characters of a player that are not its brawler), [14] = summon, [15] = on my team
++     * (were: last hit by me, is Piper) */
++    static Row rows[4096]; int n = 0; int myteam = team_of(s, pidx);
+     for (int k = 0; k < s->nch && n < 4096; k++) {
+         const int32_t *r = s->ch + k * C2;
+-        if (!is_brawler(s, r) || r[2] == pidx || r[6] <= 0) continue;
++        int br = is_brawler(s, r);
++        if (r[18] != 0 || r[1] == BOX_ID || r[2] < 0 || r[6] <= 0 || (br && r[2] == pidx)) continue;
+         double dx = (r[3] - mx) / R_SCALE, dy = (r[4] - my) / R_SCALE, ex, ey; vel_of(s, r[0], &ex, &ey);
+         int etx = floordiv(r[3], TILE), ety = floordiv(r[4], TILE), ea = r[13] > 0 ? r[13] : 0, ec = cubes_of(s, r[0]); if (ec > 10) ec = 10;
+         double v[16] = {1.0, dx, dy, ex / 40.0, ey / 40.0, (double)r[6] / (r[7] > 1 ? r[7] : 1), r[6] / 10000.0, ea / 3000.0,
+                         super_frac(s, r[2]), ec / 10.0, (double)map_at(m, m->bush, etx, ety), r[19] == 1, r[11] > 0,
+-                        jumping(s, r[0]), r[16] == pidx, r[1] == SNIPER};
++                        jumping(s, r[0]), !br, team_of(s, r[2]) == myteam};
+         rows[n].key = dx * dx + dy * dy; rows[n].seq = n; for (int j = 0; j < 16; j++) rows[n].v[j] = (float)v[j]; n++;
+     }
+     qsort(rows, n, sizeof *rows, cmprow);
+@@ -177,7 +183,9 @@ int enc_encode(const EncMap *m, const EncState *s, int pidx, float *vec, float *
+     for (int k = 0; k < s->nit && n < 4096; k++) {
+         const int32_t *r = s->it + k * I2;
+         double dx = (r[3] - mx) / R_SCALE, dy = (r[4] - my) / R_SCALE;
+-        double v[6] = {1.0, dx, dy, (double)(r[1] == CUBE_ITEM), (double)(r[1] == BOMB_ITEM || r[1] == BOMB_BOX_ITEM), (r[5] > 0 ? r[5] : 0) / 1500.0};
++        /* rl round: [4] = 1 showdown bomb or enemy area effect (data 17xxxxxx = area_effects_skin), -1 area effect of my team */
++        int area = r[1] / 1000000 == 17, mine = area && r[2] >= 0 && team_of(s, r[2]) == myteam;
++        double v[6] = {1.0, dx, dy, (double)(r[1] == CUBE_ITEM), mine ? -1.0 : (double)(area || r[1] == BOMB_ITEM || r[1] == BOMB_BOX_ITEM), (r[5] > 0 ? r[5] : 0) / 1500.0};
+         rows[n].key = dx * dx + dy * dy; rows[n].seq = n; for (int j = 0; j < 6; j++) rows[n].v[j] = (float)v[j]; n++;
+     }
+     qsort(rows, n, sizeof *rows, cmprow);
+@@ -188,7 +196,7 @@ int enc_encode(const EncMap *m, const EncState *s, int pidx, float *vec, float *
+         int x = tx - half + gx, y = ty - half + gy, inside = x >= 0 && x < W && y >= 0 && y < H;
+         int cx = x < 0 ? 0 : x > W - 1 ? W - 1 : x, cy = y < 0 ? 0 : y > H - 1 ? H - 1 : y, i = cy * W + cx;
+         int a = cx < cy ? cx : cy, b = W - 1 - cx < H - 1 - cy ? W - 1 - cx : H - 1 - cy, gas = (a < b ? a : b) < st;
+-        grid[0 * 625 + gy * 25 + gx] = m->wall[i] && inside;
++        grid[0 * 625 + gy * 25 + gx] = inside ? m->tile[i] : 0;   /* rl round: tiles.csv row + 1 (was: wall) */
+         grid[1 * 625 + gy * 25 + gx] = m->water[i] && inside;
+         grid[2 * 625 + gy * 25 + gx] = m->bush[i] && inside;
+         grid[3 * 625 + gy * 25 + gx] = gas || !inside;
+diff --git a/native/loader/env.c b/native/loader/env.c
+index fd605e1..7ef0ca5 100644
+--- a/native/loader/env.c
++++ b/native/loader/env.c
+@@ -104,6 +104,7 @@ static struct {
+     int gas_j, gas_phase, gas_latched, gas_latches;   /* storm clock (phone fog-renderer latch, see gas_test_step) */
+     struct { int n; int super[2]; double deg[2], dist[2]; } pf[NBE_MAXP];   /* attack commands of the last step (g_fire_delay) */
+     long cl_moves, cl_attacks;
++    int resp_at[NBE_MAXP], resp_ai[NBE_MAXP], resp_n, resp_done, resp_wipe;   /* rl round: teammate respawn (tick it comes back, 0 = no) */
+     int seen[NBE_MAXP], elim[NBE_MAXP], erank[NBE_MAXP], etick[NBE_MAXP], egas[NBE_MAXP], eptr_n, total, order_n, end_req, winner, local_rank, alive;
+     void *elim_ptr[NBE_MAXP];
+     /* cubes: by character id */
+@@ -143,6 +144,28 @@ static void *obj_by_id(void *sim, int id) {
+ }
+ static void **players(void *sim, int *n) { *n = I32(sim, 0x7c); if (*n < 0 || *n > 64) *n = 0; return (void **)PTR(sim, 0x70); }
+ static int player_char_id(void *p) { int c = I32(p, 0x1e4); return c ? c : I32(p, 0x10); }
++/* rl round, teammate respawn (duo / trio = rl team groups, div bit 31): a grouped brawler whose hit would knock it out
++ * while a teammate lives is kept (hp back to max), parked off the map at the game's own 'unplaced' spot, invulnerable,
++ * inputs and native AI off, dumped with hp 0 (= dead for every observation), and after RESP_TICKS (15 s) put at a living
++ * teammate's position. Its team wiped meanwhile: hp 0 -> eliminated as usual. The client libg has no respawn (server code). */
++static uint32_t g_div_team;
++#define RESP_TICKS 300
++#define PARK_X (-150)
++#define PARK_Y 150
++static int resp_on(void) { return (int)(g_div_team >> 31); }
++static int waiting(int i) { return i >= 0 && i < NBE_MAXP && E.resp_at[i] > 0; }
++static uint8_t *resp_mate(void *sim, int i) {   /* a living, not waiting teammate's brawler (NULL: none) */
++    int np; void **ps = players(sim, &np); if (i < 0 || i >= np || !ps[i]) return NULL;
++    for (int j = 0; j < np && j < NBE_MAXP; j++) {
++        if (j == i || !ps[j] || I32(ps[j], 12) != I32(ps[i], 12) || E.elim[j] || waiting(j)) continue;
++        uint8_t *c = obj_by_id(sim, player_char_id(ps[j])); if (c && VTOF(c) == VT_CHAR && I32(c, 0x3c4) > 0) return c;
++    }
++    return NULL;
++}
++static int brawler_owner(void *sim, uint8_t *c) {   /* player index whose current brawler c is, else -1 */
++    int np, ow = I32(c, 0x80); void **ps = players(sim, &np);
++    return ow >= 0 && ow < np && ow < NBE_MAXP && ps[ow] && player_char_id(ps[ow]) == I32(c, 8) ? ow : -1;
++}
+ static int local_index(void) {
+     if (!E.battle) return -1; void *c = PTR(E.battle, 0x28); return c ? I32(c, 0xe0) : -1;
+ }
+@@ -225,7 +248,8 @@ int snap2(void *sim, int32_t *out, int cap, void *cmgr) {
+         r[0] = I32(ob, 8); r[1] = d ? I32(d, 0x20) : NIL; r[2] = I32(ob, 0x80);
+         r[3] = I32(ob, 0x38); r[4] = I32(ob, 0x3c); r[5] = I32(ob, 0x40);
+         if (vo == VT_CHAR) {
+-            r[6] = I32(ob, 0x3c4); r[7] = I32(ob, 0x3c8); r[8] = I32(ob, 0x374); r[9] = I32(ob, 0x328);
++            r[6] = I32(ob, 0x3c4); r[7] = I32(ob, 0x3c8);
++            if (E.resp_n && waiting(brawler_owner(sim, ob))) r[6] = 0;   /* rl round: respawning = dead in every observation */ r[8] = I32(ob, 0x374); r[9] = I32(ob, 0x328);
+             r[10] = I32(ob, 0x7d8); r[11] = U8(ob, 0x431); r[12] = U8(ob, 0x469);
+             r[13] = s2_skill_word(ob, 0, 0x18); r[14] = s2_skill_word(ob, 0, 0x10);
+             r[15] = s2_skill_word(ob, 1, 0x30) == NIL ? NIL : (s2_skill_word(ob, 1, 0x30) & 0xff);
+@@ -324,8 +348,14 @@ static uint64_t my_root(void *victim, int a1, int dmg, int a3, int a4, void *att
+         E.charge_level = lvl;
+     }
+     int vchar = victim && VTOF(victim) == VT_CHAR, before = vchar ? I32(victim, 0x3c4) : 0;
++    int ow = vchar && mode3 && resp_on() && E.sim ? brawler_owner(E.sim, victim) : -1;
+     uint64_t r = o_root(victim, a1, dmg, a3, a4, attacker, src, a7, s0, s1, s2, s3, s4, s5, s6, s7, s8, s9);
++    if (waiting(ow)) { I32(victim, 0x3c4) = before; E.charge_level = saved_level; return r; }   /* respawning: invulnerable */
+     if (vchar && mode3) record_event(victim, attacker, before, I32(victim, 0x3c4));
++    if (ow >= 0 && I32(victim, 0x3c4) <= 0 && resp_mate(E.sim, ow)) {   /* knocked out while a teammate lives */
++        E.resp_at[ow] = I32(E.sim, 0x10) + RESP_TICKS; E.resp_ai[ow] = U8(victim, 0x469); E.resp_n++;
++        I32(victim, 0x3c4) = I32(victim, 0x3c8); U8(victim, 0x469) = 0; I32(victim, 0x38) = PARK_X; I32(victim, 0x3c) = PARK_Y;
++    }
+     E.charge_level = saved_level;
+     return r;
+ }
+@@ -720,7 +750,7 @@ static void gas_tick(void *sim) {   /* the storm schedule (check every 20 ticks)
+     for (int i = 0; i < np && i < NBE_MAXP; i++) {
+         if (!ps[i]) continue; uint8_t *c = obj_by_id(sim, player_char_id(ps[i]));
+         int alive = c && VTOF(c) == VT_CHAR && I32(c, 0x3c4) > 0;
+-        if (!alive) { E.ingas[i] = 0; continue; }
++        if (!alive || waiting(i)) { E.ingas[i] = 0; continue; }
+         int g = in_gas_tile(sim, (int)floor(I32(c, 0x38) / 300.0), (int)floor(I32(c, 0x3c) / 300.0));
+         E.ingas[i] = g; if (g) E.gast[i]++;
+         if (g && E.gas_on) I32(c, 0x7d8) = tick;        /* gasBlockRegen */
+@@ -740,12 +770,29 @@ static void apply_setup(void *sim) {   /* the phone test's debug_js_tick: park/f
+         if (!ps[i]) continue; uint8_t *c = obj_by_id(sim, player_char_id(ps[i])); if (!c || VTOF(c) != VT_CHAR) continue;
+         if ((g_setup.ai_off_mask >> i) & 1) U8(c, 0x469) = 0;
+         if ((g_setup.div.setup_super_mask >> i) & 1) I32(ps[i], 0x54) = I32(ps[i], 0x58);   /* diversity round: fill the super */
++        if ((g_setup.div.setup_super_mask >> (16 + i)) & 1) I32(ps[i], 0x98) = I32(ps[i], 0x9c);   /* bit 16+i: fill the hypercharge (+0x98 charge, +0x9c max; found by dump 2026-11-11) */
+         if ((g_setup.div.setup_unprotect_mask >> i) & 1) { I32(c, 0x4f0) = 0; U8(c, 0x431) = 0; }   /* diversity round: spawn protection ends (+0x4f0 = its end tick, 0xb3995c) */
+         if ((g_setup.set_mask >> i) & 1) { sf_stop(c); I32(c, 0x38) = g_setup.set_x[i]; I32(c, 0x3c) = g_setup.set_y[i]; I32(c, 0x3c4) = I32(c, 0x3c8); sf_stop(c); }
+     }
+ }
++static void respawn_tick(void *sim) {
++    int np, tick = I32(sim, 0x10); void **ps = players(sim, &np);
++    for (int i = 0; i < np && i < NBE_MAXP; i++) {
++        if (!waiting(i)) continue;
++        uint8_t *c = ps[i] ? obj_by_id(sim, player_char_id(ps[i])) : NULL;
++        if (!c || VTOF(c) != VT_CHAR) { E.resp_at[i] = 0; continue; }
++        uint8_t *m = resp_mate(sim, i);
++        sf_stop(c); E.moving[i] = 0; E.sent_valid[i] = 0; E.pf[i].n = 0;
++        if (!m) { E.resp_at[i] = 0; I32(c, 0x3c4) = 0; E.resp_wipe++; continue; }   /* team out: eliminated like its mates */
++        if (tick >= E.resp_at[i]) {
++            E.resp_at[i] = 0; E.resp_done++; I32(c, 0x38) = I32(m, 0x38); I32(c, 0x3c) = I32(m, 0x3c);
++            I32(c, 0x3c4) = I32(c, 0x3c8); U8(c, 0x469) = E.resp_ai[i]; sf_stop(c);
++        } else { I32(c, 0x38) = PARK_X; I32(c, 0x3c) = PARK_Y; I32(c, 0x3c4) = I32(c, 0x3c8); U8(c, 0x469) = 0; }
++    }
++}
+ static void pre_snapshot(void *sim) {   /* 0xb63b0c, once per tick: storm hits, leaps, tick jobs, local AI */
+     if (g_setup_pending) { g_setup_pending = 0; apply_setup(sim); }
++    if (E.resp_n) respawn_tick(sim);
+     for (int i = 0; i < E.ngq; i++) gas_hit(sim, obj_by_id(sim, E.gq[i].id), &E.gq[i]);
+     E.ngq = 0;
+     if (E.njobs) sf_tick(sim);
+@@ -905,6 +952,18 @@ static void fire_input(void *sim, int pidx, uint8_t *ch, int super, double deg,
+ static void gadget_input(void *sim, int pidx, uint8_t *ch, double deg) {
+     double r = deg * M_PI / 180; apply_input(sim, pidx, 8, jround(1000 * cos(r)), jround(1000 * sin(r)), NULL);
+ }
++/* rl round (tests): fire the character's skill instance idx (char +0x458 array, +0x464 count; instance +0 = SkillData) like an attack */
++static void skill_idx_input(void *sim, int pidx, uint8_t *ch, int idx, double deg) {
++    uint8_t **arr = PTR(ch, 0x458); int n = I32(ch, 0x464);
++    uint8_t *sk = arr && idx >= 0 && idx < n && n <= 16 ? arr[idx] : NULL, *sd = sk ? PTR(sk, 0) : NULL;
++    if (!sd) { LOG("[skillidx] player %d idx %d: none (count %d)\n", pidx, idx, n); return; }
++    int type = I32(sd, 0x1ac), kind = (type - 2u < 4u) ? KIND_BY_TYPE[(type - 2) * 4] : 0;
++    int cr = ((int (*)(void *))B(0xb0d948))(sd), X = I32(ch, 0x38), Y = I32(ch, 0x3c); double r = deg * M_PI / 180, L = cr > 0 ? cr * 100.0 : 1000;
++    int tx = jround(X + L * cos(r)), ty = jround(Y + L * sin(r)), ab = SKILL_ABS(sd);
++    LOG("[skillidx] player %d idx %d of %d: data id %d type %d kind %d range %d abs %d timers %d %d charge %d\n", pidx, idx, n,
++        I32(sd, 0x20), type, kind, cr, ab, I32(sk, 0x10), I32(sk, 0x18), I32(sk, 0x30));
++    apply_input(sim, pidx, kind, ab ? tx : tx - X, ab ? ty : ty - Y, sd);
++}
+ static void apply_pending_fires(void *sim, int i, uint8_t *ch) {   /* origin = the shooter's sim position now */
+     for (int k = 0; k < E.pf[i].n; k++) fire_input_now(sim, i, ch, E.pf[i].super[k], E.pf[i].deg[k], E.pf[i].dist[k], I32(ch, 0x38), I32(ch, 0x3c));
+     E.pf[i].n = 0;
+@@ -935,6 +994,8 @@ static int client_intents(void *sim, int i, uint8_t *ch, const NbeAction *a) {
+     if (a->fire == 1) { fire_input_at(sim, i, ch, 0, a->aim_deg, 1, cx, cy); E.cl_attacks++; }
+     else if (a->fire == 2) { fire_input_at(sim, i, ch, 1, a->aim_deg, a->super_dist > 0 && a->super_dist <= 1 ? a->super_dist : 1, cx, cy); E.cl_attacks++; }
+     else if (a->fire == 3) gadget_input(sim, i, ch, a->aim_deg);   /* diversity round */
++    else if (a->fire >= 200) skill_idx_input(sim, i, ch, a->fire - 200, a->aim_deg);   /* rl round (tests) */
++        else if (a->fire >= 100) apply_input(sim, i, a->fire - 100, 1, 1, NULL);   /* rl round: raw input kind (tests) */
+     (void)cc; return 1;
+ }
+ static void apply_actions(void *sim, const NbeCmd *c) {
+@@ -942,11 +1003,11 @@ static void apply_actions(void *sim, const NbeCmd *c) {
+     for (int i = 0; i < np && i < NBE_MAXP; i++) {
+         if (E.pf[i].n) {   /* last step's attacks (g_fire_delay) arrive first, like the client's queued inputs */
+             uint8_t *ch0 = ps[i] ? obj_by_id(sim, player_char_id(ps[i])) : NULL;
+-            if (ch0 && VTOF(ch0) == VT_CHAR && I32(ch0, 0x3c4) > 0) apply_pending_fires(sim, i, ch0); else E.pf[i].n = 0;
++            if (ch0 && VTOF(ch0) == VT_CHAR && I32(ch0, 0x3c4) > 0 && !waiting(i)) apply_pending_fires(sim, i, ch0); else E.pf[i].n = 0;
+         }
+         if (!((c->ctl_mask >> i) & 1) || !ps[i]) continue;
+         uint8_t *ch = obj_by_id(sim, player_char_id(ps[i]));
+-        if (!ch || VTOF(ch) != VT_CHAR || I32(ch, 0x3c4) <= 0) { E.moving[i] = 0; E.sent_valid[i] = 0; continue; }
++        if (!ch || VTOF(ch) != VT_CHAR || I32(ch, 0x3c4) <= 0 || waiting(i)) { E.moving[i] = 0; E.sent_valid[i] = 0; continue; }
+         const NbeAction *a = &c->act[i];
+         if (client_intents(sim, i, ch, a)) continue;
+         if (a->move_dir >= 0 && a->move_dir < 16) {
+@@ -961,6 +1022,8 @@ static void apply_actions(void *sim, const NbeCmd *c) {
+             E.moving[i] = 0; E.last_dir[i] = -1; E.sent_valid[i] = 0;
+         }
+         if (a->fire == 3) gadget_input(sim, i, ch, a->aim_deg);   /* diversity round */
++        else if (a->fire >= 200) skill_idx_input(sim, i, ch, a->fire - 200, a->aim_deg);   /* rl round (tests) */
++        else if (a->fire >= 100) apply_input(sim, i, a->fire - 100, 1, 1, NULL);   /* rl round: raw input kind (tests) */
+         if (a->fire == 1) fire_input(sim, i, ch, 0, a->aim_deg, 1);
+         else if (a->fire == 2) { double dd = a->super_dist > 0 && a->super_dist <= 1 ? a->super_dist : 1; fire_input(sim, i, ch, 1, a->aim_deg, dd); }
+     }
+@@ -1070,6 +1133,8 @@ static void my_setseed(void *sim, int seed) {   /* builder 0x9bb7c4: bl 0xc24a08
+  * All requests are checked against the game's own tables; a rejected one falls back to the default (NbeResp.div_err). */
+ #define LOC_GLOBAL 0x12eefc0
+ int32_t g_div_char[NBE_MAXP], g_div_skin[NBE_MAXP], g_div_gadget[NBE_MAXP], g_div_star[NBE_MAXP];   /* offline.c my_player_ctor */
++static uint32_t g_div_team;
++static void *g_div_map_loc;   /* RESET div.reserved[1]: a location (any mode) whose Map row the battle location uses instead (my_loc_map) */   /* RESET div.reserved[0]: bit i = player i joins player 0's team (env_after_build) */
+ static void *g_play_loc, *g_div_cl_loc; static uint8_t *g_theme_loc; static void *g_theme_orig; static int32_t g_div_err;
+ void *div_data(int id) {   /* LogicDataTables by global id (0xacc26c without its unchecked index): NULL unless the table has it */
+     int type = id / 1000000, idx = id % 1000000;
+@@ -1099,6 +1164,9 @@ static void div_reset(const NbeCmd *c) {   /* a RESET was accepted: set up the n
+         if (th && own && tgt && c->div.theme / 1000000 == data_id(own) / 1000000) { g_theme_loc = tgt; g_theme_orig = PTR(tgt, 0x58); PTR(tgt, 0x58) = th; }
+         else g_div_err |= 1u << 31;
+     }
++    g_div_team = (uint32_t)c->div.reserved[0];
++    g_div_map_loc = c->div.reserved[1] ? div_data(c->div.reserved[1]) : NULL;
++    if (c->div.reserved[1] && (!g_div_map_loc || c->div.reserved[1] / 1000000 != 15)) { g_div_err |= 1 << 30; g_div_map_loc = NULL; }
+     for (int i = 0; i < NBE_MAXP; i++) { g_div_char[i] = c->div.chr[i]; g_div_skin[i] = c->div.skin[i]; g_div_gadget[i] = c->div.gadget[i]; g_div_star[i] = c->div.star[i]; }
+     static int nlog; if ((c->div.location || c->div.theme) && nlog++ < 20)
+         LOG("[div] reset: location %d -> %p, theme %d (err %#x)\n", c->div.location, loc, c->div.theme, (unsigned)g_div_err);
+@@ -1107,6 +1175,10 @@ void div_reject(int i) { if (i >= 0 && i < NBE_MAXP) g_div_err |= 1 << i; }
+ static void my_cl_location(uint64_t *ctx) {   /* 0xc22d00(client, location) onEnter: the client draws our location */
+     if (g_div_cl_loc && ctx[1]) ctx[1] = (uint64_t)g_div_cl_loc;
+ }
++static void my_loc_map(uint64_t *ctx) {   /* 0xaeabd4 LocationData::getMap(this) onEnter: the battle location reads the Map row of
++                                             g_div_map_loc (game mode stays Showdown; sim and client both build the tiles from it) */
++    if (g_div_map_loc && ctx[0] == (uint64_t)PTR(B(LOC_GLOBAL), 0)) ctx[0] = (uint64_t)g_div_map_loc;
++}
+ static void div_publish(void *sim) {   /* RESET response: read the battle back from the game's objects */
+     R->div_valid = 1; R->div_err = g_div_err; R->div_reserved[1] = R->div_reserved[2] = 0;
+     void *loc = PTR(sim, 0x50); R->div_location = data_id(loc); R->div_theme = loc ? data_id(PTR(loc, 0x58)) : 0;
+@@ -1138,6 +1210,7 @@ static void ep_clear_step(void) {
+ static void hook_listener(void *sim);
+ static void hits_mark(void); void hits_dump(const char *why);
+ static long g_streams_freed; int g_free_snap_stream = 1;   /* --keep-snap-streams: 0 (keeps the game's per-tick leak, see my_deliver) */
++static void apply_teams(void *sim);
+ void env_on_build(void *battle, void *sim) {   /* a new battle was built: forget the old one */
+     g_lead_n = 0; g_lead_skip = 0;
+     int gen = E.gen + 1, hr = E.have_reset, seed = E.reset_seed, gas = E.gas_on, act = E.act_tick, sa = E.seed_applied, rr = E.reset_req;
+@@ -1171,13 +1244,15 @@ static void fill_players(void *sim) {
+         p->cubes_total = cubes_of(p->char_id); p->cubes = p->cubes_total - E.cubes0[i]; p->gas_ticks = E.gast[i]; p->in_gas = E.ingas[i];
+         p->eliminated = E.elim[i]; p->elim_rank = E.erank[i]; p->elim_tick = E.etick[i]; p->elim_gas = E.egas[i];
+         p->leaping = leaping(p->char_id); p->super_charge = I32(ps[i], 0x54); p->super_max = I32(ps[i], 0x58);
++        if (waiting(i)) { p->hp = 0; p->alive = 1; p->reserved[3] = E.resp_at[i] > I32(sim, 0x10) ? E.resp_at[i] - I32(sim, 0x10) : 1; }   /* >= 1 until respawn_tick ran */   /* rl round: respawning */
++        p->reserved[0] = I32(ps[i], 0x98); p->reserved[1] = I32(ps[i], 0x9c); p->reserved[2] = I32(ps[i], 12);   /* rl round: hypercharge charge / max, team */
+     }
+ }
+ /* ---------------- encoded observations (encode.c = state2.encode) */
+-typedef struct { int W, H; uint8_t *wall, *water, *bush; } EncMap;
++typedef struct { int W, H; uint8_t *wall, *water, *bush, *tile; } EncMap;
+ typedef struct { int id, x, y; } PrevPos;
+ typedef struct { const int32_t *pl, *ch, *pj, *it; int npl, nch, npj, nit, tick; const int32_t (*cubes)[2]; int ncubes;
+-                 const int32_t (*jumps)[5]; int njumps; const PrevPos *prev; int nprev, prev_tick; } EncState;
++                 const int32_t (*jumps)[5]; int njumps; const PrevPos *prev; int nprev, prev_tick; int hyper[16], hmax[16]; } EncState;
+ void enc_map_build(EncMap *m, const int32_t *tiles, int W, int H);
+ int enc_encode(const EncMap *m, const EncState *s, int pidx, float *vec, float *grid);
+ static EncMap g_emap; static uint32_t g_emap_hash; static PrevPos g_prev[4096]; static int g_nprev, g_prev_tick = -1, g_prev_valid;
+@@ -1228,6 +1303,7 @@ static void write_obs(void *sim, uint32_t mask) {
+     s.pl = a + 8; s.ch = s.pl + s.npl * 8; s.pj = s.ch + s.nch * 23; s.it = s.pj + s.npj * 18;
+     s.cubes = (const int32_t (*)[2])R->cubes; s.ncubes = R->ncubes; s.jumps = (const int32_t (*)[5])R->jumps; s.njumps = R->njumps;
+     if (g_prev_valid) { s.prev = g_prev; s.nprev = g_nprev; s.prev_tick = g_prev_tick; }
++    { int np; void **ps = players(sim, &np); for (int i = 0; i < np && i < 16; i++) if (ps[i]) { s.hyper[i] = I32(ps[i], 0x98); s.hmax[i] = I32(ps[i], 0x9c); } }   /* rl round */
+     int written = 0;
+     for (int p = 0; p < NBE_MAXP; p++) if ((mask >> p) & 1) {
+         float *v = OBSB + p * (NBE_OBS_VEC + NBE_OBS_GRID);
+@@ -1502,7 +1578,7 @@ static int sim_reset(int seed) {
+     hook_listener(sim);
+     double t1 = tnow(), t2 = t1;
+     extern void *g_sim; g_sim = sim;
+-    env_on_build(g_real_battle, sim);
++    env_on_build(g_real_battle, sim); apply_teams(sim);   /* rl round: the sim-only reset path */
+     E.active = 1; E.intro = 1;
+     E.t_inject = t0; E.t_build0 = tdel; E.t_build1 = t1; E.t_tick1 = t2; E.t_del = tdel - t0;
+     return 0;
+@@ -1811,9 +1887,28 @@ static void frame_hook(uint64_t *ctx) {   /* AndroidMain frame 0xeaa9f0 entry (m
+         if (r) { E.reset_req = 0; if (E.sim) publish(E.sim, g_served, -10 + r, "reset injection failed"); }
+     }
+ }
++static void apply_teams(void *sim) {   /* after every build (both reset paths) */
++    if (g_div_team && sim) {   /* teams: player +0xc = team, its character +0x84 = team (as projectiles / items).
++                                  bit 31 clear: bit i = player i joins player 0's team. rl round, bit 31 set: 3 bits per player
++                                  (player i at bit 3 * i) = its group, 0 = stays alone; a group takes its lowest player's team */
++        int np; void **ps = players(sim, &np);
++        for (int i = 1; i < np && i < NBE_MAXP; i++) {
++            int lead = -1;
++            if (g_div_team >> 31) {
++                int g = i < 10 ? (g_div_team >> (3 * i)) & 7 : 0;
++                for (int j = 0; g && j < i; j++) if (((g_div_team >> (3 * j)) & 7) == g) { lead = j; break; }
++            } else if ((g_div_team >> i) & 1) lead = 0;
++            if (lead < 0 || !ps[i] || !ps[lead]) continue;
++            uint8_t *c = obj_by_id(sim, player_char_id(ps[i])); int t = I32(ps[lead], 12);
++            LOG("[team] %#x: player %d team %d -> %d (player %d)\n", g_div_team, i, I32(ps[i], 12), t, lead);
++            I32(ps[i], 12) = t; if (c) I32(c, 0x84) = t;
++        }
++    }
++}
+ void env_after_build(void *battle) {   /* builder returned: the new battle's sim */
+     void *sim = PTR(battle, 0x30);
+     int was = E.reset_req; double ti = E.t_inject, tb = E.t_build0, ts = E.t_step0; env_on_build(battle, sim); E.t_inject = ti; E.t_build0 = tb; E.t_build1 = tnow();
++    apply_teams(sim);
+     E.t_step0 = ts;
+     if (was) { E.reset_req = 0; E.active = 1; E.intro = 1; }
+     if (!H->boot_ms) H->boot_ms = (int)((tnow() - g_t0) * 1000);
+@@ -1920,6 +2015,7 @@ void env_install(void) {
+         hook_enter(g_libg, 0x59cb7c, my_hud);
+         hook_enter(g_libg, 0xe82924, submit_hook);
+         hook_enter(g_libg, 0xc22d00, my_cl_location);   /* diversity round: the client's location (div_reset) */
++        hook_enter(g_libg, 0xaeabd4, my_loc_map);   /* custom map layout (div.reserved[1]) */
+         if (g_cube_counter) cube_counter_install();
+         if (g_intro_render >= 0 || !g_loading_render) { int r = hook_flag_skip(g_libg, 0xeaab68, 0x39421268, &g_no_draw, 0xeaac58);
+             LOG("[env] no-draw patch 0xeaab68 (intro frames drawn: last %d, loading frames drawn: %d): %s\n", g_intro_render, g_loading_render, r ? "NOT applied" : "applied"); }
+diff --git a/native/loader/nbenv_proto.h b/native/loader/nbenv_proto.h
+index db2438c..986374c 100644
+--- a/native/loader/nbenv_proto.h
++++ b/native/loader/nbenv_proto.h
+@@ -44,7 +44,7 @@ typedef struct {          /* diversity round: NbeCmd.div (RESET) */
+     int32_t gadget[NBE_MAXP];  /* per player index: cards.csv 23xxxxxx gadget card (MetaType 5) of that character -> its
+                                   config +0x10; 0 = none (as before: the offline build gives no cards) */
+     int32_t star[NBE_MAXP];    /* per player index: cards.csv 23xxxxxx star power card (MetaType 4) -> config +0x08; 0 = none */
+-    uint32_t setup_super_mask; /* SETUP (test harness): bit i = fill player i's super charge (player +0x54 = +0x58) */
++    uint32_t setup_super_mask; /* SETUP (test harness): bit i = fill player i's super charge (player +0x54 = +0x58); bit 16+i = its hypercharge (+0x98 = +0x9c) */
+     uint32_t setup_unprotect_mask; /* SETUP (test harness): bit i = clear player i's spawn protection (char +0x4f0 end tick = 0) */
+     int32_t reserved[2];
+ } NbeDiv;
+diff --git a/vendor/nbpc/instance.py b/vendor/nbpc/instance.py
+index b0c69ae..2b2583f 100644
+--- a/vendor/nbpc/instance.py
++++ b/vendor/nbpc/instance.py
+@@ -15,8 +15,9 @@ NATIVE = os.path.join(WORK, "native")
+ NBHOST = os.environ.get("NBHOST_BIN", os.path.join(NATIVE, "prebuilt", "nbhost_spawnfix"))
+ _gl = os.path.join(NATIVE, "glhost", "nbgl")
+ NBGL = os.environ.get("NBGL_BIN", _gl if os.path.exists(_gl) else os.path.join(NATIVE, "prebuilt", "nbgl"))
+-PAYLOADS = os.path.join(NATIVE, "payloads")
++PAYLOADS = os.environ.get("NBPC_PAYLOADS") or os.path.join(NATIVE, "payloads")   # run_plan: per-batch copy with our random name
+ APK = os.environ.get("NBHOST_APK", os.path.join(WORK, "game"))
++APK_BY_IDX = {}   # rl round: instance index -> its own game dir (generated maps: framegen/genmap.py OUT/game)
+ 
+ 
+ class InstanceDead(RuntimeError):
+@@ -37,6 +38,10 @@ def set_div(d, div):
+     d.setup_super_mask = int(div.get("setup_super_mask") or 0) & 0xffffffff
+     d.setup_unprotect_mask = int(div.get("setup_unprotect_mask") or 0) & 0xffffffff
+     for i in range(2): d.reserved[i] = 0
++    d.reserved[0] = int(div.get("team_mask") or 0)   # RESET: bit i = player i on player 0's team (needs native/loader/nbhost_team)
++    g = div.get("team_groups")   # rl round: group id 0-7 per player (0 = alone); players of one group share a team
++    if g: d.reserved[0] = ((1 << 31) | sum((int(x) & 7) << (3 * i) for i, x in enumerate(list(g)[:10]))) - (1 << 32)
++    d.reserved[1] = int(div.get("map_location") or 0)   # RESET: a location (any mode) whose map layout is used (needs native/loader/nbhost_maps)
+ 
+ 
+ QEMU_NB = os.path.join(NATIVE, "qemu", "bin", "qemu-aarch64-nb")
+@@ -110,7 +115,7 @@ class Instance:
+         qemu, env = qemu_cmd_env()
+         # pctrain: game processes run at a lower CPU priority (NBENV_NICE, default 10) so the desktop stays responsive
+         nice = ["nice", "-n", os.environ.get("NBENV_NICE", "10")] if os.environ.get("NBENV_NICE", "10") != "0" else []
+-        args = os.environ.get("NBHOST_WRAP", "").split() + nice + ["unshare", "-rn", qemu, NBHOST, "--libs", os.path.join(APK, "lib", "arm64-v8a"), "--assets", APK,
++        args = os.environ.get("NBHOST_WRAP", "").split() + nice + ["unshare", "-rn", qemu, NBHOST, "--libs", os.path.join(APK_BY_IDX.get(self.idx, APK), "lib", "arm64-v8a"), "--assets", APK_BY_IDX.get(self.idx, APK),
+                 "--payloads", PAYLOADS, "--stage", "boot", "--dpi", "280", "--xdpi", "409.432", "--ydpi", "406.4", "--safe-margins", "0,0,88,0", "--cores", str(self.cores), "--fast",
+                 "--autoplay", "3", "--run-seconds", "100000000", "--env", self.path, "--steps-per-frame", str(self.spf)]
+         if self.gl_shm:
+@@ -230,6 +235,7 @@ class Instance:
+         return self.hdr.resp_seq == self.seq
+ 
+     def wait(self, timeout=60.0):
++        timeout = max(timeout, float(os.environ.get("NBPC_TIMEOUT") or 0))   # run_plan: intros are slow with several instances
+         t0 = time.time(); n = 0
+         while self.hdr.resp_seq != self.seq:
+             n += 1
+@@ -282,11 +288,11 @@ class Instance:
+                   obs_mask=obs_mask, actions=actions, gas=(storm + 1) if storm is not None else 0, pix=pix, pix_obs=pix_obs)
+         return self.wait(timeout)
+ 
+-    def setup(self, positions=None, ai_off=(), super_fill=(), unprotect=()):
++    def setup(self, positions=None, ai_off=(), super_fill=(), unprotect=(), hyper_fill=()):
+         """phone test harness (debug_js_tick): teleport/stop/heal players {i: (x, y)}, clear the AI flag of players ai_off;
+         super_fill (diversity round): fill these players' super charge; applied inside the next tick (send steps afterwards)"""
+         c = self.cmd; c.set_mask = 0; c.ai_off_mask = 0
+-        set_div(c.div, {"setup_super_mask": sum(1 << int(i) for i in super_fill), "setup_unprotect_mask": sum(1 << int(i) for i in unprotect)})
++        set_div(c.div, {"setup_super_mask": sum(1 << int(i) for i in super_fill) | sum(1 << (16 + int(i)) for i in hyper_fill), "setup_unprotect_mask": sum(1 << int(i) for i in unprotect)})
+         for i, (x, y) in (positions or {}).items():
+             c.set_mask |= 1 << i; c.set_x[i] = int(x); c.set_y[i] = int(y)
+         for i in ai_off:
+diff -u vendor/nbpc/maenv.py (untracked in bulletlabels: vs its pre-respawn copy maenv.py.orig_rl)
+--- a/vendor/nbpc/maenv.py
++++ b/vendor/nbpc/maenv.py
+@@ -338,8 +338,11 @@
+             s = self.I[i]; r = s.inst.resp
+             for p, aid in s.agents.items():
+                 if not (r.obs_written >> p) & 1:
+-                    continue
+-                o = s.inst.obs_f32[p * (NV + NG):(p + 1) * (NV + NG)]
++                    if aid not in getattr(self, "dead_aids", ()):
++                        continue
++                    o = np.zeros(NV + NG, np.float32)   # rl round: respawning (no brawler to observe): blank observation, still acts
++                else:
++                    o = s.inst.obs_f32[p * (NV + NG):(p + 1) * (NV + NG)]
+                 ids.append(aid); vecs.append(o[:NV]); grids.append(o[NV:]); owners.append((i, s.W, s.H))
+                 meta.append((r.pl[p].x, r.pl[p].y, r.tick, s.W, s.H)); tags.append(s.cfg.get("tag"))
+                 if self.pixels:

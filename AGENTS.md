@@ -5,12 +5,15 @@ the repo root and is run as `python -m <module>` from the root after `source env
 
 ## Before you change anything
 - Read README.md (file map, setup) and the docstring at the top of the file you touch. The docstrings are the spec.
-- The battle host and nirkt's `nbpc` / `MAEnv` are external (NOTICE.md). Without them only the self-checks that
-  stay off the host run, and even those need `nbpc` importable. Don't vendor nirkt's code into this repo.
+- `deps/` holds nirkt's repos as git submodules (NOTICE.md). Don't copy nirkt's code into this repo and don't commit
+  inside `deps/`. Changes to nirkt's files go into `host/*.patch`, which `setup.sh` applies. Check one still applies
+  with `git -C deps/bulletlabels apply --check ../../host/<patch>` on a clean submodule.
+- `./setup.sh` builds everything (SETUP.md); `source env.sh` before any module. Without the host built, only the
+  self-checks that skip the game data run (`scorecard.py --check`, `apply_noise.py --test`).
 - No game files, binaries, checkpoints, datasets or run outputs go into git (`.gitignore`).
 
 ## Checks
-- Self-checks, no battle: `python -m obs_v5`, `python -m model`, `python -m fast_obs`, `python -m env_v5 --check`,
+- Self-checks, no battle (`obs_v5` / `env_v5` need the game files from `setup.sh`): `python -m obs_v5`, `python -m model`, `python -m fast_obs`, `python -m env_v5 --check`,
   `python scorecard.py --check`, `python apply_noise.py --test`. Run the ones for the modules you touched.
 - Host checks (boot takes 60-90 s each, so batch your questions into one run): `python -m live_check`,
   `python -m test_fast` (fast paths must stay bit-equal to the reference paths), `python -m train_ppo --run t --smoke`.
