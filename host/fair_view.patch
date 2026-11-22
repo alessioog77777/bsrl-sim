@@ -1,0 +1,39 @@
+--- a/vendor/nbpc/fair.py
++++ b/vendor/nbpc/fair.py
+@@ -21,7 +21,17 @@
+ PJ0, PJ_K, PJ_F = EN0 + EN_K * EN_F, 16, 12
+ BX0, BX_K, BX_F = PJ0 + PJ_K * PJ_F, 6, 5
+ IT0, IT_K, IT_F = BX0 + BX_K * BX_F, 8, 6
+-VIEW_X, VIEW_UP, VIEW_DOWN, BUSH_REVEAL = 4500.0, 3500.0, 2900.0, 900.0
++VIEW_X, VIEW_UP, VIEW_DOWN, BUSH_REVEAL = 3850.0, 3090.0, 2330.0, 900.0   # view: measured on the v5 labels around the ring-centre player point (rl sim_vs_labels.py, HISTORY 115; was 3800 / 3350 / 2070 around the box bottom, HISTORY 53)
++
++VIEW_SLOPE, VIEW_ZOOM = -0.138, 0.08   # half-width change per unit of y below the player (the camera trapezoid: 4270 at the
++# top edge, 3850 at the player, 3530 at the bottom); rl obs_v5 scales the window per episode by 1 + U(-0.06, +0.08)
++# (zoom spread of the screen edges, p5-p95 on the v5 labels, HISTORY 116), so the cut here is the widest one
++
++
++def view(rx, ry, f=1.0):
++    """in view of the camera trapezoid scaled by f around the player (f = 1: the median screen); rx from the camera x,
++    ry from the player y, world units"""
++    return (np.abs(rx) < f * VIEW_X + VIEW_SLOPE * ry) & (ry > -f * VIEW_UP) & (ry < f * VIEW_DOWN)
+ 
+ 
+ def own_xy(vec, W, H):
+@@ -34,7 +44,7 @@
+     camx = np.clip(mx, 3000.0, W * TILE - 3000.0)
+     ex = mx[:, None] + np.rint(dx.astype(np.float64) * R); ey = my[:, None] + np.rint(dy.astype(np.float64) * R)
+     rx, ry = ex - camx[:, None], ey - my[:, None]
+-    return (np.abs(rx) < VIEW_X) & (ry > -VIEW_UP) & (ry < VIEW_DOWN), ex, ey
++    return view(rx, ry, 1.0 + VIEW_ZOOM), ex, ey
+ 
+ 
+ def _compact(block, keep):
+@@ -54,7 +64,7 @@
+     en = vec[:, EN0:EN0 + EN_K * EN_F].reshape(-1, EN_K, EN_F)
+     inv, _, _ = _inview(mx, my, en[:, :, 1], en[:, :, 2], W)
+     dist = np.hypot(en[:, :, 1].astype(np.float64), en[:, :, 2].astype(np.float64)) * R
+-    hidden = (en[:, :, 10] > 0.5) & (dist > BUSH_REVEAL)
++    hidden = (en[:, :, 10] > 0.5) & (dist > BUSH_REVEAL) & (en[:, :, 15] < 0.5)   # rl round: [15] = on my team, never hidden
+     return (en[:, :, 0] > 0.5) & inv & ~hidden
+ 
+ 

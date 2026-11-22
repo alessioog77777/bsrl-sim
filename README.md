@@ -27,6 +27,7 @@ included here, and nothing here runs without it.
 | `viz.html` | Run dashboard: training / eval curves, action histograms, battle replay with the policy's view. |
 | `hud_ui.npy` | Measured share of each tile hidden by the game HUD (used by the noisy observation). |
 | `env.sh` | Environment variables for the host, nirkt's packages and the work folder. |
+| `host/fair_view.patch` | Camera-view change for nirkt's `vendor/nbpc/fair.py` (SETUP.md). |
 | `pro_strategies.md` | Community Showdown habits and what each means for the observation / reward. |
 
 ## Requirements
@@ -37,6 +38,8 @@ included here, and nothing here runs without it.
   applied. You supply the game files the host needs yourself. None are distributed here.
 
 ## Setup
+
+The full list of pieces and how to build the host: **[SETUP.md](SETUP.md)**. Once the host is built:
 
 ```bash
 export BULLETLABELS=/path/to/bulletlabels      # nirkt's host checkout, built
