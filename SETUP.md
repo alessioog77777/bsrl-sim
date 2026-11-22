@@ -8,8 +8,8 @@ Without the host, only the offline self-checks run.
 
 | Piece | From | Notes |
 |---|---|---|
-| `bulletlabels` at commit `52184b2` | nirkt | Battle host: `native/loader` (host binary), `native/qemu` (patched `qemu-aarch64`), `vendor/nbpc` (Python side: instances, observation encoding, `MAEnv` glue). |
-| `nbrl-env` | nirkt | `py/` (`models4`: network blocks, masked log-prob / entropy) and `train/`. |
+| `bulletlabels` at commit `52184b2` | [nirkt/bulletlabels](https://github.com/nirkt/bulletlabels) | Battle host: `native/loader` (host binary), `native/qemu` (patched `qemu-aarch64`), `vendor/nbpc` (Python side: instances, observation encoding, `MAEnv` glue). |
+| `nbrl-env` | [nirkt/nbrl-env](https://github.com/nirkt/nbrl-env) | `py/` (`models4`: network blocks, masked log-prob / entropy) and `train/`. |
 | Game data folder | you | Put it in `$BULLETLABELS/game`. Not distributed by anyone here. |
 | `host/fair_view.patch` | this repo | Camera-view window for `vendor/nbpc/fair.py` (measured trapezoid view, per-episode zoom, teammates never bush-hidden). |
 | Training-round host changes | maintainers | Team groups, summons / area effects in the observation, per-instance map folders, teammate respawn. Needed for duo / trio and generated maps; solo battles work without them. Not published yet. |
@@ -19,8 +19,8 @@ Without the host, only the offline self-checks run.
 
 ```bash
 # 1. nirkt's code
-git clone <bulletlabels> bulletlabels && git -C bulletlabels checkout 52184b2
-git clone <nbrl-env> nbrl-env
+git clone https://github.com/nirkt/bulletlabels bulletlabels && git -C bulletlabels checkout 52184b2
+git clone https://github.com/nirkt/nbrl-env nbrl-env
 git -C bulletlabels apply ../bsrl-sim/host/fair_view.patch
 
 # 2. build the host (nirkt's native/README.md has the details); the binary must be native/loader/nbhost_rl

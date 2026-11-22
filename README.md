@@ -6,7 +6,8 @@ classes, a set of detected entities with measured detector noise and latency, an
 testbed for training agents that have to act from imperfect perception, and policies trained here can run behind real
 vision models without retraining.
 
-This repository is the RL layer only. The battles themselves run in **nirkt's** `nbrl-env` / `bulletlabels` host
+This repository is the RL layer only. The battles themselves run in **nirkt's**
+[`bulletlabels`](https://github.com/nirkt/bulletlabels) host and [`nbrl-env`](https://github.com/nirkt/nbrl-env)
 (see [NOTICE.md](NOTICE.md)), which this code drives through its `MAEnv`. Neither that host nor any game file is
 included here, and nothing here runs without it.
 
