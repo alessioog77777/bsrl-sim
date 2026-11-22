@@ -6,9 +6,8 @@ classes, a set of detected entities with measured detector noise and latency, an
 testbed for training agents that have to act from imperfect perception, and policies trained here can run behind real
 vision models without retraining.
 
-The battles run in **nirkt's** [`bulletlabels`](https://github.com/nirkt/bulletlabels) host and
-[`nbrl-env`](https://github.com/nirkt/nbrl-env) environment. Both come in as git submodules under `deps/`
-(see [NOTICE.md](NOTICE.md)), and `setup.sh` builds everything. Game files are not included: you supply them.
+The battles run in **nirkt's** battle host and environment, included under `deps/` (see Credits). `setup.sh` builds
+everything. Game files are not included: you supply them.
 
 ## What is here
 
@@ -27,9 +26,9 @@ The battles run in **nirkt's** [`bulletlabels`](https://github.com/nirkt/bulletl
 | `viz.html` | Run dashboard: training / eval curves, action histograms, battle replay with the policy's view. |
 | `hud_ui.npy` | Measured share of each tile hidden by the game HUD (used by the noisy observation). |
 | `env.sh` | Environment variables for the host, nirkt's packages and the work folder. |
-| `setup.sh` | One-command setup: submodules, patches, host build, venv, game files (SETUP.md). |
-| `deps/` | nirkt's `bulletlabels` and `nbrl-env` (git submodules, pinned commits). |
-| `host/training_round.patch`, `host/fair_view.patch` | This project's changes to nirkt's host and camera rules. `setup.sh` applies them. |
+| `setup.sh` | One-command setup: host build, venv, game files (SETUP.md). |
+| `deps/` | nirkt's `bulletlabels` and the `py/` + `train/` parts of `nbrl-env`, with this project's changes applied. |
+| `host/training_round.patch`, `host/fair_view.patch` | Record of this project's changes to nirkt's host and camera rules (already applied in `deps/`). |
 | `pro_strategies.md` | Community Showdown habits and what each means for the observation / reward. |
 
 ## Requirements
@@ -42,7 +41,7 @@ The battles run in **nirkt's** [`bulletlabels`](https://github.com/nirkt/bulletl
 ## Setup
 
 ```bash
-git clone --recursive https://github.com/mlgdoggynoob/bsrl-sim && cd bsrl-sim
+git clone https://github.com/mlgdoggynoob/bsrl-sim && cd bsrl-sim
 APK=/path/to/nb_68.279_release_7c5c5152.apk ./setup.sh
 source env.sh
 ```
@@ -83,4 +82,12 @@ cd $SIM_WORK/runs && python -m http.server 8766      # dashboard: http://localho
 
 ## Licence
 
-GNU Affero General Public License v3.0, see [LICENSE](LICENSE). Credits: [NOTICE.md](NOTICE.md).
+GNU Affero General Public License v3.0, see [LICENSE](LICENSE), for this project's own code. `deps/` is not covered by
+it (see Credits).
+
+## Credits
+
+Built on [nirkt](https://github.com/nirkt)'s work: the battle host
+([bulletlabels](https://github.com/nirkt/bulletlabels) @ `52184b2`) and the environment
+([nbrl-env](https://github.com/nirkt/nbrl-env) @ `7ff57bc`) in `deps/` are nirkt's code, under nirkt's terms, with
+this project's changes from `host/*.patch` applied.

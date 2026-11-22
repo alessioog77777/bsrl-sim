@@ -10,3 +10,6 @@ HISTORY.md
 *.prof.txt
 .venv/
 work/
+
+# built by setup.sh
+deps/bulletlabels/native/loader/nbhost_rl
