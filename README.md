@@ -20,7 +20,7 @@ everything. Game files are not included: you supply them.
 | `train_ppo.py` | Behaviour cloning from the native AI, then PPO with a KL anchor, league / self-play, evals, replays. |
 | `train_fast.py` | Same trainer with environment collection split over worker processes (shared memory). |
 | `scorecard.py` | Skill metrics of a run from its logs: placement, win rate, trade, hit rate, aim lead, cube and gas stats. |
-| `live_check.py` | One-boot check of the host round: team reward, area effects (radius, kind), generated maps, teammate respawn, HUD mask, live map tiles, cubes lost at a knock-out. |
+| `live_check.py` | One-boot check of the host round: team reward, area effects (radius, kind), teammate respawn, HUD mask, live map tiles, cubes lost at a knock-out. |
 | `test_fast.py` | Equality and timing of the fast paths against the reference paths on real battles. |
 | `apply_noise.py` | Writes a measured detector-noise report into `obs_v5.NOISE` (with sanity limits). |
 | `viz.html` | Run dashboard: training / eval curves, action histograms, battle replay with the policy's view. |
@@ -57,7 +57,7 @@ python -m obs_v5 && python -m model && python -m fast_obs && python -m env_v5 --
 Live checks (boot the host; each boot takes about 60-90 s):
 
 ```bash
-python -m live_check --n 2 --minutes 8 --gen 1
+python -m live_check --n 2 --minutes 8
 python -m env_v5 --n 4 --minutes 2 --agents 10      # random-action benchmark
 ```
 
@@ -70,12 +70,14 @@ python scorecard.py my_run
 cd $SIM_WORK/runs && python -m http.server 8766      # dashboard: http://localhost:8766/my_run/
 ```
 
-`python -m train_ppo --help` lists every flag (sliders, teams, generated maps, league, KL anchor, reward weights).
+`python -m train_ppo --help` lists every flag (sliders, teams, league, KL anchor, reward weights).
 
 ## Notes
 
 - Comments cite numbered entries of the project's private decision log (`HISTORY N`). They explain why a value is
   what it is; the log itself is not published.
+- Generated layouts (`--gen`) were made for the vision models' training data and are not used for RL; their
+  generator is not in this repository.
 - The fire head is none / attack / super: gadgets and hypercharge cannot be triggered on this host.
 - Observation layout changes must be mirrored by anything that consumes exported policies. `obs_v5` carries the
   version (`obs_v5.OBS_VERSION`, now `v5.3`; saved in every checkpoint) that exported policies are checked against.
