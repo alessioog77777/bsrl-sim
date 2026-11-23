@@ -10,10 +10,11 @@ team size and brawler:
   trade      damage dealt / damage taken (sim term units)
   hit, dps   hits / shots, damage per shot (ammo efficiency: wasted shots lower it)
   cubes, alive_s, gas   cubes picked, seconds survived, share killed by the gas
-  behaviour  (rows with env_v5 "beh" counters) shares of alive time hidden by a bush / engaged / in gas, mate 1.5-4
+  behaviour  (rows with env_v5 "beh" counters) shares of alive time hidden by a bush / engaged / in gas / near it, mate 1.5-4
              tiles / < 1 tile (share of time with a mate), range ratio, damage per minute, cubes held at the end
 Presets (eval kind evalp, train --eval-presets): per preset the metrics above, the paired difference to balanced on
-  the same seeds (mean, SE) and a pass rule per style (PASS_RULES; every preset: place within 0.5 of balanced).
+  the same seeds (mean, SE) and a pass rule per style (PASS_RULES; every preset: place within 0.5 of balanced); a rule
+  whose metric is undefined there (mate metrics in solo evals) is listed as n/a, not failed.
 Slider slopes (training rows, sampled weights): OLS of each per-episode metric on the slider weights -> slope and SE per
   (slider, metric); "own" = each slider's own term per minute (s_<slider>): t < 2 = the slider changes nothing.
 From replays/*.json (one learner battle per update, true positions):
@@ -77,7 +78,8 @@ def beh_metrics(r):
     al = max(b["alive"], 1.0); mt = b["mate"]; nan = float("nan"); mins = al * STEP_S / 60.0
     out = {"hidden": b["hidden"] / al, "bush": b["bush"] / al, "engaged": b["engaged"] / al, "gas": b["gas"] / al,
            "band": b["mate_band"] / mt if mt else nan, "clump": b["clump"] / mt if mt else nan,
-           "range": b["range_ratio"] / b["near"] if b["near"] else nan, "dealt_min": b["dealt"] / mins, "cubes_end": b["cubes_end"]}
+           "range": b["range_ratio"] / b["near"] if b["near"] else nan, "dealt_min": b["dealt"] / mins, "cubes_end": b["cubes_end"],
+           "gas_near": b.get("gas_near", 0.0) / al}
     for k, v in r["terms"].items():
         if k.startswith("s_"): out[k + "_min"] = v / mins
     return out
@@ -85,7 +87,7 @@ def beh_metrics(r):
 
 # per style: (metric, op, k, how): preset mean op (balanced mean x k | + k)
 PASS_RULES = {"bush_camper": [("hidden", ">=", 1.5, "x")], "aggressive": [("engaged", ">=", 1.3, "x"), ("dealt_min", ">", 1.0, "x")],
-              "cube_farmer": [("cubes_end", ">=", 1.3, "x"), ("gas", "<=", 0.005, "+")], "team_player": [("clump", "<=", 0.02, "+")],
+              "cube_farmer": [("cubes_end", ">=", 1.3, "x"), ("gas", "<=", 0.005, "+")], "team_player": [("band", ">=", 1.2, "x"), ("clump", "<=", 0.02, "+")],
               "marksman": [("range", ">=", 1.1, "x")], "third_partier": [("s_third_party_min", ">=", 1.3, "x")]}
 PLACE_TOL = 0.5   # a style may cost at most half a rank on average
 
@@ -109,11 +111,12 @@ def preset_report(rows):
             d = [seeds[s][k] - base[s][k] for s in seeds if s in base and k in base[s] and seeds[s][k] == seeds[s][k] and base[s][k] == base[s][k]]
             if len(d) > 1: o["d_" + k] = [round(float(np.mean(d)), 4), round(float(np.std(d, ddof=1) / np.sqrt(len(d))), 4)]
         if p != "balanced" and base:
-            bm = {k: _nm(m.get(k, float("nan")) for m in base.values()) for k in keys}; why = []
+            bm = {k: _nm(m.get(k, float("nan")) for m in base.values()) for k in keys}; why = []; na = []
             for k, op, f, how in PASS_RULES.get(p, []) + [("place", "<=", PLACE_TOL, "+")]:
                 tgt = bm.get(k, float("nan")) * f if how == "x" else bm.get(k, float("nan")) + f; v = o.get(k, float("nan"))
+                if not (v == v and tgt == tgt): na.append(k); continue   # undefined here (mate metrics in solo evals)
                 if not (v >= tgt if op == ">=" else v > tgt if op == ">" else v <= tgt): why.append("%s %.3f %s %.3f" % (k, v, op, tgt))
-            o["pass"], o["why"] = not why, why
+            o["pass"], o["why"], o["n/a"] = not why, why, na
         out[p] = o
     return out
 
@@ -228,6 +231,7 @@ def _check():
          [row("evalp", "aggressive", sd, [0, 1, 2], 0.05, 0.22) for sd in range(20)]
     pr = preset_report(ev)
     assert pr["bush_camper"]["pass"] and not pr["aggressive"]["pass"] and pr["aggressive"]["why"][0].startswith("engaged"), pr["aggressive"]
+    assert pr["bush_camper"]["n/a"] == [] and preset_report([{**r, "tag": {**r["tag"], "preset": "team_player" if r["tag"]["preset"] == "aggressive" else r["tag"]["preset"]}} for r in ev])["team_player"]["n/a"] == ["band", "clump"]
     assert abs(pr["bush_camper"]["d_hidden"][0] - 0.105) < 0.01 and pr["bush_camper"]["n"] == 20 and "pass" not in pr["balanced"]
     W = rng.uniform(0, 2, (300, 3)); tr = [row("k1", None, k, list(w), 0.1 + 0.05 * w[0] + 0.01 * rng.normal(), 0.2) for k, w in enumerate(W)]
     sl = slider_slopes(tr)
@@ -251,6 +255,7 @@ if __name__ == "__main__":
             sc["run"], ev.get("place"), ev.get("win"), ev.get("trade"), ev.get("hit"), ev.get("dps"), ev.get("cubes"),
             ev.get("alive_s"), rp.get("lead"), rp.get("aim_err"), rp.get("range"), os.path.join(run, "scorecard.json")))
         if sc["presets"]:
-            print("presets: " + ", ".join("%s %s (place %s%s)" % (p, "PASS" if v.get("pass") else "-" if "pass" not in v else "FAIL", v.get("place"),
-                                                                 "; " + "; ".join(v["why"]) if v.get("why") else "") for p, v in sc["presets"].items()))
+            print("presets: " + ", ".join("%s %s (place %s%s%s)" % (p, "PASS" if v.get("pass") else "-" if "pass" not in v else "FAIL", v.get("place"),
+                                                                 "; " + "; ".join(v["why"]) if v.get("why") else "",
+                                                                 "; n/a " + ", ".join(v["n/a"]) if v.get("n/a") else "") for p, v in sc["presets"].items()))
         if sc["slopes"].get("own_t"): print("slider own-term t (< 2 = no effect):", sc["slopes"]["own_t"])

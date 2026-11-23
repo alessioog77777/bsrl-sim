@@ -9,8 +9,8 @@
     o["ent"]  (B, 39, 20)  present | class one-hot (ENT) | dx, dy (10 tiles, x right / y down) | vx, vy (tiles/tick) | hp fraction
                        | area effects: radius (10 tiles), harms me, helps me, slows me (0 for every other class)
     o["grid"] (B, 25, 25) uint8  seg class id (SEG) per tile around the player, UNKNOWN outside the camera view
-    cond(brawler, sliders, team_size, cubes, left) (28,)  own brawler stats + behaviour weights + team size + HUD numbers
-    preset_vec(name) (10,)  the slider weights of a named play-style mode (PRESETS: balanced, bush_camper, aggressive, ...)
+    cond(brawler, sliders, team_size, cubes, left) (30,)  own brawler stats + behaviour weights + team size + HUD numbers
+    preset_vec(name) (12,)  the slider weights of a named play-style mode (PRESETS: balanced, bush_camper, aggressive, ...)
 
 Source = the host's state2 vector + grid after nbpc.fair (already camera- and bush-limited). Needs the rl-round
 host `nbhost_rl` (enemy features 14 / 15 = summon / on my team, self 18 = hypercharge fraction, grid channel 0 =
@@ -36,12 +36,19 @@ SEG = ("floor", "indestructible", "destructible_wall", "fragile_wall", "bush", "
 UNKNOWN = len(SEG)
 ENT = ("enemy", "teammate", "enemy_summon", "teammate_summon", "power_box", "power_cube", "enemy_projectile",
        "teammate_projectile", "enemy_area_effect", "teammate_area_effect")
-SLIDERS = ("bush_camp", "collect", "protect", "retreat", "kite", "peek", "focus", "push", "third_party", "bush_control")
-OBS_VERSION = "v5.3"   # v5.3: + 4 area-effect columns (RAD, HARM, HELP, SLOW) at the end of each entity row
+SLIDERS = ("bush_camp", "collect", "protect", "retreat", "kite", "peek", "focus", "aggressive", "third_party", "bush_control",
+           "leash", "gas_safe")
+# v5.3: + 4 area-effect columns (RAD, HARM, HELP, SLOW) at the end of each entity row; v5.4: slider 7 push -> aggressive,
+# + sliders leash / gas_safe at the end of cond (COND_SLIDERS)
+OBS_VERSION = "v5.4"
 N_SELF, N_ENT, F_ENT, G = 8, F.EN_K + F.PJ_K + F.BX_K + F.IT_K, 1 + len(ENT) + 9, 25
 XY, VEL, HP, RAD = 1 + len(ENT), 3 + len(ENT), 5 + len(ENT), 6 + len(ENT)   # RAD, RAD + 1..3 = radius, harms / helps / slows me
 F_ENT_V52 = 1 + len(ENT) + 5             # entity row width up to v5.2 (model.load_state_dict pads old checkpoints)
 N_COND = 13 + len(SLIDERS) + 3 + 2      # + own cubes, teams / players left (Showdown HUD; BSRL brain/hud.py live)
+N_COND_V53 = 28                          # cond width up to v5.3 (10 sliders); the 2 newer sliders sit at the end
+# cond index of each slider (order SLIDERS): the first 10 after the 13 stats, the ones added later at the end, so an older
+# checkpoint's input weights zero-pad at the end (model.load_state_dict) and act the same
+COND_SLIDERS = np.r_[13:23, N_COND_V53:N_COND]
 LEFT0 = {1: 10, 2: 5, 3: 4}              # teams left at the start by team size (sim trio = 3 x 3 + 1 solo, live 4 x 3)
 _S, _E = SEG.index, ENT.index
 _AREA_C = [ENT.index("enemy_area_effect"), ENT.index("teammate_area_effect")]
@@ -319,12 +326,13 @@ def brawler_stats(name):
 # Inference: cond(..., sliders=preset_vec(name)). 2 = the style's own sliders, 0-0.5 = what the style gives up.
 PRESETS = {
     "balanced": {},
-    "bush_camper": {"bush_camp": 2, "collect": .5, "retreat": 1.5, "push": 0, "third_party": 1.5, "bush_control": .5},
-    "aggressive": {"bush_camp": 0, "collect": .5, "retreat": .5, "kite": .3, "peek": .5, "focus": 2, "push": 2, "third_party": .5, "bush_control": .5},
-    "cube_farmer": {"bush_camp": .5, "collect": 2, "protect": .5, "retreat": 1.5, "peek": .5, "push": .3},
-    "third_partier": {"protect": .5, "kite": 1.5, "focus": 1.5, "push": .3, "third_party": 2},
-    "marksman": {"bush_camp": .5, "protect": .5, "retreat": 1.5, "kite": 2, "peek": 1.5, "push": 0},
-    "team_player": {"bush_camp": .5, "collect": .5, "protect": 2, "focus": 2, "third_party": .5, "bush_control": .5},
+    "bush_camper": {"bush_camp": 2, "collect": .5, "retreat": 1.5, "aggressive": 0, "third_party": 1.5, "bush_control": .5, "gas_safe": 1.5},
+    "aggressive": {"bush_camp": 0, "collect": .5, "retreat": .5, "kite": .3, "peek": .5, "focus": 2, "aggressive": 2, "third_party": .5,
+                   "bush_control": .5, "gas_safe": .5},
+    "cube_farmer": {"bush_camp": .5, "collect": 2, "protect": .5, "retreat": 1.5, "peek": .5, "aggressive": .3, "leash": .5, "gas_safe": 1.5},
+    "third_partier": {"protect": .5, "kite": 1.5, "focus": 1.5, "aggressive": .3, "third_party": 2, "leash": .5},
+    "marksman": {"bush_camp": .5, "protect": .5, "retreat": 1.5, "kite": 2, "peek": 1.5, "aggressive": 0, "leash": .5},
+    "team_player": {"bush_camp": .5, "collect": .5, "protect": 2, "focus": 2, "third_party": .5, "bush_control": .5, "leash": 2},
 }
 
 
@@ -335,11 +343,12 @@ def preset_vec(name):
 
 
 def cond(brawler, sliders, team_size=1, cubes=0, left=None):
-    """conditioning vector: brawler stats (13) + slider weights 0-2 (10, order SLIDERS) + team size 1-3 one-hot
-    + own power cubes / 10 (max 2) + teams (solo: players) left / 10, the two Showdown HUD numbers"""
-    t = np.zeros(3, np.float32); t[team_size - 1] = 1.0
+    """conditioning vector: brawler stats (13) + slider weights 0-2 (the first 10 of SLIDERS) + team size 1-3 one-hot
+    + own power cubes / 10 (max 2) + teams (solo: players) left / 10, the two Showdown HUD numbers + the later sliders
+    (leash, gas_safe). COND_SLIDERS = each slider's index."""
+    t = np.zeros(3, np.float32); t[team_size - 1] = 1.0; w = np.asarray(sliders, np.float32)
     hud = np.array([min(cubes, 20) / 10.0, (LEFT0[team_size] if left is None else left) / 10.0], np.float32)
-    return np.concatenate([brawler_stats(brawler), np.asarray(sliders, np.float32), t, hud])
+    return np.concatenate([brawler_stats(brawler), w[:10], t, hud, w[10:]])
 
 
 def _check():
@@ -434,9 +443,12 @@ def _check():
     assert st.shape == (len(hs), 13) and np.isfinite(st).all() and st.min() >= 0 and st.max() <= 2, (st.min(), st.max())
     assert np.allclose(brawler_stats("ShotgunGirl")[[0, 1, 3, 6, 7, 8]], [23 / 30, 0.77, 3100 / 4000, 0, 0, 0.39])
     assert brawler_stats("Barkeep")[6] == 1 and brawler_stats("Undertaker")[7] == 1
-    c = cond("Sniper", np.ones(10), 3)
-    assert c.shape == (N_COND,) and c[-3] == 1 and c[-5] == 0 and c[-2] == 0 and abs(c[-1] - 0.4) < 1e-6
-    assert np.allclose(cond("Sniper", np.ones(10), 1, cubes=3, left=7)[-2:], [0.3, 0.7])
+    c = cond("Sniper", np.ones(len(SLIDERS)), 3)
+    assert c.shape == (N_COND,) and c[25] == 1 and c[23] == 0 and c[26] == 0 and abs(c[27] - 0.4) < 1e-6
+    assert np.allclose(cond("Sniper", np.ones(len(SLIDERS)), 1, cubes=3, left=7)[26:28], [0.3, 0.7])
+    w = np.arange(len(SLIDERS), dtype=np.float32) / 10; c = cond("Sniper", w, 2)
+    assert np.allclose(c[COND_SLIDERS], w) and N_COND == 30 and len(COND_SLIDERS) == len(SLIDERS) and np.allclose(c[:13], brawler_stats("Sniper"))
+    assert c[:N_COND_V53].shape == (28,) and np.allclose(c[13:23], w[:10]) and c[24] == 1   # the v5.3 layout is the first 28
     assert set(PRESETS) >= {"balanced", "bush_camper", "aggressive", "cube_farmer"} and all(set(v) <= set(SLIDERS) for v in PRESETS.values())
     pv = np.stack([preset_vec(k) for k in PRESETS])
     assert pv.shape == (len(PRESETS), len(SLIDERS)) and pv.min() >= 0 and pv.max() <= 2 and (preset_vec("balanced") == 1).all()

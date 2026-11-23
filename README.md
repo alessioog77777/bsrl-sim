@@ -14,7 +14,7 @@ everything. Game files are not included: you supply them.
 | File | What it does |
 |---|---|
 | `env_v5.py` | Randomised Showdown battles on top of nirkt's `MAEnv`: random map, brawlers, solo / duo / trio teams, policy-controlled slots vs the native AI, team placement reward, behaviour-slider reward terms (per-slider normalisation from native-AI battles: `--native 1 --episodes F`, then `--norm F`). `python -m env_v5 --check` |
-| `obs_v5.py` | The observation: `self` (8), `ent` (39 x 20 entity slots; area effects with radius and harms / helps / slows me), `grid` (25 x 25 tile classes), `cond` (28: brawler stats, 10 slider weights, team size, cubes, players left); named slider presets (play-style modes: bush camper, aggressive, cube farmer, ...). Per-episode detector noise, latency and HUD masking. `python -m obs_v5` |
+| `obs_v5.py` | The observation: `self` (8), `ent` (39 x 20 entity slots; area effects with radius and harms / helps / slows me), `grid` (25 x 25 tile classes), `cond` (30: brawler stats, 12 slider weights, team size, cubes, players left); named slider presets (play-style modes: bush camper, aggressive, cube farmer, ...). Per-episode detector noise, latency and HUD masking. `python -m obs_v5` |
 | `fast_obs.py`, `fast_act.py` | Batched, vectorised versions of the observation builder and the actor for the multi-process trainer (bit-equal to the reference paths). |
 | `model.py` | Policy: entity set + tile grid + conditioning -> GRU -> move (17) / fire (3) / aim (360, pointer over targets) / distance heads, critic with a privileged branch. `python -m model` |
 | `train_ppo.py` | Behaviour cloning from the native AI, then PPO with a KL anchor, league / self-play, evals, replays. |
@@ -80,7 +80,7 @@ cd $SIM_WORK/runs && python -m http.server 8766      # dashboard: http://localho
   generator is not in this repository.
 - The fire head is none / attack / super: gadgets and hypercharge cannot be triggered on this host.
 - Observation layout changes must be mirrored by anything that consumes exported policies. `obs_v5` carries the
-  version (`obs_v5.OBS_VERSION`, now `v5.3`; saved in every checkpoint) that exported policies are checked against.
+  version (`obs_v5.OBS_VERSION`, now `v5.4`; saved in every checkpoint) that exported policies are checked against.
 
 ## Licence
 

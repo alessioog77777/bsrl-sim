@@ -1,6 +1,6 @@
 """Policy for the ObsV5 observation: entity set + seg-class grid + self / conditioning vector -> GRU -> heads.
 
-    net = Policy(); logits, v, h = net(s, ent, grid, h)      # one decision; s = cat[self (8), cond (26)], h (B, HID)
+    net = Policy(); logits, v, h = net(s, ent, grid, h)      # one decision; s = cat[self (8), cond (30)], h (B, HID)
     logits, v = net.seq(s, ent, grid, h0)                     # (N, L, ...) chunks from stored h0 -> flat (N * L) outputs
     logits = move 17 | fire 3 (none / attack / super) | aim 360 (pointer over visible enemies / boxes + free) | distance 8
 
@@ -14,6 +14,8 @@ Stage 2 (BSRL v2 plan), both zero-initialised so s3 / s4 checkpoints act the sam
   the `hero_stats` table (add_heroes; saved in the checkpoint, rows never reorder), unknown = the last row.
 Obs v5.3 (obs_v5.OBS_VERSION): 4 area-effect columns at the end of the observation's entity row, before the lead columns;
 load_state_dict zero-pads v5.2 checkpoints there (same outputs).
+Obs v5.4: cond grew by 2 sliders (leash, gas_safe) at its end = the end of `s`; the generic pad zero-fills those
+`vec.0` input columns of a v5.3 checkpoint (same outputs; slot 7 push -> aggressive keeps its column).
 """
 import numpy as np
 import torch
@@ -245,10 +247,12 @@ def _check_stage2():
     with torch.no_grad():                                                                 # a v5.2 net: lead used, no area columns
         nn.init.normal_(a.ent[0].weight[:, O.F_ENT:], std=0.3); nn.init.normal_(a.cand[0].weight[:, -N_LEAD:], std=0.3)
         a.ent[0].weight[:, O.F_ENT_V52:O.F_ENT] = 0; a.cand[0].weight[:, pre + O.F_ENT_V52:pre + O.F_ENT] = 0
+        a.vec[0].weight[:, O.N_SELF + O.N_COND_V53:] = 0                                 # and v5.3's cond (28: no leash / gas_safe)
     ref = a.seq(s, ent, grid, h0)[0]
     old = {k: v for k, v in a.state_dict().items() if k not in ("hemb.weight", "hero_stats")}
     v52 = lambda w, p: torch.cat([w[:, :p + O.F_ENT_V52], w[:, p + O.F_ENT:]], 1)        # the v5.2 layout: row 16 | lead 2
     old["ent.0.weight"] = v52(old["ent.0.weight"], 0); old["cand.0.weight"] = v52(old["cand.0.weight"], pre)
+    old["vec.0.weight"] = old["vec.0.weight"][:, :O.N_SELF + O.N_COND_V53]; assert O.N_COND - O.N_COND_V53 == 2
     assert old["ent.0.weight"].shape[1] == O.F_ENT_V52 + N_LEAD and na == 4
     c = Policy(); c.load_state_dict({**old, "ent.0.weight": old["ent.0.weight"][:, :O.F_ENT_V52]}, strict=False)   # pre-lead format
     assert torch.equal(c.ent[0].weight[:, :O.F_ENT_V52], a.ent[0].weight[:, :O.F_ENT_V52]) and not c.ent[0].weight[:, O.F_ENT_V52:].any()

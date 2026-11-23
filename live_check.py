@@ -8,7 +8,9 @@
   6. live map: destroyed walls / bushes leave the slider masks (Env.MAP_EVERY) and read as open in the observation grid;
   7. cubes held (cubes_total) drop to 0 at a team knock-out (and the brawler's max HP by 400 per cube); half the battles
      are played by the native AI (cfg native_ctl), which collects cubes;
-  8. area effects carry a radius (> 0) and a kind (harms / helps / slows me) in the observation.
+  8. area effects carry a radius (> 0) and a kind (harms / helps / slows me) in the observation;
+  9. gas margin (env_v5.gas_margin from the latched storm step NbeResp.reserved[0], slider gas_safe) < 0 exactly where
+     the host flags in_gas.
 python -m live_check --n 2 --minutes 8 [--gen 1]"""
 import argparse, collections, time, numpy as np
 import env_v5 as E, obs_v5 as O
@@ -16,6 +18,7 @@ from nbpc import fair as F
 
 RS = collections.Counter(); RD = []; RDN = []   # respawn stats; distance respawned -> nearest living mate (RDN: native-played battles)
 MP = collections.Counter(); OPENED = {}; CB = collections.Counter()   # live map; battle -> {tile index: now open}; cubes
+GS = collections.Counter()   # 9: alive player-steps, in gas, margin < 0 agrees with in_gas
 class T(E.Env):
     bg = {}; bl = {}
     def _finish_step(self, i, r):
@@ -25,6 +28,11 @@ class T(E.Env):
                 c0, m0 = s.held[p]; CB["out_with_cubes"] += 1; CB["dropped"] += int(r.pl[p].cubes_total == 0)
                 CB["max_hp_ok"] += int(r.pl[p].max_hp == m0 - 400 * c0); CB["cubes_step_neg"] += int(r.pl[p].cubes < 0)
             s.held[p] = (int(r.pl[p].cubes_total), int(r.pl[p].max_hp))
+        for p in range(10):                              # 9: gas margin vs the host's in_gas flag
+            pl = r.pl[p]
+            if pl.alive and not pl.eliminated and pl.reserved[3] <= 0:
+                m = E.gas_margin(pl.x, pl.y, int(r.reserved[0]), s.W, s.H)[0]
+                GS["n"] += 1; GS["in_gas"] += int(pl.in_gas > 0); GS["match"] += int((pl.in_gas > 0) == (m < 0))
         old = s.map_tiles
         for p in prev:
             if r.pl[p].reserved[3] == 0 and not r.pl[p].eliminated and r.pl[p].alive:   # a wipe: hp 0 a step before eliminated
@@ -115,4 +123,6 @@ print("live map:", dict(MP), "| cubes at knock-outs:", dict(CB))
 assert MP["refresh"] > 0 and MP["cover_or_bush_gone"] > 0 and MP["masks_live"] == MP["refresh"]
 assert MP["grid_open_ok"] > 0 and MP["grid_open_bad"] <= 0.01 * MP["grid_open_ok"], "observation grid not live"
 assert CB["out_with_cubes"] > 0 and CB["dropped"] == CB["out_with_cubes"] == CB["max_hp_ok"] and not CB["cubes_step_neg"]
+print("gas margin vs in_gas:", dict(GS))
+assert GS["in_gas"] > 0 and GS["n"] - GS["match"] <= 0.02 * GS["in_gas"], dict(GS)
 assert area["radius>0"] > 0.8 * area["rows"] and area["harms"] > 0 and area["helps"] + area["slows"] > 0, dict(area)
