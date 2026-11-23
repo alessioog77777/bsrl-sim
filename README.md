@@ -19,6 +19,7 @@ everything. Game files are not included: you supply them.
 | `model.py` | Policy: entity set + tile grid + conditioning -> GRU -> move (17) / fire (3) / aim (360, pointer over targets) / distance heads, critic with a privileged branch. `python -m model` |
 | `train_ppo.py` | Behaviour cloning from the native AI, then PPO with a KL anchor, league / self-play, evals, replays. |
 | `train_fast.py` | Same trainer with environment collection split over worker processes (shared memory). |
+| `planner.py` | Planning layer: written rules pick one intent + goal point about once a second from the same observation, with a readable reason ("gas 1 tile away: moving E out of it"); entity confirmation and memory against the detector noise. `python -m planner` |
 | `scorecard.py` | Skill metrics of a run from its logs: placement, win rate, trade, hit rate, aim lead, cube and gas stats. |
 | `live_check.py` | One-boot check of the host round: team reward, area effects, generated maps, teammate respawn, HUD mask. |
 | `test_fast.py` | Equality and timing of the fast paths against the reference paths on real battles. |
