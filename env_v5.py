@@ -9,6 +9,9 @@ solo: the sim has 10 players, the real mode 12) teams, and `agents` policy-contr
 The battle is still Solo Showdown underneath (teams only change who can hurt whom), so MAEnv's rank / place reward is
 per player; `Env` holds a grouped agent's final transition until its team's rank is known and swaps in the team's
 place / win (`team_ranks`). Solo players: unchanged.
+Hard scenarios (scenarios.py, cfg "scenario"): Env runs the scripted set-up before MAEnv's trackers start
+(_start_battle), sends the scenario's forced storm ring and events every step, ends the battle at its horizon, keeps a
+trace and puts the scores / pass into the agent's episode row ("scn").
 Aux-head labels (trainer --aux-w, model.Policy.aux), from the sim's true state: `Env.aux_now(ids)` at poll time (AUX
 row: true positions, alive enemies, own index, gas margin, hidden enemies in bushes by sector), and the enemy damage
 taken per step `te` in every transition's terms.
@@ -24,6 +27,11 @@ SKIP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skip.json"
 
 def _skip():
     return json.load(open(SKIP_FILE)) if os.path.exists(SKIP_FILE) else {}
+
+
+def SC():
+    import scenarios                                     # lazy: only scenario battles (cfg "scenario") use it
+    return scenarios
 
 
 def heroes():
@@ -295,8 +303,15 @@ class Env(MAEnv):
 
     def _send_step(self, i, acts):
         s = self.I[i]; s.nstep = getattr(s, "nstep", 0) + 1; self._map_now = s.nstep % self.MAP_EVERY == 0
-        try: super()._send_step(i, acts)
+        try:
+            if getattr(s, "scn", None) is not None: SC().send_step(self, i, acts)   # scenario: its events + forced storm ring
+            else: super()._send_step(i, acts)
         finally: self._map_now = False
+
+    def _battle_over(self, i, r):
+        s = self.I[i]; sc = getattr(s, "scn", None)
+        if sc is not None and r.tick - s.start_tick >= sc["horizon"]: return True   # a scenario ends at its horizon
+        return super()._battle_over(i, r)
 
     def _labels(self, s, r):
         """player -> [move, fire, aim, dist] the native AI did this step: the rules of nirkt's collect_demos4 (move = the
@@ -322,8 +337,18 @@ class Env(MAEnv):
         return super()._restart(i, why)
 
     def _start_battle(self, i, r):
+        s = self.I[i]; scn = (s.cfg or {}).get("scenario")
+        if scn:                                          # hard scenario: scripted set-up first, r (= s.inst.resp) is its end state
+            from nbpc.instance import InstanceDead
+            try: SC().preroll(self, i)
+            except InstanceDead as e: s.scn = None; return self._restart(i, "scenario pre-roll: %s" % e)   # the item is lost
         super()._start_battle(i, r)
-        s = self.I[i]; s.hold = {}                       # player -> its final transition, held until the team's rank is known
+        s.scn = SC().start(self, s) if scn else None     # its trace (scores at the episode's end)
+        if scn and 0 not in s.agents:                    # the agent did not survive the set-up: an invalid row, no battle
+            self.episodes.append({"seed": int(s.cfg["seed"]), "player": 0, "rank": None, "win": None, "ticks": 0, "steps": 0, "ret": 0.0,
+                                  "terms": {}, "storm_death": 0, "truncated": True, "restart": False, "tag": s.cfg.get("tag"), "ctl": s.ctl,
+                                  "invalid": "agent out after the scenario set-up", "scn": None})
+        s.hold = {}                                      # player -> its final transition, held until the team's rank is known
         tag = s.cfg.get("tag") or {}
         s.sl = slider_state(s.map_tiles, s.W, s.H, tag.get("chr", []), self.rng, w=tag.get("sliders"), mode=self.slider_sample)
         s.map_hash = int(r.map_hash)
@@ -351,6 +376,7 @@ class Env(MAEnv):
         sl["asum"] += np.abs(T)
         n0, e0 = len(self._trans), len(self.episodes)
         lab = self._labels(s, r) if self.record and s.cfg.get("native_ctl") else {}
+        if getattr(s, "scn", None) is not None: SC().trace(s.scn, r, lab.get(0) if s.cfg.get("native_ctl") else s.acts.get(0))
         s.pos = {p: (r.pl[p].x, r.pl[p].y) for p in range(10)}; s.ptick = r.tick; s.pjump = {int(r.jumps[k][0]) for k in range(r.njumps)}
         g = np.array((s.cfg.get("tag") or {}).get("groups") or [0] * 10)
         if g.any(): pr, dead = player_ranks(r); b0 = s.battle   # read r before a reset reuses it
@@ -387,6 +413,8 @@ class Env(MAEnv):
             row["terms"].update({"sn_" + m: round(float(v), 4) for m, v in zip(SL, sl["sumw"][p])})
             row["terms"].update({"sa_" + m: round(float(v), 4) for m, v in zip(SL, sl["asum"][p])})
             row["beh"] = {k: round(float(v), 3) for k, v in zip(BEH, sl["beh"][p])}
+            if getattr(s, "scn", None) is not None and p == 0 and (row["tag"] or {}).get("scn"):   # the scenario's agent
+                row["scn"] = {"name": s.scn["name"], "item": s.scn["item"], "battle": s.scn["battle"], "pre": s.scn["pre"], **SC().score(s.scn)}
 
     def aux_now(self, ids):
         """(B, AUX_W) aux-head labels of the agents of the last poll() from the true state of their battle's current

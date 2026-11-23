@@ -19,6 +19,8 @@ of one forward come from whichever instances were ready, and actions are sampled
 Non-acting heads (--vlive, --aux-w): as train_ppo (its helpers: targets / readouts in prepare(), losses in train()); the
 aux labels (env_v5.Env.aux_now) are computed in the workers next to priv and reach the main process in a second shared
 memory block; the replay readout (train_ppo.aux_readout of the recorded row) goes back with the actions.
+Hard scenarios (--eval-scenarios): every worker records its scenario episodes (scenarios.Recorder) and sends their
+index entries; the main process writes replays/scn/index.json and, at the eval's end, scenarios.jsonl.
 progress.jsonl: all train_ppo fields; t_poll_build_act_rest = [main waiting for workers, build per worker (mean),
 act, rest] (workers run in parallel, so they no longer add up to the collect time) + "t_fast" (more timers) and
 "wall_dps" (learner decisions per wall second incl. the update).
@@ -46,7 +48,7 @@ def parse(argv=None):
     ap.add_argument("--kmix", default="1,2,3,4,5"); ap.add_argument("--brawler", default="Sniper", help="Sniper = Piper")
     ap.add_argument("--loc", default=None, help="Showdown location (default: the first of env_v5.locations())")
     ap.add_argument("--slider-scale", type=float, default=0.0, help="weight of the slider rewards (stage 1: off)")
-    from train_ppo import slider_flags, head_flags; slider_flags(ap); head_flags(ap)   # --slider-norm / --slider-sample / --eval-sliders / --eval-presets; --vlive
+    from train_ppo import slider_flags, head_flags, scenario_flags; slider_flags(ap); head_flags(ap); scenario_flags(ap)   # sliders; --vlive / --aux-w; --eval-scenarios
     ap.add_argument("--reward-w", default="", help='JSON overrides of maenv.REWARD_W, e.g. {"taken": -0.25, "dealt": 0.3, "shots": -0.03} (HISTORY 77)')
     ap.add_argument("--noise", type=int, default=1, help="ObsV5 vision noise + latency")
     ap.add_argument("--eval-min", type=float, default=30.0); ap.add_argument("--eval-episodes", type=int, default=200)
@@ -76,7 +78,7 @@ def parse(argv=None):
     ap.add_argument("--gen", type=int, default=0, help="1 = instances boot generated layouts (env_v5.use_genmaps), played with --p-gen")
     ap.add_argument("--p-gen", type=float, default=0.5)
     a = ap.parse_args(argv)
-    if a.smoke: a.n, a.rollout, a.chunks, a.bc_updates, a.eval_episodes, a.evalb_episodes, a.hours = a.smoke_n, 2048, 64, 1, 4, 4, 0.2
+    if a.smoke: a.n, a.rollout, a.chunks, a.bc_updates, a.eval_episodes, a.evalb_episodes, a.hours, a.scenario_seeds = a.smoke_n, 2048, 64, 1, 4, 4, 0.2, 1
     a.workers = max(1, min(a.n, a.workers or (a.n + 1) // 2))
     return a
 
@@ -88,7 +90,7 @@ def worker(w, lo, hi, a, loc, out, conn, shm, init, ashm=None):
     signal.signal(signal.SIGTERM, signal.SIG_IGN); signal.signal(signal.SIGINT, signal.SIG_IGN)   # the main process stops us
     try:
         from nbpc import diversity as D
-        import env_v5 as E, obs_v5 as O, fast_obs as FO
+        import env_v5 as E, obs_v5 as O, fast_obs as FO, scenarios as SC
         from train_ppo import Recorder, eval_tag, TR_X
         from fast_act import OBS_W, _OFF
         st = dict(init); evq = []; rng_b = np.random.default_rng(a.seed + 7 + 1000 * w)
@@ -116,6 +118,7 @@ def worker(w, lo, hi, a, loc, out, conn, shm, init, ashm=None):
             cfg = {"div": D.make_div(location=tag["loc"], chr=tag["chr"]), "tag": tag, "end": "agents"}
             if evq and not bc and i >= a.n - a.eval_n:   # evals stay on --brawler / the first location (comparable numbers)
                 sd, kd, pre = evq.pop(0); b = kd == "evalb"
+                if kd == "evalscn": return SC.battle_cfg(pre)   # hard scenario (its own map / brawlers / teams)
                 if a.eval_team > 1: cfg = teams(cfg, tag, a.eval_team); tag = cfg["tag"]
                 return {**cfg, "seed": sd, "ctl": list(range(10)) if b else [0], "end": "player0",
                         "tag": {**tag, "kind": kd, "opp": list(range(1, 10)) if b else [], **eval_tag(a, pre)}}
@@ -157,6 +160,7 @@ def worker(w, lo, hi, a, loc, out, conn, shm, init, ashm=None):
                    reward_w=json.loads(a.reward_w) if a.reward_w else None)
         ob = FO.FastObsV5(noise=O.NOISE if a.noise else None, seed=a.seed + 1000 * w)
         rec = Recorder(out) if lo == 0 else None
+        srec = SC.Recorder(out) if a.eval_scenarios else None   # every scenario episode of this worker's instances
         X = np.frombuffer(shm, np.float32).reshape(-1, OBS_W); n_ep = 0; tw = np.zeros(4)   # poll / build / wait for main / messages
         XA = np.frombuffer(ashm, np.float32).reshape(-1, E.AUX_W) if a.aux_w else None     # --aux-w: aux label rows
         while True:
@@ -177,6 +181,7 @@ def worker(w, lo, hi, a, loc, out, conn, shm, init, ashm=None):
             msg["tr"] = [(aid, rew, done, t.get("_act"), {k: t[k] for k in TR_X if k in t}) for (aid, rew, done, t, rank) in tr]
             msg["dropped"] = env.dropped; env.dropped = []
             msg["eps"] = env.episodes[n_ep:]; n_ep = len(env.episodes)
+            if srec is not None: msg["scn_rep"] = [srec.finish(r) for r in msg["eps"] if r.get("scn")]   # the main writes the index
             msg["busy"] = len(evq) + sum(s.state != "idle" and (s.cfg or {}).get("tag", {}).get("kind", "").startswith("eval") for s in env.I)
             msg.update(ack=st["ver"], restarts=env.stats["restarts"], tw=tw.tolist())
             if len(env.episodes) > 4096: del env.episodes[:2048]; n_ep = len(env.episodes)   # sent already; the main keeps them
@@ -188,6 +193,7 @@ def worker(w, lo, hi, a, loc, out, conn, shm, init, ashm=None):
                 env.record = st["record"]
                 if rec is not None and st.pop("rec_want", False): rec.want = True
             if rec is not None and B: rec.frame(env, ids, o, A, st["upd"], x=xr)
+            if srec is not None and B: srec.frame(env, ids, o, A)
             env.send(ids if B else [], A if B else [])   # also steps ready instances whose agents had no observation
         env.close()
     except EOFError:
@@ -223,7 +229,8 @@ def main(argv=None):
     from nbpc.maenv import REWARD_W, TERMS
     import env_v5 as E, obs_v5 as O
     from train_ppo import Buffer, chunks, eval_summary, eval_items, eval_presets, split_params, gae, expl_var, live_targets, head_loss
-    from train_ppo import aux_targets, aux_readout
+    from train_ppo import aux_targets, aux_readout, scenario_items, scenario_eval
+    import scenarios as SC
     from fast_act import StackedActor, OBS_W, _OFF
     NS = O.N_SELF + O.N_COND
     out = os.path.join(E.WORK, "runs", a.run); os.makedirs(out, exist_ok=True)
@@ -290,6 +297,9 @@ def main(argv=None):
     epf = open(os.path.join(out, "episodes.jsonl"), "a"); evf = open(os.path.join(out, "evals.jsonl"), "a")
     evepf = open(os.path.join(out, "eval_episodes.jsonl"), "a")   # the policy's (player 0) eval rows: scorecard.py eval / per-preset groups
     prf = open(os.path.join(out, "progress.jsonl"), "a")
+    scf = open(os.path.join(out, "scenarios.jsonl"), "a") if a.eval_scenarios else None   # --eval-scenarios: one row per scenario eval
+    scef = open(os.path.join(out, "scenario_episodes.jsonl"), "a") if a.eval_scenarios else None
+    sidx = SC.ScnIndex(out) if a.eval_scenarios else None    # replays/scn/index.json (the workers write the replays)
     t0 = time.time(); n_ep = 0; ep_rows = []; stop = {"now": False}; z = np.zeros(HID, np.float32)
     signal.signal(signal.SIGTERM, lambda *_: stop.__setitem__("now", True))
     T = lambda x, dt=torch.float32: torch.as_tensor(x, device=dev).to(dt)
@@ -302,7 +312,7 @@ def main(argv=None):
     def start_eval():
         nonlocal enet
         enet = frozen(anet.state_dict())
-        items = eval_items(a)
+        items = eval_items(a) + scenario_items(a, ev.get("n", 0), upd); ev.update(n=ev.get("n", 0) + 1, t_scn=None)
         cap = [w for w in range(NWk) if cut[w + 1] > a.n - a.eval_n] or list(range(NWk))   # workers with eval instances
         for j, it in enumerate(items): extra[cap[j % len(cap)]].setdefault("eval", []).append(it)
         push(); ev.update(active=True, update=upd, steps=agent_steps, t0=time.time(), n0=len(episodes), ver=ctl["ver"])
@@ -316,6 +326,7 @@ def main(argv=None):
               **{"b_" + k: v for k, v in eval_summary(by("evalb")).items() if k in ("episodes", "rank", "ci95", "win", "top3")},
               **eval_presets(episodes[ev["n0"]:])}
         evf.write(json.dumps(sm) + "\n"); evf.flush(); print("[eval]", json.dumps(sm), flush=True); evepf.flush()
+        if scf: scenario_eval(episodes[ev["n0"]:], ev, sm["minutes"], scf, scef)
         ev.update(active=False, t_last=time.time())
         epf.flush()   # scorecard.py (CPU, own process: the loop never waits) -> RUN/scorecard.json + one line in the log
         subprocess.Popen([sys.executable, os.path.join(HERE, "scorecard.py"), out], stdin=subprocess.DEVNULL)
@@ -496,7 +507,9 @@ def main(argv=None):
                     if sent[w] != ctl["ver"]:
                         c_ = {k: v_ for k, v_ in ctl.items()}; c_.update(extra[w]); extra[w] = {}; sent[w] = ctl["ver"]
                     conns[w].send((acts_by.get(w), c_, xr_by.get(w))); waiting.discard(w)
-                for w, m_ in msgs: episodes.extend(m_["eps"])
+                for w, m_ in msgs:
+                    episodes.extend(m_["eps"])
+                    if m_.get("scn_rep"): sidx.add(m_["scn_rep"]); ev["t_scn"] = time.time()
                 for r in episodes[n_ep:]:
                     tg = r["tag"]                            # PFSP score: only battles whose snapshot stayed loaded to the end
                     if (tg["kind"] == "sp" and r["player"] in tg["opp"] and tg.get("snap") and tg["snap"] == lname[tg["slot"]]
@@ -504,7 +517,7 @@ def main(argv=None):
                         e = pf.setdefault(tg["snap"], [5.5, 0]); e[0] += 0.02 * (r["rank"] - e[0]); e[1] += 1
                     if not r["tag"]["kind"].startswith("eval") and r["player"] not in r["tag"].get("opp", ()):
                         ep_rows.append(r); epf.write(json.dumps(r) + "\n")
-                    elif r["tag"]["kind"].startswith("eval") and r["player"] == 0: evepf.write(json.dumps(r) + "\n")
+                    elif r["tag"]["kind"].startswith("eval") and r["player"] == 0 and r["tag"]["kind"] != "evalscn": evepf.write(json.dumps(r) + "\n")
                 n_ep = len(episodes)
                 if ev["active"]: finish_eval()
                 elif not a.overlap_update and not bc() and time.time() - ev["t_last"] > a.eval_min * 60: start_eval()

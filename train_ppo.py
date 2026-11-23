@@ -39,6 +39,10 @@
   aux_fut_still_tiles (stays where seen), aux_fut_match (share of seen enemy slots matched to a true enemy),
   aux_hit_auc, aux_gas_mae_tiles, aux_bush_auc (+ base rates, aux_loss_*).
   Replays: the recorded row's predictions (frame "x") and truth (frame "xt"); viz draws them.
+* Hard scenarios (--eval-scenarios 1, default 0 = off; every --scenario-every-th eval): scenarios.py's set (7 scenarios
+  x 2 maps x 2 brawler picks x --scenario-seeds layouts) joins the eval queue as kind "evalscn", played by the frozen
+  eval copy on the eval instances -> scenarios.jsonl (one row per eval: pass rate + mean scores per scenario),
+  scenario_episodes.jsonl, every episode's replay in replays/scn/ (viz: failures first).
 shortcut: no exploiters (a second learner trained only to beat this one); add them if b_rank flattens again with PFSP.
 """
 import argparse, glob, json, os, shutil, signal, sys, time
@@ -46,7 +50,7 @@ import numpy as np
 import torch
 from nbpc import diversity as D
 from nbpc.maenv import REWARD_W, TERMS
-import env_v5 as E, obs_v5 as O
+import env_v5 as E, obs_v5 as O, scenarios as SC
 from model import Policy, HID, PRIV, NONACT, dist_logp_ent, masked_kl, act_stacked, aux_losses
 
 NS = O.N_SELF + O.N_COND
@@ -77,6 +81,24 @@ class Buffer:
         self.n = len(k)
 
 
+def replay_head(s, upd):
+    """a replay's header from instance state s (live map tiles as seg letters)"""
+    tag = s.cfg["tag"]
+    tiles = O._tile_lut()[np.clip(np.asarray(s.map_tiles).reshape(s.H, s.W) % 1000000 + 1, 0, 255)] if s.map_tiles is not None else np.zeros((s.H, s.W), np.uint8)
+    return {"battle": s.battle, "update": upd, "kind": tag["kind"], "loc": tag["loc"], "chr": tag["chr"], "ctl": s.ctl, "W": s.W, "H": s.H,
+            "groups": tag.get("groups"),   # scorecard.py: teammates are not targets
+            "seg": list(O.SEG) + ["unknown"], "ent": list(O.ENT), "map": ["".join(chr(97 + c) for c in row) for row in tiles], "frames": []}
+
+
+def replay_frame(s, ids, b, o, act):
+    """one replay frame: row b of the poll (its agent = the focus), every player's true state, what the policy saw / did"""
+    r = s.inst.resp; e = o["ent"][b]; e = e[e[:, 0] > 0.5]
+    return {"t": int(r.tick), "f": int(ids[b]) & 15, "a": [int(x) for x in act[b]],
+            "p": [[int(r.pl[p].x), int(r.pl[p].y), int(r.pl[p].hp), int(r.pl[p].max_hp), int(bool(r.pl[p].alive) and not r.pl[p].eliminated)] for p in range(10)],
+            "e": [[int(x[1:1 + len(O.ENT)].argmax()), round(float(x[O.XY]), 3), round(float(x[O.XY + 1]), 3), round(float(x[O.HP]), 2)] for x in e],
+            "s": [round(float(x), 2) for x in o["self"][b, :5]], "g": "".join(chr(97 + c) for c in o["grid"][b].ravel())}
+
+
 class Recorder:
     """one battle of instance 0 per update -> replays/u<update>.json (+ index.json), the newest `keep` kept"""
     def __init__(self, out, keep=30):
@@ -95,19 +117,10 @@ class Recorder:
         if self.cur is not None and (self.cur["battle"] != s.battle or len(self.cur["frames"]) >= 600):   # 600 steps = 1 min of game
             self.flush()
         if not len(rows) or (self.cur is None and not self.want): return
-        r = s.inst.resp; b = int(rows[0]); tag = s.cfg["tag"]
+        r = s.inst.resp; b = int(rows[0])
         if self.cur is None:
-            tiles = O._tile_lut()[np.clip(np.asarray(s.map_tiles).reshape(s.H, s.W) % 1000000 + 1, 0, 255)] if s.map_tiles is not None else np.zeros((s.H, s.W), np.uint8)
-            self.cur = {"battle": s.battle, "update": upd, "kind": tag["kind"], "loc": tag["loc"], "chr": tag["chr"], "ctl": s.ctl, "W": s.W, "H": s.H,
-                        "groups": tag.get("groups"),   # scorecard.py: teammates are not targets
-                        "seg": list(O.SEG) + ["unknown"], "ent": list(O.ENT), "map": ["".join(chr(97 + c) for c in row) for row in tiles], "frames": []}
-            self.want = False
-        e = o["ent"][b]; e = e[e[:, 0] > 0.5]
-        self.cur["frames"].append({
-            "t": int(r.tick), "f": int(ids[b]) & 15, "a": [int(x) for x in act[b]],
-            "p": [[int(r.pl[p].x), int(r.pl[p].y), int(r.pl[p].hp), int(r.pl[p].max_hp), int(bool(r.pl[p].alive) and not r.pl[p].eliminated)] for p in range(10)],
-            "e": [[int(x[1:1 + len(O.ENT)].argmax()), round(float(x[O.XY]), 3), round(float(x[O.XY + 1]), 3), round(float(x[O.HP]), 2)] for x in e],
-            "s": [round(float(x), 2) for x in o["self"][b, :5]], "g": "".join(chr(97 + c) for c in o["grid"][b].ravel())})
+            self.cur = replay_head(s, upd); self.want = False
+        self.cur["frames"].append(replay_frame(s, ids, b, o, act))
         if x is not None:
             A = E.aux_split(env.aux_now(ids[b:b + 1])); pl = r.pl[int(ids[b]) & 15]
             self.cur["frames"][-1].update(x=x, xt={"g": round(float(A["gm"][0]), 1), "b": [int(v) for v in A["be"][0]], "h": int(pl.damage_taken > pl.gas_damage)})
@@ -148,6 +161,34 @@ def eval_items(a):
     pre = [p for p in a.eval_presets.split(",") if p]; pre = (["balanced"] + [p for p in pre if p != "balanced"]) if pre else []
     return ([(sd, "eval", None) for sd in range(1, a.eval_episodes + 1)] + [(sd, "evalb", None) for sd in range(1, a.evalb_episodes + 1)]
             + [(sd, "evalp", p) for p in pre for sd in range(1, a.eval_episodes + 1)])
+
+
+def scenario_flags(ap):
+    """step-S flags of the hard-scenario evals (scenarios.py), shared with train_fast (default off = the original evals)"""
+    ap.add_argument("--eval-scenarios", type=int, default=0, help="1 = the hard-scenario set (scenarios.py, 7 x 16 battles) joins the evals")
+    ap.add_argument("--scenario-every", type=int, default=1, help="with --eval-scenarios: on every k-th eval only")
+    ap.add_argument("--scenario-seeds", type=int, default=4, help="layouts per (scenario, map, pick): 16 episodes per scenario at 4 (--smoke: 1)")
+
+
+def scenario_items(a, n_eval, upd):
+    """the scenario battles of eval number n_eval (0 = the first) as eval queue items (seed, "evalscn", item)"""
+    if not a.eval_scenarios or n_eval % max(1, a.scenario_every): return []
+    return [(it["seed"], "evalscn", it) for it in SC.items(seeds=a.scenario_seeds, update=upd)]
+
+
+def scenario_eval(rows, ev, minutes, f_sum, f_ep):
+    """an eval's scenario episodes (kind evalscn) -> one row in scenarios.jsonl (scenarios.summary per scenario) and
+    their scenario_episodes.jsonl rows; None without any (scn_s = eval start to its last scenario episode)"""
+    rs = [r for r in rows if r["tag"]["kind"] == "evalscn"]
+    if not rs: return None
+    good = [r for r in rs if r.get("scn")]
+    sm = {"update": ev["update"], "minutes": minutes, "scn_s": round((ev.get("t_scn") or time.time()) - ev["t0"], 1),
+          "episodes": len(rs), "invalid": len(rs) - len(good), **SC.summary(good)}
+    f_sum.write(json.dumps(sm) + "\n"); f_sum.flush()
+    for r in good: f_ep.write(json.dumps(SC.episode_row(r)) + "\n")
+    f_ep.flush()
+    print("[scenarios]", json.dumps({k: (v["pass"] if isinstance(v, dict) else v) for k, v in sm.items()}), flush=True)
+    return sm
 
 
 def eval_tag(a, preset):
@@ -387,7 +428,7 @@ def main():
     ap.add_argument("--kmix", default="1,2,3,4,5"); ap.add_argument("--brawler", default="Sniper", help="Sniper = Piper")
     ap.add_argument("--loc", default=None, help="Showdown location (default: the first of env_v5.locations())")
     ap.add_argument("--slider-scale", type=float, default=0.0, help="weight of the slider rewards (stage 1: off)")
-    slider_flags(ap); head_flags(ap)
+    slider_flags(ap); head_flags(ap); scenario_flags(ap)
     ap.add_argument("--noise", type=int, default=1, help="ObsV5 vision noise + latency")
     ap.add_argument("--eval-min", type=float, default=30.0); ap.add_argument("--eval-episodes", type=int, default=200)
     ap.add_argument("--max-ticks", type=int, default=4000); ap.add_argument("--seed", type=int, default=0)
@@ -402,7 +443,7 @@ def main():
     ap.add_argument("--opp-slots", type=int, default=3); ap.add_argument("--opp-hold", type=int, default=2)
     ap.add_argument("--pfsp-p", type=float, default=2.0)
     a = ap.parse_args()
-    if a.smoke: a.n, a.rollout, a.chunks, a.bc_updates, a.eval_episodes, a.evalb_episodes, a.hours = 2, 2048, 64, 1, 4, 4, 0.2
+    if a.smoke: a.n, a.rollout, a.chunks, a.bc_updates, a.eval_episodes, a.evalb_episodes, a.hours, a.scenario_seeds = 2, 2048, 64, 1, 4, 4, 0.2, 1
     torch.manual_seed(a.seed); np.random.seed(a.seed)
     out = os.path.join(E.WORK, "runs", a.run); os.makedirs(out, exist_ok=True)
     loc = a.loc or E.locations()[0]
@@ -442,6 +483,7 @@ def main():
         cfg = {"div": D.make_div(location=loc, chr=tag["chr"]), "tag": tag, "end": "agents"}
         if eval_queue and not bc() and i >= a.n - a.eval_n:
             sd, kd, pre = eval_queue.pop(0); b = kd == "evalb"
+            if kd == "evalscn": return SC.battle_cfg(pre)
             return {**cfg, "seed": sd, "ctl": list(range(10)) if b else [0], "end": "player0",
                     "tag": {**tag, "kind": kd, "opp": list(range(1, 10)) if b else [], **eval_tag(a, pre)}}
         sd = int(rng_b.integers(10_000_000, 2 ** 31 - 1))
@@ -458,11 +500,14 @@ def main():
     E.Env.slider_sample, E.Env.slider_norm = a.slider_sample, E.slider_norm(a.slider_norm)
     env = E.Env(a.n, battle_fn, ticks=2, fair=True, max_ticks=a.max_ticks, verbose=True, seed=a.seed, tag="ppo%d" % os.getpid())
     ob = O.ObsV5(noise=O.NOISE if a.noise else None, seed=a.seed); rec = Recorder(out)
+    srec, sidx = (SC.Recorder(out), SC.ScnIndex(out)) if a.eval_scenarios else (None, None)   # every scenario episode's replay
     buf = Buffer(a.rollout + 8192)
     pending, traj, final, hid = {}, {}, set(), {}      # aid -> row waiting for its transition / rows this rollout / ended / GRU state
     epf = open(os.path.join(out, "episodes.jsonl"), "a"); evf = open(os.path.join(out, "evals.jsonl"), "a")
     evepf = open(os.path.join(out, "eval_episodes.jsonl"), "a")   # the policy's (player 0) eval rows: scorecard.py eval / per-preset groups
     prf = open(os.path.join(out, "progress.jsonl"), "a")
+    scf = open(os.path.join(out, "scenarios.jsonl"), "a") if a.eval_scenarios else None   # --eval-scenarios: one row per scenario eval
+    scef = open(os.path.join(out, "scenario_episodes.jsonl"), "a") if a.eval_scenarios else None
     t0 = time.time(); n_ep = 0; ep_rows = []; stop = {"now": False}; z = np.zeros(HID, np.float32)
     signal.signal(signal.SIGTERM, lambda *_: stop.__setitem__("now", True))
     T = lambda x, dt=torch.float32: torch.as_tensor(x, device=dev).to(dt)
@@ -474,7 +519,8 @@ def main():
     def start_eval():
         nonlocal enet
         enet = frozen(net.state_dict())
-        eval_queue.extend(eval_items(a))
+        eval_queue.extend(eval_items(a) + scenario_items(a, ev.get("n", 0), upd))
+        ev.update(n=ev.get("n", 0) + 1, t_scn=None)
         ev.update(active=True, update=upd, steps=agent_steps, t0=time.time(), n0=len(env.episodes))
         save(os.path.join(out, "ckpt_u%04d.pt" % upd))
 
@@ -486,6 +532,7 @@ def main():
               **{"b_" + k: v for k, v in eval_summary(by("evalb")).items() if k in ("episodes", "rank", "ci95", "win", "top3")},
               **eval_presets(env.episodes[ev["n0"]:])}
         evf.write(json.dumps(sm) + "\n"); evf.flush(); print("[eval]", json.dumps(sm), flush=True); evepf.flush()
+        if scf: scenario_eval(env.episodes[ev["n0"]:], ev, sm["minutes"], scf, scef)
         ev.update(active=False, t_last=time.time())
 
     t_end = t0 + a.hours * 3600; smoke_end = upd + 3
@@ -537,6 +584,7 @@ def main():
                 b = rec.row(env, ids) if a.aux_w else None   # the aux heads' readout for the replay
                 xr = aux_readout(net, T(s[b:b + 1]), T(o["ent"][b:b + 1]), T(o["grid"][b:b + 1], torch.uint8), T(h[b:b + 1])) if b is not None else None
                 rec.frame(env, ids, o, A, upd, x=xr)
+                if srec: srec.frame(env, ids, o, A)
                 env.send(ids, A)
                 for r in env.episodes[n_ep:]:
                     tg = r["tag"]                            # PFSP score: only battles whose snapshot stayed loaded to the end
@@ -545,6 +593,8 @@ def main():
                         e = pf.setdefault(tg["snap"], [5.5, 0]); e[0] += 0.02 * (r["rank"] - e[0]); e[1] += 1
                     if not r["tag"]["kind"].startswith("eval") and r["player"] not in r["tag"].get("opp", ()):
                         ep_rows.append(r); epf.write(json.dumps(r) + "\n")
+                    elif r["tag"]["kind"] == "evalscn":      # scenarios.jsonl at the eval's end; the replay now
+                        if srec: sidx.add([srec.finish(r)]); ev["t_scn"] = time.time()
                     elif r["tag"]["kind"].startswith("eval") and r["player"] == 0: evepf.write(json.dumps(r) + "\n")
                 n_ep = len(env.episodes)
                 if ev["active"]: finish_eval()

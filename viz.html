@@ -40,12 +40,15 @@ table{border-collapse:collapse;font-size:11px}td,th{padding:2px 8px;text-align:r
 <div class="battle"><canvas id="map" width="560" height="560"></canvas>
  <div><canvas id="view" width="325" height="325"></canvas><div class="key" id="key"></div><div id="act" style="margin-top:6px;color:var(--ink2)"></div></div></div>
 <h2>Evals (player 0 = policy vs 9 native AI, held-out seeds)</h2><div class="card" style="overflow:auto"><table id="evt"></table></div>
+<div id="scnwrap" style="display:none"><h2>Hard scenarios <span style="font-weight:400;color:var(--mute)">— --eval-scenarios: pass rate per scenario (pass rules: scenarios.py); replays failures first</span></h2>
+<div class="cards" id="scn"></div><div class="ctl" style="margin-top:8px"><select id="ssel" aria-label="scenario replay"></select><span style="color:var(--mute)">plays in the battle replay above</span></div>
+<div class="card" style="overflow:auto"><table id="sct"></table></div></div>
 <div id="tip"></div>
 <script>
 const $=id=>document.getElementById(id), css=n=>getComputedStyle(document.documentElement).getPropertyValue(n).trim();
 const C=i=>css('--c'+(i+1)), fmt=v=>v==null?'–':Math.abs(v)>=1000?Math.round(v).toLocaleString():+(+v).toPrecision(3)+'';
 const jl=async u=>{const r=await fetch(u+'?'+Date.now());if(!r.ok)return [];return (await r.text()).split('\n').filter(x=>x.trim()).map(x=>JSON.parse(x))};
-let P=[],EV=[];
+let P=[],EV=[],SCN=[],sidx=[];
 
 // one line chart: series [{name, pts:[[x,y]...], band?:[[x,lo,hi]]}], one y axis, crosshair + tooltip
 function chart(host,id,title,note,series,o={}){
@@ -118,8 +121,19 @@ function draw(){
     chart('opt','c_auxf','Aux: enemy position in 1 s','median error in tiles · the head must beat constant velocity',[S('aux_fut_tiles','aux head',0),S('aux_fut_cv_tiles','constant velocity',1),S('aux_fut_still_tiles','stays where seen',2)],{...o,zero:1});
     chart('opt','c_auxa','Aux: hit next 1 s / hidden bush enemy','ROC AUC · 0.5 = chance',[S('aux_hit_auc','hit',0),S('aux_bush_auc','bush sectors',1)],{...o,ref:0.5,refLabel:'chance'});
     chart('opt','c_auxg','Aux: gas margin','mean absolute error, tiles',[S('aux_gas_mae_tiles','gas',0)],{...o,zero:1})}
+  drawScn();
   const cols=['update','minutes','episodes','rank','ci95','win','top3','dealt','taken','kills','cubes','hit_rate','ticks'];
   $('evt').innerHTML='<tr>'+cols.map(c=>`<th>${c}</th>`).join('')+'</tr>'+EV.slice().reverse().map(r=>'<tr>'+cols.map(c=>`<td>${fmt(r[c])}</td>`).join('')+'</tr>').join('')}
+
+// ---------------- hard scenarios (scenarios.jsonl, replays/scn/index.json)
+function drawScn(){if(!SCN.length)return;$('scnwrap').style.display='';const names=[...new Set(SCN.flatMap(r=>Object.keys(r).filter(k=>r[k]&&r[k].pass!=null&&k!='_all')))];
+  chart('scn','c_scn','Scenario pass rate','share of a scenario\'s episodes that pass its rule',names.map((k,i)=>({name:k,c:i,pts:SCN.filter(r=>r[k]).map(r=>[r.update,r[k].pass])})),{zero:1});
+  const l=SCN[SCN.length-1];$('sct').innerHTML='<tr><th>scenario (update '+l.update+')</th><th>n</th><th>pass</th><th>scores (means)</th></tr>'+names.filter(k=>l[k]).map(k=>
+    `<tr><td>${k}</td><td>${l[k].n}</td><td>${fmt(l[k].pass)}</td><td style="text-align:left">${Object.entries(l[k]).filter(([a,v])=>!['n','pass'].includes(a)&&typeof v=='number').map(([a,v])=>a+' '+fmt(v)).join(' · ')}</td></tr>`).join('')}
+async function loadScnIdx(){const r=await fetch('replays/scn/index.json?'+Date.now());if(!r.ok)return;sidx=await r.json();const sel=$('ssel'),cur=sel.value;
+  const o=sidx.slice().sort((a,b)=>b.update-a.update||a.pass-b.pass||a.scn.localeCompare(b.scn)||a.file.localeCompare(b.file));   // newest eval, failures first
+  sel.innerHTML='<option value="">scenario replays ('+o.filter(x=>!x.pass).length+' failed of '+o.length+')</option>'+o.map(x=>`<option value="${x.file}">${x.pass?'pass':'FAIL'} · u${x.update} · ${x.scn} · ${x.loc} · pick ${x.pick} · seed ${x.seed}</option>`).join('');sel.value=cur}
+$('ssel').onchange=e=>{if(e.target.value){follow=false;loadRp('scn/'+e.target.value)}};
 
 // ---------------- battle replay
 const TILE={floor:'#d9d3c3',indestructible:'#4b4a46',destructible_wall:'#7a6a55',fragile_wall:'#9a8468',bush:'#3f9a4c',faded_bush:'#8fc296',water:'#4d8fd0',
@@ -163,12 +177,12 @@ function frame(){if(!RP)return;const F=RP.frames[fi],cv=$('map'),g=cv.getContext
     ax=`<br>aux: P(hit in 1 s) ${(100*P_.h).toFixed(0)} % (${hit?'hit':'no hit'}) · gas margin ${P_.g} tiles (true ${F.xt?F.xt.g:'–'}) · rings = enemies in 1 s, crosses = truth · wedges = hidden bush enemy (outline = true)`}
   if(a[1]>0){const q=a[2]*Math.PI/180;h.strokeStyle=css(a[1]==2?'--c4':'--c8');h.lineWidth=2;h.beginPath();h.moveTo(mx,my);h.lineTo(mx+9*t*Math.cos(q),my+9*t*Math.sin(q));h.stroke()}
   const alive=F.p.filter(p=>p[4]).length;$('scrub').value=fi;$('finfo').textContent=`step ${fi+1}/${RP.frames.length} · tick ${F.t} · ${alive} alive`;
-  $('act').innerHTML=`focus = player ${F.f} · HP ${(100*F.s[0]).toFixed(0)} % · ammo ${(3*F.s[1]).toFixed(1)} · super ${F.s[2]?'ready':'–'} · sees ${F.e.length} entities<br>action: move ${a[0]?(a[0]-1)*22.5+'°':'stop'} · ${['no fire','ATTACK at '+a[2]+'°','SUPER at '+a[2]+'°'][a[1]]}${ax}`}
+  $('act').innerHTML=(RP.scn?`<b>scenario ${RP.scn.name}: ${RP.scn.pass?'pass':'FAIL'}</b> · ${Object.entries(RP.scn.scores).map(([a,v])=>a+' '+fmt(v)).join(' · ')}<br>`:'')+`focus = player ${F.f} · HP ${(100*F.s[0]).toFixed(0)} % · ammo ${(3*F.s[1]).toFixed(1)} · super ${F.s[2]?'ready':'–'} · sees ${F.e.length} entities<br>action: move ${a[0]?(a[0]-1)*22.5+'°':'stop'} · ${['no fire','ATTACK at '+a[2]+'°','SUPER at '+a[2]+'°'][a[1]]}${ax}`}
 $('play').onclick=()=>{playing=!playing;$('play').textContent=playing?'Pause':'Play'};
 $('scrub').oninput=e=>{fi=+e.target.value;playing=false;$('play').textContent='Play';frame()};
 $('rsel').onchange=e=>{follow=idx.length&&e.target.value==idx[idx.length-1].file;loadRp(e.target.value)};
 setInterval(()=>{if(RP&&playing){fi=Math.min(fi+ +$('speed').value,RP.frames.length-1);frame()}},100);
-async function tick(){try{P=await jl('progress.jsonl');EV=await jl('evals.jsonl');draw();await loadIdx()}catch(e){$('sub').textContent='load error: '+e}}
+async function tick(){try{P=await jl('progress.jsonl');EV=await jl('evals.jsonl');SCN=await jl('scenarios.jsonl');draw();await loadIdx();if(SCN.length)await loadScnIdx()}catch(e){$('sub').textContent='load error: '+e}}
 if(/^http/.test(location.protocol))$('title').textContent='RL training · '+(location.pathname.split('/').filter(x=>x&&!/\.html$/.test(x)).pop()||'run');
 else $('sub').textContent='Opened as a file: no run data here. Open http://localhost:8765/<run>/ instead (README "Dashboard").';
 if(/^http/.test(location.protocol))tick();setInterval(tick,5000);addEventListener('resize',draw);
