@@ -11,7 +11,7 @@ enemy target at distance d along a corridor. Per phase: teleport + heal everyone
 one normal attack at the shooter (so a self-heal is visible); fill the shooters' supers; fire the super (fire 2, aim at the
 target, super_dist = d / CastingRange, a charge aims ~1 tile past the target); watch WATCH ticks.
 Measured per shooter (state2 dump each step, attributed by owner player index): super consumed (charge < half of max),
-damage = target HP lost (NbeResp damage_dealt is also read, but stayed 0 in the trial with the native AI off), own max displacement (dash / jump / charge; host `leaping` flag), target max
+damage = target HP lost (or the shooter's NbeResp damage_dealt summed over the watch steps: the host reports it per step), own max displacement (dash / jump / charge; host `leaping` flag), target max
 displacement (pushback / pull), own HP gain (only when the pre-damage hit), new projectiles / summons / area effects
 (name, table radius) / other items owned by the shooter, a change of the brawler's character (transform), the skill's
 "active" word (state2 ultiActive, informational), foreign summons near the pair (contamination from phase A).
@@ -375,7 +375,7 @@ class Auditor:
             M[j] = dict(geo[j], spawned=True, filled=bool(p.super_max > 0 and p.super_charge >= p.super_max), super_max=int(p.super_max),
                         sc0=int(p.super_charge), sc_min=int(p.super_charge), hp0=int(p.hp), hp_max=int(p.hp), max_hp=int(p.max_hp),
                         pre_damaged=bool(p.hp < p.max_hp), x0=int(p.x), y0=int(p.y), tx0=int(q.x), ty0=int(q.y), thp0=int(q.hp), thp_min=int(q.hp),
-                        dd0=int(p.damage_dealt), move=0, push=0, leaping=False, projectiles={}, summons={}, areas={}, items={},
+                        move=0, push=0, leaping=False, projectiles={}, summons={}, areas={}, items={},
                         changed=False, data0=int(ch[0, 1]) if len(ch) else NIL, ulti0=int(ch[0, 15]) if len(ch) else NIL,
                         ulti_active=False, foreign_near=False, target_dead=False, s=s, t=t)
         acts = dict(idle)
@@ -390,7 +390,7 @@ class Auditor:
                 m["leaping"] |= bool(p.leaping)
                 if p.alive: m["move"] = max(m["move"], int(np.hypot(p.x - m["x0"], p.y - m["y0"])))
                 if q.alive and not q.eliminated: m["push"] = max(m["push"], int(np.hypot(q.x - m["tx0"], q.y - m["ty0"])))
-                m["dd"] = int(p.damage_dealt) - m["dd0"]
+                m["dd"] = m.get("dd", 0) + int(p.damage_dealt)   # per step (the host clears it after every response)
                 if st is None: continue
                 if bid.get(s) != bid0.get(s): m["changed"] = True
                 for row in st["pj"]:
