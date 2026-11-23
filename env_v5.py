@@ -79,24 +79,31 @@ _COVER = [O.SEG.index(c) for c in ("indestructible", "destructible_wall", "fragi
 _PL = ("x", "y", "hp", "max_hp", "damage_dealt", "bomb_damage", "damage_taken", "box_damage", "cubes", "cubes_total")
 
 
-def slider_state(tiles, W, H, brawlers, rng, n=10):
-    """per-battle state of the slider rewards: weights 0-2 per player and slider, map masks, trackers"""
+def slider_map(sl, tiles, W, H):
+    """sl["bush"] / sl["nearcover"] (cover within 2 tiles) from the host's tile ids (H*W,), in place; Env calls it again
+    whenever the live tiles change (a bush or wall destroyed)"""
     t = O._tile_lut()[np.clip(np.asarray(tiles).reshape(H, W) % 1000000 + 1, 0, 255)] if tiles is not None else np.zeros((H, W), np.uint8)
     cover = np.pad(np.isin(t, _COVER), 2)
     near = np.zeros((H, W), bool)
     for dy in range(5):
         for dx in range(5): near |= cover[dy:dy + H, dx:dx + W]
+    sl["bush"], sl["nearcover"] = t == O.SEG.index("bush"), near
+    return sl
+
+
+def slider_state(tiles, W, H, brawlers, rng, n=10):
+    """per-battle state of the slider rewards: weights 0-2 per player and slider, map masks, trackers"""
     rg = [float(O.brawler_stats(b)[0]) * 3000 if b else 2400.0 for b in (list(brawlers) + [None] * n)[:n]]
-    return {"w": rng.uniform(0, 2, (n, len(SL))), "bush": t == O.SEG.index("bush"), "nearcover": near, "range": np.array(rg),
-            "hid": np.zeros(n, bool), "low": np.zeros(n, bool), "dist": np.full(n, np.nan), "hp": np.full(n, np.nan),
-            "checked": np.zeros((n, H, W), bool), "sum": np.zeros((n, len(SL))), "ret": np.zeros(n)}
+    return slider_map({"w": rng.uniform(0, 2, (n, len(SL))), "range": np.array(rg),
+                       "hid": np.zeros(n, bool), "low": np.zeros(n, bool), "dist": np.full(n, np.nan), "hp": np.full(n, np.nan),
+                       "checked": np.zeros((n, H, W), bool), "sum": np.zeros((n, len(SL))), "ret": np.zeros(n)}, tiles, W, H)
 
 
 def slider_terms(sl, pl, n=10):
     """(n, 10) slider reward terms of one env step, order SLIDERS; pl = the response's players. Units as MAEnv's terms
     (1000 damage = 1). The host reports damage per player, not per target, so `focus`, `protect` and `third_party` use
-    "that enemy took damage this step" instead of "I hit it".
-    shortcut: bushes / cover are the tiles at the battle start (destroyed ones still count); re-read map_tiles to upgrade."""
+    "that enemy took damage this step" instead of "I hit it". Bushes / cover = sl's map masks, the live tiles (Env refreshes
+    them every MAP_EVERY steps). `collect` counts the cubes picked up this step (NbePlayer.cubes), `push` compares cubes held."""
     A = np.array([[getattr(pl[p], k) for k in _PL] + [pl[p].reserved[2], pl[p].alive and not pl[p].eliminated] for p in range(n)], np.float64)
     x, y, hp, mhp, dealt, bomb, taken, box, cubes, ctot, team, alive = A.T
     alive = alive > 0; H, W = sl["bush"].shape; dk = (dealt + bomb) / 1000.0; idx = np.arange(n)
@@ -168,12 +175,22 @@ class Env(MAEnv):
     resp = {"out": 0, "back": 0, "wiped": 0}   # knock-outs into respawn, respawns, waits ended by the team's wipe
     record = False    # True: battles with cfg "native_ctl" put the native AI's action into the transition terms ("_act": BC labels)
     # sim_plan B3 (train_fast --cube-shaping K): the flat per-cube reward becomes potential shaping on the cubes held,
-    # K x (gamma x held_after - held_before), held = 0 once eliminated, so a death gives the cubes' reward back.
-    # shortcut: held = cubes_total (picked up so far); a team knock-out that drops cubes but respawns keeps it.
+    # K x (gamma x held_after - held_before), held = NbePlayer.cubes_total (the host zeroes it at a team knock-out, as Duo
+    # Showdown does) and 0 once eliminated, so losing the cubes gives their reward back.
     cube_k, cube_gamma = 0.0, 0.999
+    # the slider rewards' bush / cover masks follow the live tiles: F_MAP every MAP_EVERY steps per instance, masks rebuilt
+    # when map_hash changed. 10 steps = 1 s at ticks 2: a destroyed bush keeps paying for <= 1 s. Cost (measured): F_MAP ~45 us
+    # of host time per request (us_state 575 vs 530 us), ~4.5 us per step at k = 10; the rebuild (~120 us) only when a tile
+    # changed (live_check: ~1.7 refreshes per battle)
+    MAP_EVERY = 10
 
     def _flags(self):
-        return super()._flags() | (P.F_REC if self.record else 0)
+        return super()._flags() | (P.F_REC if self.record else 0) | (P.F_MAP if getattr(self, "_map_now", False) else 0)
+
+    def _send_step(self, i, acts):
+        s = self.I[i]; s.nstep = getattr(s, "nstep", 0) + 1; self._map_now = s.nstep % self.MAP_EVERY == 0
+        try: super()._send_step(i, acts)
+        finally: self._map_now = False
 
     def _labels(self, s, r):
         """player -> [move, fire, aim, dist] the native AI did this step: the rules of nirkt's collect_demos4 (move = the
@@ -201,14 +218,14 @@ class Env(MAEnv):
     def _start_battle(self, i, r):
         super()._start_battle(i, r)
         s = self.I[i]; s.hold = {}                       # player -> its final transition, held until the team's rank is known
-        s.sl = slider_state(s.map_tiles, s.W, s.H, (s.cfg.get("tag") or {}).get("chr", []), self.rng)
+        s.sl = slider_state(s.map_tiles, s.W, s.H, (s.cfg.get("tag") or {}).get("chr", []), self.rng); s.map_hash = int(r.map_hash)
         s.pos = {p: (r.pl[p].x, r.pl[p].y) for p in range(10)}; s.ptick = r.tick; s.pjump = set(); s.wprev = set()
         s.cprev = {p: int(r.pl[p].cubes_total) for p in range(10)}
         s.hud = self._hud(s, r)
 
     def _hud(self, s, r):
-        """the two Showdown HUD numbers per player: own cubes, teams left (a group with a member not eliminated, or a
-        solo player still in). shortcut: cubes = cubes_total (picked up so far), as B3; live reads the HUD (held)."""
+        """the two Showdown HUD numbers per player: own cubes held (cubes_total: 0 after a team knock-out, as B3), teams
+        left (a group with a member not eliminated, or a solo player still in)"""
         g = (s.cfg.get("tag") or {}).get("groups") or [0] * 10; inn = [not r.pl[p].eliminated for p in range(10)]
         left = len({g[p] for p in range(10) if inn[p] and g[p]}) + sum(1 for p in range(10) if inn[p] and not g[p])
         return [int(r.pl[p].cubes_total) for p in range(10)], left
@@ -219,6 +236,8 @@ class Env(MAEnv):
 
     def _finish_step(self, i, r):
         s = self.I[i]; sl = s.sl
+        if getattr(r, "map_written", 0) and int(r.map_hash) != s.map_hash:   # a tile changed (bush / wall destroyed): live masks
+            s.map_tiles = s.inst.map_tiles(); s.map_hash = int(r.map_hash); slider_map(sl, s.map_tiles, s.W, s.H)
         T = slider_terms(sl, r.pl) if self.slider_scale else np.zeros(np.shape(sl["w"]))   # speed round: off = no reward, skip it (s_* logs 0)
         extra = (T * sl["w"]).sum(1) * self.slider_scale; sl["sum"] += T; sl["ret"] += extra
         n0, e0 = len(self._trans), len(self.episodes)
@@ -293,6 +312,8 @@ def _check():
     sl = slider_state(tiles.ravel(), 60, 40, ["Sniper"] * 10, np.random.default_rng(0))
     assert sl["w"].shape == (10, 10) and 0 <= sl["w"].min() and sl["w"].max() <= 2 and sl["range"][0] == 3000
     assert sl["bush"].sum() == 4 and sl["nearcover"][23, 8] and sl["nearcover"][27, 12] and not sl["nearcover"][28, 10]
+    t2 = tiles.copy(); t2[25, 10] = 27000000; t2[5, 5] = 27000000; s2 = slider_map(dict(sl), t2.ravel(), 60, 40)   # destroyed
+    assert s2["bush"].sum() == 3 and not s2["bush"][5, 5] and not s2["nearcover"][23, 8] and sl["bush"][5, 5]
     col = lambda T, name: T[:, SL.index(name)]
     T = slider_terms(sl, players())                      # p0 at tile (5, 5) = the bush, nearest enemy 10 tiles away
     assert col(T, "bush_camp")[0] == 0.01 and col(T, "bush_camp")[1:].sum() == 0 and col(T, "bush_control")[0] == 0.005
