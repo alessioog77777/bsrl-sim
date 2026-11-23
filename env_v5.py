@@ -1,6 +1,8 @@
 """Randomised Showdown battles on top of nirkt's MAEnv (run in WSL after `source rl/env.sh`).
 
     python3 -m env_v5 --n 12 --minutes 5 --agents 10      # benchmark: random actions, one summary line + bench.jsonl
+    python3 -m env_v5 --n 3 --minutes 15 --native 1 --episodes nat.jsonl && python3 -m env_v5 --norm nat.jsonl
+                                                          # slider_norm factors from native-AI battles (NORM_MEASURED)
 
 battle_fn(): every battle a random Showdown map, a random brawler per player, solo / duo (5 x 2) / trio (3 x 3 + 1
 solo: the sim has 10 players, the real mode 12) teams, and `agents` policy-controlled slots (the rest = native AI).
@@ -76,7 +78,41 @@ def make_battle_fn(agents=10, seed0=10_000_000, roster=None, locs=None, p_team=0
 
 SL = O.SLIDERS
 _COVER = [O.SEG.index(c) for c in ("indestructible", "destructible_wall", "fragile_wall", "bouncer", "gravity", "destructible")]
-_PL = ("x", "y", "hp", "max_hp", "damage_dealt", "bomb_damage", "damage_taken", "box_damage", "cubes", "cubes_total")
+_PL = ("x", "y", "hp", "max_hp", "damage_dealt", "bomb_damage", "damage_taken", "gas_damage", "box_damage", "cubes",
+       "cubes_total", "in_gas")
+# behaviour counters per player and battle (row["beh"]; scorecard's per-preset / slider-slope metrics), steps unless noted:
+# alive, on a bush tile, hidden by a bush from an enemy whose screen it is on, enemy in range with >= 40 % hp, in gas,
+# a living mate, mate 1.5-4 tiles, mate < 1 tile, mate distance (tiles, summed), visible enemy <= 12 tiles, its distance /
+# own range (summed), damage dealt / 1000, box damage / 1000, then cubes held: max, at the end
+BEH = ("alive", "bush", "hidden", "engaged", "gas", "mate", "mate_band", "clump", "mate_tiles", "near", "range_ratio",
+       "dealt", "box", "cubes_max", "cubes_end")
+# per-slider factors on the terms so each is worth ~0.5 per battle at weight 1 (0.5 / mean |sum of the term| per player
+# and battle, against the 8 of place + win). Measured 2026-11-23 on the native AI (the BC target): `env_v5 --n 3
+# --minutes 15 --native 1` = 821 battles / 8197 player rows, random maps / brawlers, half in teams (mean 60 s alive, place
+# + win 2.8, dealt 14.2 per row), then `--norm`. Re-measure when the terms change or the policy is far from the native AI.
+NORM_MEASURED = {"bush_camp": 0.2333, "collect": 0.1881, "protect": 0.6685, "retreat": 0.2, "kite": 0.1431, "peek": 0.0531,
+                 "focus": 0.0455, "push": 2.096, "third_party": 2.7241, "bush_control": 0.5593}
+
+
+def slider_norm(spec):
+    """--slider-norm: '' = all 1.0 (terms as computed), 'measured' = NORM_MEASURED, else a JSON file {slider: factor}"""
+    d = {} if not spec else NORM_MEASURED if spec == "measured" else json.load(open(spec))
+    return np.array([float(d.get(k, 1.0)) for k in SL])
+
+
+def sample_sliders(rng, n, mode="uniform"):
+    """(n, len(SL)) per-battle slider weights 0-2. uniform: U(0, 2) each (the original sampler, same draws). mix (train
+    --slider-sample mix): per player 40 % uniform, 40 % a preset + N(0, 0.3) (density where people steer), 10 % an exact
+    preset, 10 % sparse (all 0.5, one or two sliders at 2: single-style coverage)"""
+    if mode == "uniform": return rng.uniform(0, 2, (n, len(SL)))
+    names = list(O.PRESETS); w = np.zeros((n, len(SL)))
+    for p in range(n):
+        u = rng.random(); pre = O.preset_vec(names[int(rng.integers(len(names)))])
+        if u < 0.4: w[p] = rng.uniform(0, 2, len(SL))
+        elif u < 0.8: w[p] = np.clip(pre + rng.normal(0, 0.3, len(SL)), 0, 2)
+        elif u < 0.9: w[p] = pre
+        else: w[p] = 0.5; w[p, rng.choice(len(SL), int(rng.integers(1, 3)), replace=False)] = 2.0
+    return w
 
 
 def slider_map(sl, tiles, W, H):
@@ -91,56 +127,89 @@ def slider_map(sl, tiles, W, H):
     return sl
 
 
-def slider_state(tiles, W, H, brawlers, rng, n=10):
-    """per-battle state of the slider rewards: weights 0-2 per player and slider, map masks, trackers"""
-    rg = [float(O.brawler_stats(b)[0]) * 3000 if b else 2400.0 for b in (list(brawlers) + [None] * n)[:n]]
-    return slider_map({"w": rng.uniform(0, 2, (n, len(SL))), "range": np.array(rg),
+def slider_state(tiles, W, H, brawlers, rng, n=10, w=None, mode="uniform"):
+    """per-battle state of the slider rewards: weights 0-2 per player and slider (w: (len(SL),) for every player or
+    (n, len(SL)); None = sample_sliders(rng, n, mode)), map masks, trackers, behaviour counters"""
+    # own attack range (units); floor 600 = 2 tiles, the shortest real melee reach (Rock has no CastingRange)
+    rg = [max(float(O.brawler_stats(b)[0]) * 3000, 600.0) if b else 2400.0 for b in (list(brawlers) + [None] * n)[:n]]
+    w = sample_sliders(rng, n, mode) if w is None else np.broadcast_to(np.asarray(w, np.float64), (n, len(SL))).copy()
+    return slider_map({"w": w, "range": np.array(rg),
                        "hid": np.zeros(n, bool), "low": np.zeros(n, bool), "dist": np.full(n, np.nan), "hp": np.full(n, np.nan),
-                       "checked": np.zeros((n, H, W), bool), "sum": np.zeros((n, len(SL))), "ret": np.zeros(n)}, tiles, W, H)
+                       "j": np.full(n, -1), "held": np.zeros(n), "was": np.zeros(n, bool), "mhit": np.zeros(n),
+                       "checked": np.zeros((n, H, W), bool), "sum": np.zeros((n, len(SL))), "sumw": np.zeros((n, len(SL))),
+                       "ret": np.zeros(n), "beh": np.zeros((n, len(BEH)))}, tiles, W, H)
 
 
 def slider_terms(sl, pl, n=10):
     """(n, 10) slider reward terms of one env step, order SLIDERS; pl = the response's players. Units as MAEnv's terms
-    (1000 damage = 1). The host reports damage per player, not per target, so `focus`, `protect` and `third_party` use
-    "that enemy took damage this step" instead of "I hit it". Bushes / cover = sl's map masks, the live tiles (Env refreshes
-    them every MAP_EVERY steps). `collect` counts the cubes picked up this step (NbePlayer.cubes), `push` compares cubes held."""
-    A = np.array([[getattr(pl[p], k) for k in _PL] + [pl[p].reserved[2], pl[p].alive and not pl[p].eliminated] for p in range(n)], np.float64)
-    x, y, hp, mhp, dealt, bomb, taken, box, cubes, ctot, team, alive = A.T
-    alive = alive > 0; H, W = sl["bush"].shape; dk = (dealt + bomb) / 1000.0; idx = np.arange(n)
+    (1000 damage = 1), before the weights and slider_norm. A respawning player (reserved[3] > 0) counts as out. Enemy
+    damage taken `te` = damage_taken - gas_damage (the host's damage_taken includes the gas). The host reports damage per
+    player, not per target, so `focus`, `protect`, `third_party` and `bush_control` use "that enemy took damage this step"
+    instead of "I hit it". Bushes / cover = sl's map masks, the live tiles (Env refreshes them every MAP_EVERY steps).
+      bush_camp     0.002 per step hidden by a bush from an enemy that has me on its screen, + damage dealt the step after
+      collect       out of the gas: 0.2 x box damage + cubes picked up; - cubes lost (knock-out / elimination drops them)
+      protect       damage dealt while a mate within 6 tiles took enemy damage in the last 10 steps (peel)
+      retreat       hp regained while low (latched < 40 % until 80 %); not the respawn refill, not a cube's +hp
+      kite          damage dealt taking no enemy damage, the nearest enemy >= 0.7 x own range away
+      peek          damage dealt within 2 tiles of cover
+      focus         damage dealt while the lowest-hp enemy in range is taking enemy damage
+      push          closing on the same nearest enemy (signed, 0.02 per tile) while ahead in hp and cubes held
+      third_party   damage dealt taking none, an enemy in range taking more than I dealt
+      bush_control  0.005 per bush tile first within 3 tiles this battle + damage dealt while an enemy hidden in a bush in
+                    my range takes damage (checking bushes from range)
+    Also accumulates sl["beh"] (BEH)."""
+    A = np.array([[getattr(pl[p], k) for k in _PL] + [pl[p].reserved[2], pl[p].alive and not pl[p].eliminated and pl[p].reserved[3] <= 0]
+                  for p in range(n)], np.float64)
+    x, y, hp, mhp, dealt, bomb, taken, gasd, box, cubes, held, ingas, team, alive = A.T
+    alive = alive > 0; was = sl["was"]; H, W = sl["bush"].shape; dk = (dealt + bomb) / 1000.0; idx = np.arange(n)
+    te = np.maximum(taken - gasd, 0.0); ingas = ingas > 0
     d = np.hypot(x[None, :] - x[:, None], y[None, :] - y[:, None])
     both = alive[:, None] & alive[None, :]
     en = both & (team[:, None] != team[None, :]); mate = both & (team[:, None] == team[None, :]) & (idx[:, None] != idx[None, :])
     tx, ty = np.clip(x // 300, 0, W - 1).astype(int), np.clip(y // 300, 0, H - 1).astype(int)
     inb = sl["bush"][ty, tx]
-    # sees[q, p]: p is on q's screen (the camera rule of nbpc.fair) and not hidden in a bush
+    # screen[q, p]: p is on q's screen (the camera rule of nbpc.fair); sees[q, p]: and not hidden in a bush (> 900 away)
     camx = np.clip(x, 3000.0, W * 300 - 3000.0); ry = y[None, :] - y[:, None]
-    sees = (np.abs(x[None, :] - camx[:, None]) < 4500) & (ry > -3500) & (ry < 2900) & ~(inb[None, :] & (d > 900))
-    hid = inb & alive & ~(en.T & sees).any(0)
+    screen = (np.abs(x[None, :] - camx[:, None]) < 4500) & (ry > -3500) & (ry < 2900)
+    sees = screen & ~(inb[None, :] & (d > 900))
+    hid = inb & alive & ~(en & sees).any(0) & (en & screen).any(0)   # the bush is what hides me from someone
     d_en = np.where(en, d, np.inf); near = d_en.min(1); has = np.isfinite(near); j = d_en.argmin(1)
     inr = en & (d <= sl["range"][:, None])
     low_hp = np.where(inr, (hp / np.maximum(mhp, 1))[None, :], np.inf).argmin(1)
-    mate_taken = (mate * (d < 1800) * taken[None, :]).sum(1) / 1000.0     # only mates near enough to help
-    gain = np.nan_to_num(np.maximum(hp - sl["hp"], 0)) / 1000.0
+    sl["mhit"] = np.where(alive & (te > 0), 10, np.maximum(sl["mhit"] - 1, 0))   # 10 steps = 1 s of "under fire"
+    peel = (mate & (d < 1800) & (sl["mhit"] > 0)[None, :]).any(1)               # 6 tiles: near enough to help
+    gain = np.nan_to_num(np.maximum(hp - sl["hp"], 0)) / 1000.0 * (cubes == 0)  # sl["hp"] nan while out / respawning
     low = sl["low"] | (hp < 0.4 * mhp)
-    closing = np.nan_to_num(np.clip(sl["dist"] - np.where(has, near, np.nan), 0, 300)) / 15000.0   # 0.02 per tile
-    others = taken[None, :] > (dealt + bomb)[:, None]    # others[p, q]: q took more than p dealt = someone else hit it too
+    same = has & (j == sl["j"]) & np.isfinite(sl["dist"])                       # a switch of nearest enemy is no closing
+    closing = np.where(same, np.clip(np.nan_to_num(sl["dist"]) - np.where(has, near, 0.0), -300, 300), 0.0) / 15000.0   # 0.02 per tile
+    others = te[None, :] > (dealt + bomb)[:, None]       # others[p, q]: q took more than p dealt = someone else hit it too
+    bushhit = (inr & inb[None, :] & ~sees & (te > 0)[None, :]).any(1)          # sees[p, q]: p sees q
     new = np.zeros(n)
     for p in np.nonzero(alive)[0]:                       # bush tiles within 3 tiles, first time this battle
         ys, xs = slice(max(ty[p] - 3, 0), ty[p] + 4), slice(max(tx[p] - 3, 0), tx[p] + 4)
         fresh = sl["bush"][ys, xs] & ~sl["checked"][p, ys, xs]
         new[p] = fresh.sum(); sl["checked"][p, ys, xs] |= fresh
+    held = np.where(alive, held, 0.0); lost = np.minimum(held - sl["held"] - cubes, 0) * was   # an elimination: held -> 0
     T = np.stack([
-        0.01 * hid + dk * sl["hid"],                                              # bush_camp: hidden time + ambush damage
-        box / 1000.0 + cubes,                                                     # collect
-        dk * (mate_taken > 0) - mate_taken + 0.01 * (np.where(mate, d, np.inf).min(1) < 1800),   # protect
-        gain * low,                                                               # retreat: HP regained after dropping low
-        dk * (taken == 0) * (has & (near >= 0.7 * sl["range"])),                  # kite
+        0.002 * hid + dk * sl["hid"],                                             # bush_camp
+        ~ingas * (0.2 * box / 1000.0 + cubes),                                    # collect (+ lost below)
+        dk * peel,                                                                # protect
+        gain * low,                                                               # retreat
+        dk * (te == 0) * (has & (near >= 0.7 * sl["range"])),                     # kite
         dk * sl["nearcover"][ty, tx],                                             # peek
-        dk * inr.any(1) * (taken[low_hp] > 0),                                    # focus
-        closing * (has & (hp > hp[j]) & (ctot >= ctot[j])),                       # push
-        dk * (taken == 0) * (inr & others).any(1),                                # third_party
-        0.005 * new], 1) * alive[:, None]                                         # bush_control
+        dk * inr.any(1) * (te[low_hp] > 0),                                       # focus
+        closing * (has & (hp > hp[j]) & (held >= held[j])),                       # push
+        dk * (te == 0) * (inr & others).any(1),                                   # third_party
+        0.005 * new + dk * bushhit], 1) * alive[:, None]                          # bush_control
+    T[:, 1] += lost
+    dm = np.where(mate, d, np.inf).min(1); hm = np.isfinite(dm) & alive
+    dv = np.where(en & sees, d, np.inf).min(1); nv = alive & (dv < 3600)      # a visible enemy within 12 tiles
+    b = sl["beh"]
+    b[:, :13] += np.stack([alive, inb & alive, hid, inr.any(1) & (hp >= 0.4 * mhp), ingas & alive, hm, hm & (dm >= 450) & (dm <= 1200),
+                           hm & (dm < 300), np.where(hm, dm, 0) / 300.0, nv, np.where(nv, dv, 0) / sl["range"], dk * alive, box / 1000.0], 1)
+    b[:, 13] = np.maximum(b[:, 13], held); b[:, 14] = held
     sl["hid"], sl["dist"], sl["hp"], sl["low"] = hid, np.where(has, near, np.nan), np.where(alive, hp, np.nan), low & (hp < 0.8 * mhp)
+    sl["j"], sl["held"], sl["was"] = np.where(has, j, -1), held, alive
     return T
 
 
@@ -168,9 +237,14 @@ def team_ranks(groups, pr, dead, over):
 
 class Env(MAEnv):
     """MAEnv + a log of every instance restart with the battle that caused it + the slider rewards: every player gets
-    random weights 0-2 per battle; the transitions' reward and terms ("s_<slider>") and the episode rows include them."""
+    weights 0-2 per battle (tag "sliders": fixed, one vector for every player or one per player; else sample_sliders
+    with slider_sample); reward += slider_scale x sum(weight x slider_norm x term). The transitions' terms carry the raw
+    terms ("s_<slider>"); the episode rows carry the raw sums ("s_<slider>"), the reward they gave ("sn_<slider>"), the
+    weights ("sliders") and the behaviour counters ("beh", BEH)."""
     crashes = []
     slider_scale = 1.0
+    slider_sample = "uniform"     # train --slider-sample
+    slider_norm = np.ones(len(SL))   # train --slider-norm (env_v5.slider_norm)
     dead_aids = set()   # agents respawning right now (host: duo / trio knock-out with a living mate, 15 s): dead(ids)
     resp = {"out": 0, "back": 0, "wiped": 0}   # knock-outs into respawn, respawns, waits ended by the team's wipe
     record = False    # True: battles with cfg "native_ctl" put the native AI's action into the transition terms ("_act": BC labels)
@@ -218,7 +292,9 @@ class Env(MAEnv):
     def _start_battle(self, i, r):
         super()._start_battle(i, r)
         s = self.I[i]; s.hold = {}                       # player -> its final transition, held until the team's rank is known
-        s.sl = slider_state(s.map_tiles, s.W, s.H, (s.cfg.get("tag") or {}).get("chr", []), self.rng); s.map_hash = int(r.map_hash)
+        tag = s.cfg.get("tag") or {}
+        s.sl = slider_state(s.map_tiles, s.W, s.H, tag.get("chr", []), self.rng, w=tag.get("sliders"), mode=self.slider_sample)
+        s.map_hash = int(r.map_hash)
         s.pos = {p: (r.pl[p].x, r.pl[p].y) for p in range(10)}; s.ptick = r.tick; s.pjump = set(); s.wprev = set()
         s.cprev = {p: int(r.pl[p].cubes_total) for p in range(10)}
         s.hud = self._hud(s, r)
@@ -239,7 +315,7 @@ class Env(MAEnv):
         if getattr(r, "map_written", 0) and int(r.map_hash) != s.map_hash:   # a tile changed (bush / wall destroyed): live masks
             s.map_tiles = s.inst.map_tiles(); s.map_hash = int(r.map_hash); slider_map(sl, s.map_tiles, s.W, s.H)
         T = slider_terms(sl, r.pl) if self.slider_scale else np.zeros(np.shape(sl["w"]))   # speed round: off = no reward, skip it (s_* logs 0)
-        extra = (T * sl["w"]).sum(1) * self.slider_scale; sl["sum"] += T; sl["ret"] += extra
+        Tw = T * sl["w"] * self.slider_norm * self.slider_scale; extra = Tw.sum(1); sl["sum"] += T; sl["sumw"] += Tw; sl["ret"] += extra
         n0, e0 = len(self._trans), len(self.episodes)
         lab = self._labels(s, r) if self.record and s.cfg.get("native_ctl") else {}
         s.pos = {p: (r.pl[p].x, r.pl[p].y) for p in range(10)}; s.ptick = r.tick; s.pjump = {int(r.jumps[k][0]) for k in range(r.njumps)}
@@ -274,6 +350,8 @@ class Env(MAEnv):
         for row in self.episodes[e0:]:
             p = row["player"]; row["ret"] += float(sl["ret"][p]); row["sliders"] = [round(float(v), 3) for v in sl["w"][p]]
             row["terms"].update({"s_" + m: round(float(v), 4) for m, v in zip(SL, sl["sum"][p])})
+            row["terms"].update({"sn_" + m: round(float(v), 4) for m, v in zip(SL, sl["sumw"][p])})
+            row["beh"] = {k: round(float(v), 3) for k, v in zip(BEH, sl["beh"][p])}
 
     def cmd_vel(self, ids):
         """(B, 2) tiles / tick: the agents' last commanded move x their brawler speed (sim_plan A2; what the agent uses live
@@ -301,7 +379,7 @@ def _check():
     from types import SimpleNamespace as NS
     def players(**over):
         pl = [NS(x=1650 + 3000 * (p % 5), y=1650 + 6000 * (p // 5), hp=3000, max_hp=4000, damage_dealt=0, bomb_damage=0, damage_taken=0,
-                 box_damage=0, cubes=0, cubes_total=0, reserved=[0, 0, p, 0], alive=1, eliminated=0) for p in range(10)]
+                 box_damage=0, cubes=0, cubes_total=0, gas_damage=0, in_gas=0, reserved=[0, 0, p, 0], alive=1, eliminated=0) for p in range(10)]
         for k, v in over.items(): setattr(pl[int(k[1])], k[3:], v)
         return pl
     cub, left = Env._hud(None, NS(cfg={"tag": {"groups": [1, 1, 1, 2, 2, 2, 3, 3, 3, 0]}}),   # cond's HUD numbers
@@ -315,20 +393,53 @@ def _check():
     t2 = tiles.copy(); t2[25, 10] = 27000000; t2[5, 5] = 27000000; s2 = slider_map(dict(sl), t2.ravel(), 60, 40)   # destroyed
     assert s2["bush"].sum() == 3 and not s2["bush"][5, 5] and not s2["nearcover"][23, 8] and sl["bush"][5, 5]
     col = lambda T, name: T[:, SL.index(name)]
-    T = slider_terms(sl, players())                      # p0 at tile (5, 5) = the bush, nearest enemy 10 tiles away
-    assert col(T, "bush_camp")[0] == 0.01 and col(T, "bush_camp")[1:].sum() == 0 and col(T, "bush_control")[0] == 0.005
-    T = slider_terms(sl, players(p0_damage_dealt=500, p0_box_damage=1000, p0_cubes=1, p1_damage_taken=800))
-    assert np.isclose(col(T, "bush_camp")[0], 0.51) and col(T, "collect")[0] == 2.0 and col(T, "bush_control")[0] == 0
+    fresh = lambda: slider_state(tiles.ravel(), 60, 40, ["Sniper"] * 10, np.random.default_rng(0))
+    T = slider_terms(sl, players())                      # p0 on the bush tile (5, 5), on p1's screen 10 tiles away: hidden
+    assert col(T, "bush_camp")[0] == 0.002 and col(T, "bush_camp")[1:].sum() == 0 and col(T, "bush_control")[0] == 0.005
+    assert sl["beh"][0, BEH.index("hidden")] == 1 and sl["beh"][0, BEH.index("bush")] == 1 and sl["beh"][1, BEH.index("bush")] == 0
+    T = slider_terms(sl, players(p0_damage_dealt=500, p0_box_damage=1000, p0_cubes=1, p0_cubes_total=1, p1_damage_taken=800))
+    assert np.isclose(col(T, "bush_camp")[0], 0.502) and np.isclose(col(T, "collect")[0], 1.2) and col(T, "bush_control")[0] == 0
     assert col(T, "kite")[0] == 0.5 and col(T, "focus")[0] == 0.5 and col(T, "third_party")[0] == 0.5 and col(T, "peek")[0] == 0
     assert col(T, "kite")[1] == 0 and col(T, "protect").sum() == 0 and col(T, "push").sum() == 0
+    g = fresh(); slider_terms(g, players(p0_eliminated=1, p2_eliminated=1, p3_eliminated=1, p4_eliminated=1, p5_eliminated=1,
+                                          p6_eliminated=1, p7_eliminated=1, p8_eliminated=1, p9_eliminated=1, p1_x=15000))
+    assert g["beh"][0, BEH.index("hidden")] == 0 and g["beh"][1, BEH.index("alive")] == 1   # A4: a bush with nobody around is no hiding
+    gas = players(p0_damage_dealt=500, p1_damage_taken=800, p1_gas_damage=800, p0_box_damage=1000, p0_in_gas=1)
+    T = slider_terms(fresh(), gas)                       # A2: gas damage is no enemy hit; A5: no farming in the gas
+    assert col(T, "third_party")[0] == 0 and col(T, "focus")[0] == 0 and col(T, "collect")[0] == 0 and col(T, "kite")[1] == 0.0
     T = slider_terms(sl, players(p0_hp=1000)); assert col(T, "retreat")[0] == 0 and sl["low"][0]
     T = slider_terms(sl, players(p0_hp=1600)); assert np.isclose(col(T, "retreat")[0], 0.6)
     T = slider_terms(sl, players(p0_hp=3500)); assert np.isclose(col(T, "retreat")[0], 1.9) and not sl["low"][0]
     T = slider_terms(sl, players(p0_hp=3600, p0_x=1800)); assert col(T, "retreat")[0] == 0 and np.isclose(col(T, "push")[0], 0.01)
-    mates = players(p2_damage_taken=1000, p1_x=3000); mates[1].reserved[2] = 0; mates[2].reserved[2] = 0
-    T = slider_terms(sl, mates); assert np.allclose(col(T, "protect")[:3], [0.01, 0.01, 0])    # p2 is 15-20 tiles away
-    mates[2].x = 2500                                    # p2 now 850 / 500 from p0 / p1: its damage counts for both
-    T = slider_terms(sl, mates); assert np.isclose(col(T, "protect")[0], -1 + 0.01) and np.isclose(col(T, "protect")[1], -1 + 0.01)
+    T = slider_terms(sl, players(p0_hp=3600)); assert np.isclose(col(T, "push")[0], -0.01)   # A6: stepping back pays it back
+    T = slider_terms(sl, players(p0_hp=3600, p0_x=1800, p1_eliminated=1)); assert col(T, "push")[0] == 0   # new nearest: no closing
+    g = fresh(); slider_terms(g, players(p0_hp=1000))   # A1 / A7: knocked out low, respawned full: no retreat for the refill
+    ko = players(p0_hp=0); ko[0].reserved = [0, 0, 0, 100]; assert not slider_terms(g, ko)[0].any()
+    assert col(slider_terms(g, players(p0_hp=4000)), "retreat")[0] == 0 and g["beh"][0, BEH.index("alive")] == 2
+    g = fresh(); slider_terms(g, players(p0_hp=1000)); assert col(slider_terms(g, players(p0_hp=1400, p0_cubes=1, p0_cubes_total=1)), "retreat")[0] == 0
+    g = fresh(); slider_terms(g, players(p0_cubes=3, p0_cubes_total=3))           # cubes lost at a knock-out / an elimination
+    ko = players(); ko[0].reserved = [0, 0, 0, 100]; assert col(slider_terms(g, ko), "collect")[0] == -3
+    g = fresh(); slider_terms(g, players(p0_cubes=2, p0_cubes_total=2))
+    assert col(slider_terms(g, players(p0_eliminated=1, p0_cubes_total=2)), "collect")[0] == -2 and g["beh"][0, BEH.index("cubes_max")] == 2
+    mates = lambda **o: [setattr(q, "reserved", [0, 0, 0 if k < 3 else k, 0]) or q for k, q in enumerate(players(**o))]
+    g = fresh(); T = slider_terms(g, mates(p2_damage_taken=1000, p2_x=2500, p0_damage_dealt=400))   # A3: peel, no proximity pay
+    assert np.isclose(col(T, "protect")[0], 0.4) and col(T, "protect")[1] == 0
+    for k in range(8): slider_terms(g, mates())          # steps k+1 .. k+8
+    assert np.isclose(col(slider_terms(g, mates(p0_damage_dealt=400, p2_x=2500)), "protect")[0], 0.4)   # step k+9: still (10 steps)
+    assert col(slider_terms(g, mates(p0_damage_dealt=400, p2_x=2500)), "protect")[0] == 0
+    T = slider_terms(fresh(), mates(p2_damage_taken=1000, p0_damage_dealt=400)); assert col(T, "protect")[0] == 0   # p2 15+ tiles away
+    assert slider_terms(fresh(), mates())[:, SL.index("protect")].sum() == 0   # being near a mate pays nothing by itself
+    hb = players(p1_x=4500, p1_y=6300, p1_damage_taken=500, p0_damage_dealt=300, p0_x=4500, p0_y=4200)   # p1 in the bush (15, 21)
+    tiles2 = tiles.copy(); tiles2[21, 15] = bush; g = slider_state(tiles2.ravel(), 60, 40, ["Sniper"] * 10, np.random.default_rng(0))
+    assert np.isclose(col(slider_terms(g, hb), "bush_control")[0], 0.3)   # hidden in a bush 7 tiles off, in range, hit
+    w = slider_state(tiles.ravel(), 60, 40, [], np.random.default_rng(0), w=O.preset_vec("bush_camper"))["w"]
+    assert w.shape == (10, 10) and (w == O.preset_vec("bush_camper")).all()
+    r0, r1 = np.random.default_rng(5), np.random.default_rng(5)
+    assert np.array_equal(sample_sliders(r0, 10), r1.uniform(0, 2, (10, len(SL))))   # uniform = the original draws
+    m = sample_sliders(np.random.default_rng(1), 4000, "mix"); pre = np.stack([O.preset_vec(k) for k in O.PRESETS])
+    exact = (m[:, None] == pre[None]).all(2).any(1).mean(); sparse = ((m == 0.5) | (m == 2.0)).all(1).mean()
+    assert m.min() >= 0 and m.max() <= 2 and 0.08 < exact < 0.13 and 0.08 < sparse < 0.15, (exact, sparse)
+    assert (slider_norm("") == 1).all() and slider_norm("measured").shape == (len(SL),)
     dead = players(p0_alive=0, p0_damage_dealt=900); assert not slider_terms(sl, dead)[0].any()
     pl = players(p0_alive=0, p1_eliminated=1, p2_eliminated=1, p3_eliminated=1)          # team placement
     for p, k in ((0, 9), (1, 8), (2, 10), (3, 7)): pl[p].elim_rank = k
@@ -364,7 +475,26 @@ def _check():
         assert env._trans[-1][1] == 0.0 and env._trans[-1][3]["hp"] == 0.0 and not env.dead([16]).any()
         assert env.resp == {"out": 1, "back": 1, "wiped": 0}
     finally: MAEnv._finish_step = sup
+    def fake3(self, i, r):                               # p0 steps on with base reward 0 and finishes: an episode row
+        self._trans.append((16, 0.0, False, {"hp": 0.0, "place": 0.0, "win": 0.0}, None)); self.episodes.append({"player": 0, "ret": 0.0, "terms": {}})
+    sl3 = fresh(); sl3["w"][:] = 2.0; env.slider_scale = 0.5; env.slider_norm = np.full(len(SL), 3.0); env.w = {}
+    env.I = [NS(sl=sl3, cfg={"tag": {"groups": [0] * 10}}, hold={}, battle=1, pos={}, ptick=0, pjump=set(), agents={0: 16}, wprev=set())]
+    sup, MAEnv._finish_step = MAEnv._finish_step, fake3
+    try: env._finish_step(0, mk([], 0)); env._finish_step(0, mk([], 0, p0_damage_dealt=1000))   # hidden, then an ambush hit
+    finally: MAEnv._finish_step = sup
+    want = 2.0 * 3.0 * 0.5 * np.array([0.002 + 0.005, 0.002 + 1.0 + 1.0])   # weight x norm x scale x (bush_camp + bush_control's new tile; bush_camp + ambush + kite)
+    assert np.allclose([t[1] for t in env._trans[-2:]], want), [t[1] for t in env._trans[-2:]]
+    row = env.episodes[-1]; assert np.isclose(row["terms"]["sn_bush_camp"], 3 * 1.004) and np.isclose(row["terms"]["s_bush_camp"], 1.004)
+    assert row["beh"]["alive"] == 2 and row["sliders"] == [2.0] * 10
     print("env_v5 sliders ok")
+
+
+def norm_from(rows, budget=0.5):
+    """{slider: factor} so that each term's mean |sum per player and battle| over the episode rows becomes `budget`
+    (0.5: a slider at weight 1 is worth ~0.5 per battle, against the 8 of place + win); a term that never fired: 1.0"""
+    rows = [r for r in rows if "sliders" in r and not r.get("restart")]
+    m = {k: float(np.mean([abs(r["terms"].get("s_" + k, 0.0)) for r in rows])) if rows else 0.0 for k in SL}
+    return {k: round(budget / v, 4) if v > 1e-6 else 1.0 for k, v in m.items()}, m
 
 
 def main():
@@ -372,10 +502,19 @@ def main():
     ap.add_argument("--n", type=int, default=12); ap.add_argument("--minutes", type=float, default=5)
     ap.add_argument("--agents", type=int, default=10); ap.add_argument("--ticks", type=int, default=2)
     ap.add_argument("--out", default="bench.jsonl"); ap.add_argument("--gen", type=int, default=0, help="instances on generated maps")
+    ap.add_argument("--native", type=int, default=0, help="1 = the native AI plays the agents (observed; the slider-norm reference)")
+    ap.add_argument("--episodes", default="", help="also write every episode row to this jsonl")
+    ap.add_argument("--norm", default="", help="RUN dir or episodes jsonl -> slider_norm factors (no game)")
     ap.add_argument("--check", action="store_true", help="slider reward self-check (no game)")
     a = ap.parse_args()
     if a.check: return _check()
-    env = Env(a.n, make_battle_fn(a.agents, gen=use_genmaps(a.gen) if a.gen else None), ticks=a.ticks, fair=True, max_ticks=4000)
+    if a.norm:
+        fn = os.path.join(a.norm, "episodes.jsonl") if os.path.isdir(a.norm) else a.norm
+        f, m = norm_from([json.loads(l) for l in open(fn)])
+        print("mean |term| per player and battle:", {k: round(v, 4) for k, v in m.items()}); print(json.dumps(f)); return
+    bf = make_battle_fn(a.agents, gen=use_genmaps(a.gen) if a.gen else None)
+    battle_fn = (lambda rng, i: {**bf(rng, i), "native_ctl": True}) if a.native else bf
+    env = Env(a.n, battle_fn, ticks=a.ticks, fair=True, max_ticks=4000)
     rng = np.random.default_rng(0); t0 = None; steps = 0
     try:
         while t0 is None or time.time() - t0 < a.minutes * 60:
@@ -390,6 +529,9 @@ def main():
         dt = time.time() - (t0 or time.time()); env.close()
     with open(a.out, "w") as f:
         for c in env.crashes: f.write(json.dumps(c) + "\n")
+    if a.episodes:
+        with open(a.episodes, "w") as f:
+            for r in env.episodes: f.write(json.dumps(r) + "\n")
     print("n %d agents %d ticks %d: %.0f decisions/s, %d battles, %d episodes, %d restarts (%s), %d brawlers, %d maps" % (
         a.n, a.agents, a.ticks, steps / max(dt, 1e-9), env.stats["battles"], len(env.episodes), env.stats["restarts"],
         a.out, len(heroes()), len(locations())))

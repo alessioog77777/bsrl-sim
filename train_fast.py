@@ -43,6 +43,7 @@ def parse(argv=None):
     ap.add_argument("--kmix", default="1,2,3,4,5"); ap.add_argument("--brawler", default="Sniper", help="Sniper = Piper")
     ap.add_argument("--loc", default=None, help="Showdown location (default: the first of env_v5.locations())")
     ap.add_argument("--slider-scale", type=float, default=0.0, help="weight of the slider rewards (stage 1: off)")
+    from train_ppo import slider_flags; slider_flags(ap)   # --slider-norm / --slider-sample / --eval-sliders / --eval-presets
     ap.add_argument("--reward-w", default="", help='JSON overrides of maenv.REWARD_W, e.g. {"taken": -0.25, "dealt": 0.3, "shots": -0.03} (HISTORY 77)')
     ap.add_argument("--noise", type=int, default=1, help="ObsV5 vision noise + latency")
     ap.add_argument("--eval-min", type=float, default=30.0); ap.add_argument("--eval-episodes", type=int, default=200)
@@ -85,7 +86,7 @@ def worker(w, lo, hi, a, loc, out, conn, shm, init):
     try:
         from nbpc import diversity as D
         import env_v5 as E, obs_v5 as O, fast_obs as FO
-        from train_ppo import Recorder
+        from train_ppo import Recorder, eval_tag
         from fast_act import OBS_W, _OFF
         st = dict(init); evq = []; rng_b = np.random.default_rng(a.seed + 7 + 1000 * w)
         kmix = [int(x) for x in a.kmix.split(",")]; M = a.opp_slots; NW = a.workers
@@ -111,10 +112,10 @@ def worker(w, lo, hi, a, loc, out, conn, shm, init):
             tag = {"loc": locs[0], "chr": [a.brawler] * 10, "team_size": 1, "groups": [0] * 10}
             cfg = {"div": D.make_div(location=tag["loc"], chr=tag["chr"]), "tag": tag, "end": "agents"}
             if evq and not bc and i >= a.n - a.eval_n:   # evals stay on --brawler / the first location (comparable numbers)
-                sd, kd = evq.pop(0); b = kd == "evalb"
+                sd, kd, pre = evq.pop(0); b = kd == "evalb"
                 if a.eval_team > 1: cfg = teams(cfg, tag, a.eval_team); tag = cfg["tag"]
                 return {**cfg, "seed": sd, "ctl": list(range(10)) if b else [0], "end": "player0",
-                        "tag": {**tag, "kind": kd, "opp": list(range(1, 10)) if b else []}}
+                        "tag": {**tag, "kind": kd, "opp": list(range(1, 10)) if b else [], **eval_tag(a, pre)}}
             if roster or len(locs) > 1 or gen:           # A3: random brawlers / map per training battle
                 g = gen.get(li) if li in gen and rng_b.random() < a.p_gen else None
                 lc = E.GEN_BASE if g else locs[int(rng_b.integers(len(locs)))]
@@ -148,6 +149,7 @@ def worker(w, lo, hi, a, loc, out, conn, shm, init):
 
         E.Env.slider_scale = a.slider_scale; E.Env.record = st["record"]
         E.Env.cube_k, E.Env.cube_gamma = a.cube_shaping, a.gamma
+        E.Env.slider_sample, E.Env.slider_norm = a.slider_sample, E.slider_norm(a.slider_norm)
         env = WEnv(hi - lo, battle_fn, ticks=2, fair=True, max_ticks=a.max_ticks, verbose=True, seed=a.seed + 1000 * w, tag="pf%d_%d" % (os.getpid(), w),
                    reward_w=json.loads(a.reward_w) if a.reward_w else None)
         ob = FO.FastObsV5(noise=O.NOISE if a.noise else None, seed=a.seed + 1000 * w)
@@ -215,7 +217,7 @@ def main(argv=None):
     torch.manual_seed(a.seed); np.random.seed(a.seed)
     from nbpc.maenv import REWARD_W, TERMS
     import env_v5 as E, obs_v5 as O
-    from train_ppo import Buffer, chunks, eval_summary
+    from train_ppo import Buffer, chunks, eval_summary, eval_items, eval_presets
     from fast_act import StackedActor, OBS_W, _OFF
     NS = O.N_SELF + O.N_COND
     out = os.path.join(E.WORK, "runs", a.run); os.makedirs(out, exist_ok=True)
@@ -275,6 +277,7 @@ def main(argv=None):
     buf = Buffer(a.rollout + 8192)
     pending, traj, final, hid = {}, {}, set(), {}
     epf = open(os.path.join(out, "episodes.jsonl"), "a"); evf = open(os.path.join(out, "evals.jsonl"), "a")
+    evepf = open(os.path.join(out, "eval_episodes.jsonl"), "a")   # the policy's (player 0) eval rows: scorecard.py eval / per-preset groups
     prf = open(os.path.join(out, "progress.jsonl"), "a")
     t0 = time.time(); n_ep = 0; ep_rows = []; stop = {"now": False}; z = np.zeros(HID, np.float32)
     signal.signal(signal.SIGTERM, lambda *_: stop.__setitem__("now", True))
@@ -288,7 +291,7 @@ def main(argv=None):
     def start_eval():
         nonlocal enet
         enet = frozen(anet.state_dict())
-        items = [(sd, "eval") for sd in range(1, a.eval_episodes + 1)] + [(sd, "evalb") for sd in range(1, a.evalb_episodes + 1)]
+        items = eval_items(a)
         cap = [w for w in range(NWk) if cut[w + 1] > a.n - a.eval_n] or list(range(NWk))   # workers with eval instances
         for j, it in enumerate(items): extra[cap[j % len(cap)]].setdefault("eval", []).append(it)
         push(); ev.update(active=True, update=upd, steps=agent_steps, t0=time.time(), n0=len(episodes), ver=ctl["ver"])
@@ -299,8 +302,9 @@ def main(argv=None):
         by = lambda kd: list({r["seed"]: r for r in episodes[ev["n0"]:] if r["tag"]["kind"] == kd and r["player"] == 0}.values())
         sm = {"update": ev["update"], "agent_steps": ev["steps"], "minutes": round((time.time() - t0) / 60, 1),
               "eval_s": round(time.time() - ev["t0"], 1), **eval_summary(by("eval")),
-              **{"b_" + k: v for k, v in eval_summary(by("evalb")).items() if k in ("episodes", "rank", "ci95", "win", "top3")}}
-        evf.write(json.dumps(sm) + "\n"); evf.flush(); print("[eval]", json.dumps(sm), flush=True)
+              **{"b_" + k: v for k, v in eval_summary(by("evalb")).items() if k in ("episodes", "rank", "ci95", "win", "top3")},
+              **eval_presets(episodes[ev["n0"]:])}
+        evf.write(json.dumps(sm) + "\n"); evf.flush(); print("[eval]", json.dumps(sm), flush=True); evepf.flush()
         ev.update(active=False, t_last=time.time())
         epf.flush()   # scorecard.py (CPU, own process: the loop never waits) -> RUN/scorecard.json + one line in the log
         subprocess.Popen([sys.executable, os.path.join(HERE, "scorecard.py"), out], stdin=subprocess.DEVNULL)
@@ -475,6 +479,7 @@ def main(argv=None):
                         e = pf.setdefault(tg["snap"], [5.5, 0]); e[0] += 0.02 * (r["rank"] - e[0]); e[1] += 1
                     if not r["tag"]["kind"].startswith("eval") and r["player"] not in r["tag"].get("opp", ()):
                         ep_rows.append(r); epf.write(json.dumps(r) + "\n")
+                    elif r["tag"]["kind"].startswith("eval") and r["player"] == 0: evepf.write(json.dumps(r) + "\n")
                 n_ep = len(episodes)
                 if ev["active"]: finish_eval()
                 elif not a.overlap_update and not bc() and time.time() - ev["t_last"] > a.eval_min * 60: start_eval()

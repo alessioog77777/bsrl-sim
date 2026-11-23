@@ -10,6 +10,7 @@
                        | area effects: radius (10 tiles), harms me, helps me, slows me (0 for every other class)
     o["grid"] (B, 25, 25) uint8  seg class id (SEG) per tile around the player, UNKNOWN outside the camera view
     cond(brawler, sliders, team_size, cubes, left) (28,)  own brawler stats + behaviour weights + team size + HUD numbers
+    preset_vec(name) (10,)  the slider weights of a named play-style mode (PRESETS: balanced, bush_camper, aggressive, ...)
 
 Source = the host's state2 vector + grid after nbpc.fair (already camera- and bush-limited). Needs the rl-round
 host `nbhost_rl` (enemy features 14 / 15 = summon / on my team, self 18 = hypercharge fraction, grid channel 0 =
@@ -314,6 +315,25 @@ def brawler_stats(name):
     return np.minimum(v, 2.0)    # a few rows are far out (a 29000-speed projectile, 120-tile supers)
 
 
+# play-style modes: slider weights (0-2) per named preset, sliders not listed = 1.0 (the uniform sampler's mean).
+# Inference: cond(..., sliders=preset_vec(name)). 2 = the style's own sliders, 0-0.5 = what the style gives up.
+PRESETS = {
+    "balanced": {},
+    "bush_camper": {"bush_camp": 2, "collect": .5, "retreat": 1.5, "push": 0, "third_party": 1.5, "bush_control": .5},
+    "aggressive": {"bush_camp": 0, "collect": .5, "retreat": .5, "kite": .3, "peek": .5, "focus": 2, "push": 2, "third_party": .5, "bush_control": .5},
+    "cube_farmer": {"bush_camp": .5, "collect": 2, "protect": .5, "retreat": 1.5, "peek": .5, "push": .3},
+    "third_partier": {"protect": .5, "kite": 1.5, "focus": 1.5, "push": .3, "third_party": 2},
+    "marksman": {"bush_camp": .5, "protect": .5, "retreat": 1.5, "kite": 2, "peek": 1.5, "push": 0},
+    "team_player": {"bush_camp": .5, "collect": .5, "protect": 2, "focus": 2, "third_party": .5, "bush_control": .5},
+}
+
+
+def preset_vec(name):
+    """(len(SLIDERS),) float32 slider weights of a PRESETS entry"""
+    p = PRESETS[name]
+    return np.array([p.get(k, 1.0) for k in SLIDERS], np.float32)
+
+
 def cond(brawler, sliders, team_size=1, cubes=0, left=None):
     """conditioning vector: brawler stats (13) + slider weights 0-2 (10, order SLIDERS) + team size 1-3 one-hot
     + own power cubes / 10 (max 2) + teams (solo: players) left / 10, the two Showdown HUD numbers"""
@@ -417,6 +437,10 @@ def _check():
     c = cond("Sniper", np.ones(10), 3)
     assert c.shape == (N_COND,) and c[-3] == 1 and c[-5] == 0 and c[-2] == 0 and abs(c[-1] - 0.4) < 1e-6
     assert np.allclose(cond("Sniper", np.ones(10), 1, cubes=3, left=7)[-2:], [0.3, 0.7])
+    assert set(PRESETS) >= {"balanced", "bush_camper", "aggressive", "cube_farmer"} and all(set(v) <= set(SLIDERS) for v in PRESETS.values())
+    pv = np.stack([preset_vec(k) for k in PRESETS])
+    assert pv.shape == (len(PRESETS), len(SLIDERS)) and pv.min() >= 0 and pv.max() <= 2 and (preset_vec("balanced") == 1).all()
+    assert preset_vec("bush_camper")[SLIDERS.index("bush_camp")] == 2 and len({tuple(r) for r in pv}) == len(PRESETS)
     print("obs_v5 ok: %d brawlers, %d thrown, %d melee, cond %d, ent %dx%d" % (
         len(hs), st[:, 6].sum(), st[:, 7].sum(), N_COND, N_ENT, F_ENT))
 

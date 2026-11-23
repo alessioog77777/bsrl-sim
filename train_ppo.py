@@ -21,6 +21,9 @@
 * Eval = a frozen copy of the weights: "eval" vs 9 native (sanity gate) and "evalb" vs 9 copies of --base (default: the
   --resume checkpoint; from scratch: the BC snapshot) -> b_rank in evals.jsonl: 5.5 = equal to base, lower = stronger.
 * Evals run on the last --eval-n instances only; the others keep training.
+* Sliders (env_v5): --slider-scale x sum(weight x --slider-norm factor x term); weights per battle from --slider-sample.
+  Evals use sampled weights unless --eval-sliders balanced; --eval-presets a,b adds "evalp" battles (same seeds vs 9
+  native, player 0 on the preset's weights, + balanced) -> p_<preset> in evals.jsonl, scorecard.py per preset.
 shortcut: no exploiters (a second learner trained only to beat this one); add them if b_rank flattens again with PFSP.
 """
 import argparse, glob, json, os, shutil, signal, sys, time
@@ -113,6 +116,38 @@ def chunks(traj, L):
     return np.array(out, np.int64).reshape(-1, L)
 
 
+def eval_items(a):
+    """the battles of one eval: (seed, kind, preset) for eval / evalb, then per --eval-presets name (balanced first, the
+    paired reference) the same seeds as kind "evalp" vs 9 native"""
+    pre = [p for p in a.eval_presets.split(",") if p]; pre = (["balanced"] + [p for p in pre if p != "balanced"]) if pre else []
+    return ([(sd, "eval", None) for sd in range(1, a.eval_episodes + 1)] + [(sd, "evalb", None) for sd in range(1, a.evalb_episodes + 1)]
+            + [(sd, "evalp", p) for p in pre for sd in range(1, a.eval_episodes + 1)])
+
+
+def eval_tag(a, preset):
+    """slider weights of an eval battle (env_v5 tag "sliders", every player): a preset's; --eval-sliders balanced: all
+    1.0; else none (sampled as in training)"""
+    if preset is None and a.eval_sliders != "balanced": return {}
+    p = preset or "balanced"
+    return {"sliders": [float(v) for v in O.preset_vec(p)], "preset": p}
+
+
+def eval_presets(rows):
+    """{"p_<preset>": eval_summary} of an eval's evalp rows (player 0, one per seed)"""
+    out = {}
+    for p in sorted({r["tag"].get("preset") for r in rows if r["tag"]["kind"] == "evalp"} - {None}):
+        out["p_" + p] = eval_summary(list({r["seed"]: r for r in rows if r["tag"]["kind"] == "evalp" and r["tag"].get("preset") == p and r["player"] == 0}.values()))
+    return out
+
+
+def slider_flags(ap):
+    """step-A slider flags, shared with train_fast (defaults = the original behaviour)"""
+    ap.add_argument("--slider-norm", default="", help="'' = terms unscaled, 'measured' = env_v5.NORM_MEASURED, or a JSON file {slider: factor}")
+    ap.add_argument("--slider-sample", default="uniform", choices=("uniform", "mix"), help="per-battle slider weights: U(0, 2) or the preset mix (env_v5.sample_sliders)")
+    ap.add_argument("--eval-sliders", default="random", choices=("random", "balanced"), help="eval / evalb weights: sampled as in training, or all 1.0")
+    ap.add_argument("--eval-presets", default="", help="comma list of obs_v5.PRESETS: each also plays the eval seeds vs native (kind evalp, + balanced)")
+
+
 def eval_summary(rows):
     ok = [r for r in rows if r["rank"] is not None and not r["truncated"]]
     rk = np.array([r["rank"] for r in ok], float); m = lambda k: round(float(np.mean([r["terms"][k] for r in ok])), 3) if ok else None
@@ -137,6 +172,7 @@ def main():
     ap.add_argument("--kmix", default="1,2,3,4,5"); ap.add_argument("--brawler", default="Sniper", help="Sniper = Piper")
     ap.add_argument("--loc", default=None, help="Showdown location (default: the first of env_v5.locations())")
     ap.add_argument("--slider-scale", type=float, default=0.0, help="weight of the slider rewards (stage 1: off)")
+    slider_flags(ap)
     ap.add_argument("--noise", type=int, default=1, help="ObsV5 vision noise + latency")
     ap.add_argument("--eval-min", type=float, default=30.0); ap.add_argument("--eval-episodes", type=int, default=200)
     ap.add_argument("--max-ticks", type=int, default=4000); ap.add_argument("--seed", type=int, default=0)
@@ -187,9 +223,9 @@ def main():
         tag = {"loc": loc, "chr": [a.brawler] * 10, "team_size": 1, "groups": [0] * 10}
         cfg = {"div": D.make_div(location=loc, chr=tag["chr"]), "tag": tag, "end": "agents"}
         if eval_queue and not bc() and i >= a.n - a.eval_n:
-            sd, kd = eval_queue.pop(0); b = kd == "evalb"
+            sd, kd, pre = eval_queue.pop(0); b = kd == "evalb"
             return {**cfg, "seed": sd, "ctl": list(range(10)) if b else [0], "end": "player0",
-                    "tag": {**tag, "kind": kd, "opp": list(range(1, 10)) if b else []}}
+                    "tag": {**tag, "kind": kd, "opp": list(range(1, 10)) if b else [], **eval_tag(a, pre)}}
         sd = int(rng_b.integers(10_000_000, 2 ** 31 - 1))
         if bc():
             return {**cfg, "seed": sd, "ctl": list(range(10)), "native_ctl": True, "tag": {**tag, "kind": "bc"}}
@@ -201,11 +237,13 @@ def main():
         return {**cfg, "seed": sd, "ctl": sorted(rng_b.choice(10, k, replace=False).tolist()), "tag": {**tag, "kind": "k%d" % k}}
 
     E.Env.slider_scale = a.slider_scale; E.Env.record = a.bc_updates > 0
+    E.Env.slider_sample, E.Env.slider_norm = a.slider_sample, E.slider_norm(a.slider_norm)
     env = E.Env(a.n, battle_fn, ticks=2, fair=True, max_ticks=a.max_ticks, verbose=True, seed=a.seed, tag="ppo%d" % os.getpid())
     ob = O.ObsV5(noise=O.NOISE if a.noise else None, seed=a.seed); rec = Recorder(out)
     buf = Buffer(a.rollout + 8192)
     pending, traj, final, hid = {}, {}, set(), {}      # aid -> row waiting for its transition / rows this rollout / ended / GRU state
     epf = open(os.path.join(out, "episodes.jsonl"), "a"); evf = open(os.path.join(out, "evals.jsonl"), "a")
+    evepf = open(os.path.join(out, "eval_episodes.jsonl"), "a")   # the policy's (player 0) eval rows: scorecard.py eval / per-preset groups
     prf = open(os.path.join(out, "progress.jsonl"), "a")
     t0 = time.time(); n_ep = 0; ep_rows = []; stop = {"now": False}; z = np.zeros(HID, np.float32)
     signal.signal(signal.SIGTERM, lambda *_: stop.__setitem__("now", True))
@@ -218,7 +256,7 @@ def main():
     def start_eval():
         nonlocal enet
         enet = frozen(net.state_dict())
-        eval_queue.extend([(sd, "eval") for sd in range(1, a.eval_episodes + 1)] + [(sd, "evalb") for sd in range(1, a.evalb_episodes + 1)])
+        eval_queue.extend(eval_items(a))
         ev.update(active=True, update=upd, steps=agent_steps, t0=time.time(), n0=len(env.episodes))
         save(os.path.join(out, "ckpt_u%04d.pt" % upd))
 
@@ -227,8 +265,9 @@ def main():
         by = lambda kd: list({r["seed"]: r for r in env.episodes[ev["n0"]:] if r["tag"]["kind"] == kd and r["player"] == 0}.values())
         sm = {"update": ev["update"], "agent_steps": ev["steps"], "minutes": round((time.time() - t0) / 60, 1),
               "eval_s": round(time.time() - ev["t0"], 1), **eval_summary(by("eval")),
-              **{"b_" + k: v for k, v in eval_summary(by("evalb")).items() if k in ("episodes", "rank", "ci95", "win", "top3")}}
-        evf.write(json.dumps(sm) + "\n"); evf.flush(); print("[eval]", json.dumps(sm), flush=True)
+              **{"b_" + k: v for k, v in eval_summary(by("evalb")).items() if k in ("episodes", "rank", "ci95", "win", "top3")},
+              **eval_presets(env.episodes[ev["n0"]:])}
+        evf.write(json.dumps(sm) + "\n"); evf.flush(); print("[eval]", json.dumps(sm), flush=True); evepf.flush()
         ev.update(active=False, t_last=time.time())
 
     t_end = t0 + a.hours * 3600; smoke_end = upd + 3
@@ -284,6 +323,7 @@ def main():
                         e = pf.setdefault(tg["snap"], [5.5, 0]); e[0] += 0.02 * (r["rank"] - e[0]); e[1] += 1
                     if not r["tag"]["kind"].startswith("eval") and r["player"] not in r["tag"].get("opp", ()):
                         ep_rows.append(r); epf.write(json.dumps(r) + "\n")
+                    elif r["tag"]["kind"].startswith("eval") and r["player"] == 0: evepf.write(json.dumps(r) + "\n")
                 n_ep = len(env.episodes)
                 if ev["active"]: finish_eval()
                 elif not bc() and time.time() - ev["t_last"] > a.eval_min * 60: start_eval()
