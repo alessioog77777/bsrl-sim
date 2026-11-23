@@ -20,10 +20,16 @@ Heads the actor never runs (NONACT; fast_act / act_stacked skip them, old checkp
 fresh ones; built on their own RNG stream, so Policy() under a given seed has the acting weights it had without them):
 * live value `vl` (trainer --vlive): MLP on the detached cat[x, h], no priv, so it works live (priv does not exist
   there) and never changes the policy; zero-initialised. Target: the return without the intent reward.
+* aux heads `aux` (trainer --aux-w; labels from the sim's true state at train time only, env_v5.AUX): fut = each
+  enemy-block slot's position 1 s ahead (the slot's seen position + a zero-initialised offset: it starts at "stays
+  where seen"), hit = P(enemy damage taken in the next 1 s), gas = gas margin, bush = P(an enemy hidden in a bush within
+  5 tiles) per 45-degree sector. On cat[x, h] NOT detached: their gradients shape the encoders / trunk / GRU, never
+  the policy or value heads (separate modules).
 
     lg, v, xc = net.seq(s, ent, grid, h0, priv, feats=True)  # + xc = cat[x, h] (N * L, d + HID) for the heads below
     vl = net.value_live(xc)                                   # (N * L,)
     xc = net.row_feats(s, ent, grid, h)                       # cat[x, h'] of single decisions from their stored h (no grad)
+    aux = net.aux_out(xc, ent, s); loss, per_head = aux_losses(aux, labels)
 """
 import numpy as np
 import torch
@@ -33,7 +39,9 @@ import obs_v5 as O
 from models4 import UnfoldConv2d, dist_logp_ent      # nirkt (MIOpen-safe conv; masked log-prob / entropy / sampling)
 
 NVEC, HID, PRIV = [17, 3, 360, 8], 256, 40
-NONACT = ("vl.",)                                     # parameter prefixes acting never uses (skipped by fast_act / act_stacked)
+NONACT = ("vl.", "aux.")                              # parameter prefixes acting never uses (skipped by fast_act / act_stacked)
+AUX_SLOTS = 9                                         # fut head: the enemy block (ent 0-8)
+AUX_REL = {"fut": 1.0, "hit": 0.5, "gas": 0.5, "bush": 0.5}   # relative aux loss weights (behaviour design 5; x --aux-w)
 _CAND = list(range(0, 9)) + list(range(25, 31))       # ent slots that can be aimed at: the enemy block + the power boxes
 _FOE = [1 + O.ENT.index(c) for c in ("enemy", "enemy_summon", "power_box")]
 N_LEAD, HMAX, N_STAT = 2, 160, 13                     # lead columns; hero table rows (+1 unknown); cond's brawler stats
@@ -91,6 +99,12 @@ class Policy(nn.Module):
             torch.default_generator.manual_seed((torch.initial_seed() + 1) % 2 ** 63)
             self.vl = nn.Sequential(nn.Linear(d + HID, 256), nn.ReLU(), nn.Linear(256, 1))   # live value (no priv)
             nn.init.zeros_(self.vl[2].weight); nn.init.zeros_(self.vl[2].bias)
+
+        with torch.random.fork_rng(devices=[]):          # aux heads, own stream too (128 wide: small next to the grid conv)
+            torch.default_generator.manual_seed((torch.initial_seed() + 2) % 2 ** 63)
+            mlp = lambda i, o: nn.Sequential(nn.Linear(i, 128), nn.ReLU(), nn.Linear(128, o))
+            self.aux = nn.ModuleDict({"fut": mlp(d + HID + F_IN, 2), "hit": mlp(d + HID, 1), "gas": mlp(d + HID, 1), "bush": mlp(d + HID, 8)})
+            nn.init.zeros_(self.aux["fut"][2].weight); nn.init.zeros_(self.aux["fut"][2].bias)
 
     def add_heroes(self, stats):
         """put each (13,) stats row not in the table yet into the next free row (order-stable across resumes) -> count"""
@@ -166,12 +180,33 @@ class Policy(nn.Module):
         """(N,) live value from cat[x, h]: no priv, detached input (a probe: its loss reaches only `vl`)"""
         return self.vl(xc.detach()).squeeze(-1)
 
+    def aux_out(self, xc, ent, s):
+        """aux predictions from cat[x, h] (not detached) and the entity rows (N, N_ENT, F_ENT): fut (N, 9, 2) each
+        enemy-block slot's position in 1 s relative to my position now (10-tile units), hit (N,) logit of P(enemy damage
+        taken in the next 1 s), gas (N,) gas margin / 10 tiles, bush (N, 8) logits per sector (env_v5.AUX "be")"""
+        e = ent[:, :AUX_SLOTS]; e = torch.cat([e, lead(e, s)], -1); N, K, _ = e.shape
+        fut = e[..., O.XY:O.XY + 2] + self.aux["fut"](torch.cat([xc[:, None].expand(N, K, xc.shape[-1]), e], -1))
+        return {"fut": fut, "hit": self.aux["hit"](xc)[:, 0], "gas": self.aux["gas"](xc)[:, 0], "bush": self.aux["bush"](xc)}
+
     @torch.no_grad()
     def row_feats(self, s, ent, grid, h):
         """cat[x, h'] of single decisions from their stored GRU input state h (the acting math; the trainers' pass over a
         rollout and the replay readout)"""
         x = self.encode(s, ent, grid)
         return torch.cat([x, self.gru(x, h)], -1)
+
+
+def aux_losses(out, lab):
+    """masked aux losses (Policy.aux_out vs train_ppo.aux_labels) -> (sum of AUX_REL x loss, {head: loss}). lab: fut
+    (N, 9, 2) + fut_m (N, 9), hit (N,) + hit_m (N,), gas (N,), bush (N, 8), m (N,) = rows with labels (alive). Huber
+    delta 0.1 = 1 tile (fut, gas), BCE (hit, bush multi-label)"""
+    mm = lambda x, m: (x * m).sum() / m.sum().clamp(min=1)
+    m = lab["m"]
+    L = {"fut": mm(F.huber_loss(out["fut"], lab["fut"], reduction="none", delta=0.1).sum(-1), lab["fut_m"] * m[:, None]),
+         "hit": mm(F.binary_cross_entropy_with_logits(out["hit"], lab["hit"], reduction="none"), lab["hit_m"] * m),
+         "gas": mm(F.huber_loss(out["gas"], lab["gas"], reduction="none", delta=0.1), m),
+         "bush": mm(F.binary_cross_entropy_with_logits(out["bush"], lab["bush"], reduction="none").mean(-1), m)}
+    return sum(AUX_REL[k] * v for k, v in L.items()), L
 
 
 def mask_super(fi, s):
@@ -250,6 +285,7 @@ def _check():
     lp, en, a = dist_logp_ent(lg2); assert a.shape == (N * L, 4) and torch.isfinite(lp).all()
     assert masked_kl(lg2, lg2).abs().max() < 1e-5
     (lp.mean() + v2.mean()).backward()
+    _check_aux(net, s, ent, grid)
     _check_live(net, s, ent, grid, pv)
     _check_stage2()
     print("model ok: %d parameters" % sum(x.numel() for x in net.parameters()))
@@ -272,6 +308,28 @@ def _check_live(net, s, ent, grid, pv):
         r1 = act_stacked([net], xs)
     assert all(torch.equal(a, b) for a, b in zip(list(r0[0]) + [r0[1], r0[2]], list(r1[0]) + [r1[1], r1[2]])), "acting reads a non-acting head"
     assert not any(k.startswith(NONACT) for k in acting_params(net)) and len(acting_params(net)) < len(dict(net.named_parameters()))
+
+
+def _check_aux(net, s, ent, grid):
+    """aux heads: shapes, fut starts at the seen position, masked labels do not count, the loss reaches the encoders /
+    GRU and the aux heads but no policy / value head"""
+    N, L = s.shape[:2]; f = lambda t: t.flatten(0, 1); net.zero_grad(set_to_none=True)
+    xc = net.seq(s, ent, grid, torch.zeros(N, HID), feats=True)[2]; out = net.aux_out(xc, f(ent), f(s)); M = N * L
+    assert out["fut"].shape == (M, AUX_SLOTS, 2) and out["hit"].shape == out["gas"].shape == (M,) and out["bush"].shape == (M, 8)
+    assert torch.equal(out["fut"], f(ent)[:, :AUX_SLOTS, O.XY:O.XY + 2])          # zero-init offset: "stays where seen"
+    g = torch.Generator().manual_seed(3); r = lambda *sh: torch.rand(*sh, generator=g)
+    lab = {"fut": r(M, AUX_SLOTS, 2), "fut_m": (r(M, AUX_SLOTS) < 0.5).float(), "hit": (r(M) < 0.3).float(), "hit_m": (r(M) < 0.8).float(),
+           "gas": r(M), "bush": (r(M, 8) < 0.1).float(), "m": torch.ones(M)}
+    lab["m"][0] = 0; tot, per = aux_losses(out, lab)
+    lab2 = dict(lab); lab2["fut"] = torch.where(lab["fut_m"][..., None] > 0, lab["fut"], lab["fut"] + 5)   # masked: anything
+    lab2["hit"] = torch.where(lab["hit_m"] > 0, lab["hit"], 1 - lab["hit"]); lab2["gas"] = lab["gas"].clone(); lab2["gas"][0] = 9.0
+    tot2, per2 = aux_losses(out, lab2)
+    assert torch.allclose(tot, tot2) and all(torch.isfinite(v) and v > 0 for v in per.values()), (per, per2)
+    tot.backward()
+    grads = {k: p.grad is not None and p.grad.abs().sum() > 0 for k, p in net.named_parameters()}
+    for k in ("ent.0.weight", "grid.0.weight", "vec.0.weight", "trunk.0.weight", "gru.weight_ih", "aux.fut.2.weight", "aux.bush.0.weight"):
+        assert grads[k], k
+    assert not any(v for k, v in grads.items() if k.split(".")[0] in ("pi", "v", "vp", "cand", "free", "free_score", "vl")), [k for k, v in grads.items() if v]
 
 
 def _check_stage2():

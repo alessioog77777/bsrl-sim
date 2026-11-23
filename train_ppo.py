@@ -2,6 +2,7 @@
 
     python -m train_ppo --run s1 --hours 3            # outputs $SIM_WORK/runs/s1/
     python -m train_ppo --run t --smoke               # 2 instances, tiny rollouts, 3 updates: plumbing check
+    python -m train_ppo --check                       # self-check of the update-time helpers (no game)
 
 * Updates 1..--bc-updates: all 10 players are driven by the native AI and observed; loss = cross-entropy to its action
   (env_v5.Env labels) + value regression. Then PPO: k agents per battle (--kmix) vs the native AI, clip + entropy +
@@ -30,6 +31,14 @@
   progress.jsonl: expl_var_live (next to expl_var, the critic with priv), vloss_live, extra_s (the pass). The heads that
   never act (model.NONACT) have their own Adam ("opt_x" in the checkpoint) and gradient clip, so the main optimizer and
   its clip see exactly the acting network's parameters.
+* Aux heads (--aux-w W, default 0 = no loss, no gradient): W x model.aux_losses added to the BC / PPO loss, gradients
+  into the encoders / trunk / GRU (not the policy / value heads). Labels from the sim's true state: env_v5.Env.aux_now
+  at poll time (buffer columns tpos talive me gm be) + the transition term "te" (enemy damage taken), assembled at
+  update time by aux_labels. progress.jsonl readouts on the pre-update predictions (row_pass): aux_fut_tiles (median
+  error of the 1 s enemy position) next to aux_fut_cv_tiles (constant velocity from the seen velocity) and
+  aux_fut_still_tiles (stays where seen), aux_fut_match (share of seen enemy slots matched to a true enemy),
+  aux_hit_auc, aux_gas_mae_tiles, aux_bush_auc (+ base rates, aux_loss_*).
+  Replays: the recorded row's predictions (frame "x") and truth (frame "xt"); viz draws them.
 shortcut: no exploiters (a second learner trained only to beat this one); add them if b_rank flattens again with PFSP.
 """
 import argparse, glob, json, os, shutil, signal, sys, time
@@ -38,7 +47,7 @@ import torch
 from nbpc import diversity as D
 from nbpc.maenv import REWARD_W, TERMS
 import env_v5 as E, obs_v5 as O
-from model import Policy, HID, PRIV, NONACT, dist_logp_ent, masked_kl, act_stacked
+from model import Policy, HID, PRIV, NONACT, dist_logp_ent, masked_kl, act_stacked, aux_losses
 
 NS = O.N_SELF + O.N_COND
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -74,7 +83,14 @@ class Recorder:
         self.dir = os.path.join(out, "replays"); os.makedirs(self.dir, exist_ok=True)
         self.keep, self.want, self.cur, self.index = keep, True, None, []
 
-    def frame(self, env, ids, o, act, upd):
+    def row(self, env, ids):
+        """index in ids of the agent frame() would record now (instance 0's battle), else None"""
+        rows = np.nonzero((ids >> 4) == env.I[0].battle)[0]
+        return int(rows[0]) if len(rows) and (self.cur is not None or self.want) else None
+
+    def frame(self, env, ids, o, act, upd, x=None):
+        """x = aux_readout of the recorded row (--aux-w): the frame gets "x" and the truth "xt" (env_v5.Env.aux_now: gas
+        margin, hidden bush enemies by sector; "h" = enemy damage taken this step; the 1 s positions are the later frames' "p")"""
         s = env.I[0]; rows = np.nonzero((ids >> 4) == s.battle)[0]
         if self.cur is not None and (self.cur["battle"] != s.battle or len(self.cur["frames"]) >= 600):   # 600 steps = 1 min of game
             self.flush()
@@ -92,6 +108,9 @@ class Recorder:
             "p": [[int(r.pl[p].x), int(r.pl[p].y), int(r.pl[p].hp), int(r.pl[p].max_hp), int(bool(r.pl[p].alive) and not r.pl[p].eliminated)] for p in range(10)],
             "e": [[int(x[1:1 + len(O.ENT)].argmax()), round(float(x[O.XY]), 3), round(float(x[O.XY + 1]), 3), round(float(x[O.HP]), 2)] for x in e],
             "s": [round(float(x), 2) for x in o["self"][b, :5]], "g": "".join(chr(97 + c) for c in o["grid"][b].ravel())})
+        if x is not None:
+            A = E.aux_split(env.aux_now(ids[b:b + 1])); pl = r.pl[int(ids[b]) & 15]
+            self.cur["frames"][-1].update(x=x, xt={"g": round(float(A["gm"][0]), 1), "b": [int(v) for v in A["be"][0]], "h": int(pl.damage_taken > pl.gas_damage)})
 
     def flush(self):
         c, self.cur = self.cur, None
@@ -161,6 +180,7 @@ TR_X = ("i_rew",)   # transition terms the buffer keeps besides rew / done (trai
 def head_flags(ap):
     """step-C flags of the heads that never act, shared with train_fast (defaults = off, the original behaviour)"""
     ap.add_argument("--vlive", type=int, default=0, help="1 = train the live value head (model.Policy.vl: no priv, return without the intent reward)")
+    ap.add_argument("--aux-w", type=float, default=0.0, help="weight of the aux head losses (model.Policy.aux; 0 = off: no loss, no gradient; start 0.1)")
 
 
 def split_params(net):
@@ -205,12 +225,104 @@ def live_targets(a, net, g, buf, traj, pending, final, n, use_rows):
     return vl, ret, expl_var(ret[use_rows], vl[use_rows])
 
 
+Buffer.F.update({"tpos": ((10, 2), np.float32), "talive": ((10,), bool), "me": ((), np.int8), "gm": ((), np.float32),
+                 "be": ((8,), bool), "te": ((), np.float32)})   # aux labels: env_v5.AUX columns + the transition's te
+TR_X = TR_X + ("te",)
+FUT_GATE, FUT_K = 1.5, 10   # tiles: a slot is that enemy within 1.5 tiles of where it is seen (noise ~0.4, latency <= 0.2 s); 10 rows = 1 s
+
+
+def aux_labels(buf, traj, final, n):
+    """update-time aux labels of buffer rows 0..n-1 (numpy, the model.aux_losses keys) from the trajectories' row lists
+    (time order), the env_v5.AUX columns and the transitions' te:
+      fut (n, 9, 2) / fut_m: enemy-block slot k of row j greedily matched to the nearest alive true enemy within FUT_GATE
+        of where the slot is seen (relative to me at j); label = that enemy's true position FUT_K rows later (same
+        trajectory, still alive) minus mine at j, / 10 tiles, clip +-2.5
+      hit / hit_m: enemy damage taken in the transitions of rows j .. j+9; known once 10 transitions follow, the
+        trajectory ended, or a hit came already
+      gas: gas margin at j / 10 tiles, 0 in the gas; bush: "be"; m: rows of an alive (not respawning) agent
+      cv, still (n, 9, 2): the fut baselines (metrics only): constant velocity from the seen velocity (moved on by the
+        frame's latency model.LAT, relative to me), and stays where seen; fut_p (n, 9): present enemy slots of rows with
+        a row 1 s later (metrics only: the share matched to a true enemy)"""
+    from model import AUX_SLOTS, LAT
+    pos = np.full(n, -1, np.int64); hit = np.zeros(n, np.float32); hit_m = np.zeros(n, np.float32)
+    for aid, r in traj.items():
+        r = np.asarray(r, np.int64); L = len(r); i = np.arange(L)
+        if L > FUT_K: pos[r[:-FUT_K]] = r[FUT_K:]
+        cs = np.concatenate([[0], np.cumsum(buf.te[r] > 0)]); hh = cs[np.minimum(i + 10, L)] > cs[i]
+        hit[r] = hh; hit_m[r] = hh | (i + 10 <= L) | (aid in final)
+    E_ = buf.ent[:n, :AUX_SLOTS].astype(np.float32); seen = E_[..., O.XY:O.XY + 2]; v = E_[..., O.VEL:O.VEL + 2]
+    lab = {"fut": np.zeros((n, AUX_SLOTS, 2), np.float32), "fut_m": np.zeros((n, AUX_SLOTS), np.float32), "hit": hit, "hit_m": hit_m,
+           "gas": np.maximum(buf.gm[:n], 0) / 10.0, "bush": buf.be[:n].astype(np.float32), "m": (~buf.dead[:n]).astype(np.float32),
+           "still": seen, "cv": seen + ((v - buf.s[:n, None, 6:8].astype(np.float32)) * LAT + v * 2 * FUT_K) / 10.0,   # 2 ticks per row
+           "fut_p": np.zeros((n, AUX_SLOTS), np.float32)}
+    j = np.flatnonzero(pos >= 0); J = len(j); k10 = pos[j]; ar = np.arange(J)
+    if J:
+        me = buf.me[j].astype(np.int64); tp = buf.tpos[j]; mine = tp[ar, me]
+        en = (E_[j, :, 0] > 0.5) & (E_[j, :, 1 + O.ENT.index("enemy")] > 0.5); lab["fut_p"][j] = en
+        d = np.linalg.norm(seen[j][:, :, None] * 10.0 - (tp - mine[:, None])[:, None], axis=-1)      # (J, 9, 10) tiles
+        d[~(en[:, :, None] & buf.talive[j][:, None])] = np.inf
+        q = np.full((J, AUX_SLOTS), -1, np.int64)
+        for _ in range(AUX_SLOTS):                       # greedy: the closest (slot, player) pair first
+            f = d.reshape(J, -1); a_ = f.argmin(1); ok = f[ar, a_] < FUT_GATE
+            if not ok.any(): break
+            jj = np.flatnonzero(ok); kk, qq = np.divmod(a_[jj], 10)
+            q[jj, kk] = qq; d[jj, kk, :] = np.inf; d[jj, :, qq] = np.inf
+        qc = np.maximum(q, 0)
+        lab["fut"][j] = np.clip((buf.tpos[k10][ar[:, None], qc] - mine[:, None]) / 10.0, -2.5, 2.5)
+        lab["fut_m"][j] = (q >= 0) & buf.talive[k10][ar[:, None], qc]
+    return lab
+
+
+def auc(score, y):
+    """ROC AUC (Mann-Whitney U, ties averaged); None without both classes"""
+    y = np.asarray(y) > 0.5; npos = int(y.sum()); nneg = len(y) - npos
+    if not npos or not nneg: return None
+    _, inv, cnt = np.unique(score, return_inverse=True, return_counts=True); rk = (np.cumsum(cnt) - (cnt - 1) / 2.0)[inv]
+    return float((rk[y].sum() - npos * (npos + 1) / 2.0) / (npos * nneg))
+
+
+def aux_targets(a, net, g, buf, traj, final, n, use_rows, xrow, T):
+    """--aux-w: labels (aux_labels, as tensors -> X["AUX"]) and the readouts of the pre-update predictions on the rows
+    trained on (row_pass) into xrow"""
+    from model import AUX_SLOTS
+    lab = aux_labels(buf, traj, final, n); K2 = AUX_SLOTS * 2
+    cat = lambda net_, xc, s, ent: (lambda o: torch.cat([o["fut"].flatten(1), o["hit"][:, None], o["gas"][:, None], o["bush"]], 1))(net_.aux_out(xc, ent, s))
+    P = row_pass(net, g, n, {"aux": cat})["aux"].float().cpu().numpy()[use_rows]; L = {k: v[use_rows] for k, v in lab.items()}
+    fut, hit, gas, bush = P[:, :K2].reshape(-1, AUX_SLOTS, 2), P[:, K2], P[:, K2 + 1], P[:, K2 + 2:]
+    m = L["m"] > 0; fm = (L["fut_m"] > 0) & m[:, None]; hm = (L["hit_m"] > 0) & m
+    err = lambda p: round(float(np.median(np.linalg.norm(p[fm] - L["fut"][fm], axis=-1))) * 10, 3) if fm.any() else None
+    r3 = lambda v: None if v is None else round(v, 4)
+    fp = (L["fut_p"] > 0) & m[:, None]
+    xrow.update(aux_fut_tiles=err(fut), aux_fut_cv_tiles=err(L["cv"]), aux_fut_still_tiles=err(L["still"]), aux_fut_n=int(fm.sum()),
+                aux_fut_match=round(float(fm.sum() / fp.sum()), 3) if fp.any() else None,
+                aux_hit_auc=r3(auc(hit[hm], L["hit"][hm])), aux_hit_rate=r3(float(L["hit"][hm].mean())) if hm.any() else None,
+                aux_gas_mae_tiles=round(float(np.abs(gas[m] - L["gas"][m]).mean()) * 10, 3) if m.any() else None,
+                aux_bush_auc=r3(auc(bush[m].ravel(), L["bush"][m].ravel())), aux_bush_rate=r3(float(L["bush"][m].mean())) if m.any() else None)
+    return {"AUX": {k: T(v) for k, v in lab.items() if k not in ("cv", "still", "fut_p")}, "s": g["s"], "ent": g["ent"]}
+
+
+@torch.no_grad()
+def aux_readout(net, s, ent, grid, h):
+    """the aux heads on one decision (replay frame "x"; device tensors with a batch of 1): per present enemy slot of the
+    enemy block [seen dx, dy, predicted dx, dy in 1 s] (10-tile units), p_hit, gas margin (tiles), P(hidden enemy in a
+    bush) per sector"""
+    from model import AUX_SLOTS
+    o = net.aux_out(net.row_feats(s, ent, grid, h), ent, s); e = ent[0, :AUX_SLOTS].float().cpu().numpy(); f = o["fut"][0].float().cpu().numpy()
+    on = (e[:, 0] > 0.5) & (e[:, 1 + O.ENT.index("enemy")] > 0.5)
+    return {"f": [[round(float(v), 3) for v in (*e[k, O.XY:O.XY + 2], *f[k])] for k in np.flatnonzero(on)],
+            "h": round(float(torch.sigmoid(o["hit"][0])), 3), "g": round(float(o["gas"][0]) * 10, 2),
+            "b": [round(float(v), 3) for v in torch.sigmoid(o["bush"][0])]}
+
+
 def head_loss(net, xc, rf, X, a):
     """loss of the heads that never act on a minibatch (xc = cat[x, h] of its rows, rf = their buffer rows) -> (loss,
     {stat: value}); 0 with the flags off. --vlive: 0.5 x 0.5 MSE to the live lambda-return (as the critic's)"""
     loss, st = 0.0, {}
     if a.vlive:
         lv = 0.5 * ((net.value_live(xc) - X["RETL"][rf]) ** 2).mean(); loss = loss + 0.5 * lv; st["vloss_live"] = lv.item()
+    if a.aux_w:                                          # --aux-w: x model.aux_losses (no detach: shapes the shared layers)
+        la, per = aux_losses(net.aux_out(xc, X["ent"][rf], X["s"][rf]), {k: v[rf] for k, v in X["AUX"].items()})
+        loss = loss + a.aux_w * la; st.update({"aux_loss_" + k: v.item() for k, v in per.items()})
     return loss, st
 
 
@@ -225,7 +337,44 @@ def eval_summary(rows):
             "hit_rate": round(sum(r["terms"]["hits"] for r in ok) / max(1.0, sum(r["terms"]["shots"] for r in ok)), 3) if ok else None}
 
 
+def _check():
+    """gae == the original inline loop; aux_labels on a synthetic trajectory (slot matching, 1 s label, masks, hit
+    window, baselines); auc"""
+    rng = np.random.default_rng(0); n = 60; buf = Buffer(n)
+    buf.rew[:n] = rng.normal(size=n); buf.val[:n] = rng.normal(size=n); buf.done[29] = True; buf.n = n
+    traj, pending, final = {1: list(range(30)), 2: list(range(30, 55))}, {2: 57}, {1}
+    adv, ret = gae(traj, pending, final, buf.rew[:n], buf.val[:n], 0.99, 0.9, buf.done[:n]); last = 0.0; nxt = float(buf.val[57])
+    for j in range(54, 29, -1):
+        last = buf.rew[j] + 0.99 * nxt - buf.val[j] + 0.99 * 0.9 * last; nxt = buf.val[j]; assert adv[j] == last and ret[j] == last + buf.val[j]
+    assert np.isclose(ret[29], buf.rew[29]) and adv[29] == buf.rew[29] - buf.val[29]     # done: no bootstrap
+    # trajectory 1 (rows 0-29): me (player 3) still at (10, 10) tiles; enemy 5 walks right 0.1 tiles / row (0.05 / tick),
+    # seen in slot 2 (slot 0: a teammate on the same spot, slot 1: a false enemy far from any player); enemy 7 dies at row 15
+    buf.me[:n] = 3; buf.tpos[:n] = 20.0; buf.tpos[:n, 3] = 10.0; buf.talive[:n, [5, 7]] = True; buf.talive[15:30, 7] = False
+    k = np.arange(30); buf.tpos[k, 5] = np.stack([12.0 + 0.1 * k, np.full(30, 10.0)], 1); buf.tpos[k, 7] = [10.0, 13.0]
+    en, mate = 1 + O.ENT.index("enemy"), 1 + O.ENT.index("teammate")
+    buf.ent[k, 2, 0] = 1; buf.ent[k, 2, en] = 1; buf.ent[k, 2, O.XY] = (2.0 + 0.1 * k + 0.05) / 10; buf.ent[k, 2, O.VEL] = 0.05   # seen 0.05 tiles off
+    buf.ent[k, 0, 0] = 1; buf.ent[k, 0, mate] = 1; buf.ent[k, 0, O.XY] = 0.2
+    buf.ent[k, 1, 0] = 1; buf.ent[k, 1, en] = 1; buf.ent[k, 1, O.XY + 1] = -0.6
+    buf.ent[k, 3, 0] = 1; buf.ent[k, 3, en] = 1; buf.ent[k, 3, O.XY + 1] = 0.3                                  # enemy 7, 3 tiles below
+    buf.te[[4, 12]] = 0.3; buf.dead[20] = True
+    lab = aux_labels(buf, traj, final, n)
+    assert lab["fut_m"][:20, 2].all() and not lab["fut_m"][20:, 2].any() and not lab["fut_m"][:, :2].any()   # 10 rows ahead in the trajectory
+    assert lab["fut_p"][:20, 1:4].all() and not lab["fut_p"][:, 0].any() and not lab["fut_p"][20:].any()   # slot 1: present, unmatched
+    assert np.allclose(lab["fut"][:20, 2], np.stack([(2.0 + 0.1 * (k[:20] + 10)) / 10, np.zeros(20)], 1), atol=1e-6)
+    assert lab["fut_m"][:5, 3].all() and not lab["fut_m"][5:, 3].any()   # enemy 7 dead at row 15 = 10 rows after row 5
+    from model import LAT
+    assert np.allclose(lab["cv"][:20, 2, 0], buf.ent[:20, 2, O.XY].astype(np.float32) + (0.05 * LAT + 0.05 * 20) / 10, atol=1e-3)
+    assert np.allclose(lab["still"][:, 2], buf.ent[:, 2, O.XY:O.XY + 2].astype(np.float32))
+    assert lab["hit"][:13].all() and not lab["hit"][13:30].any() and lab["hit_m"][:30].all()            # rows j .. j+9, ended trajectory
+    assert lab["hit"][30:].sum() == 0 and lab["hit_m"][30:46].all() and not lab["hit_m"][46:55].any()    # not ended: last 9 unknown
+    assert lab["m"][20] == 0 and lab["m"][19] == 1 and np.allclose(lab["gas"], 0)
+    assert auc([0.1, 0.2, 0.8, 0.9], [0, 0, 1, 1]) == 1.0 and auc([0.5] * 4, [0, 1, 0, 1]) == 0.5 and auc([1, 2], [1, 1]) is None
+    assert abs(auc([0.9, 0.2, 0.8, 0.1], [0, 0, 1, 1]) - 0.25) < 1e-9                      # 1 of 4 pairs ordered
+    print("train_ppo helpers ok")
+
+
 def main():
+    if "--check" in sys.argv: return _check()
     ap = argparse.ArgumentParser()
     ap.add_argument("--run", required=True); ap.add_argument("--hours", type=float, default=3.0); ap.add_argument("--n", type=int, default=12)
     ap.add_argument("--rollout", type=int, default=32768); ap.add_argument("--epochs", type=int, default=3)
@@ -355,6 +504,7 @@ def main():
                     if buf.bc[j] and terms.get("_act") is not None: buf.act[j] = terms["_act"]
                     elif buf.bc[j]: continue                 # a BC row without a label (recording went off): not trained on
                     traj.setdefault(aid, []).append(j)
+                    buf.te[j] = terms.get("te", 0.0)
                     if done: final.add(aid)
                 for aid in env.dropped: pending.pop(aid, None); hid.pop(aid, None)
                 env.dropped = []
@@ -381,10 +531,12 @@ def main():
                 m = ~isev & ~opp & ((kind == "bc") == bc())   # BC battles still running after the switch are not collected
                 if m.any():
                     rows = buf.add(s=s[m], ent=o["ent"][m], grid=o["grid"][m], h=h[m], priv=pv[m], act=A[m], logp=lp[m],
-                                   val=v[m], bc=kind[m] == "bc", dead=env.dead(ids[m]))
+                                   val=v[m], bc=kind[m] == "bc", dead=env.dead(ids[m]), **(E.aux_split(env.aux_now(ids[m])) if a.aux_w else {}))
                     for aid, j in zip(ids[m], rows): pending[int(aid)] = int(j)
                     agent_steps += int(m.sum()); dec_n += int(m.sum())
-                rec.frame(env, ids, o, A, upd)
+                b = rec.row(env, ids) if a.aux_w else None   # the aux heads' readout for the replay
+                xr = aux_readout(net, T(s[b:b + 1]), T(o["ent"][b:b + 1]), T(o["grid"][b:b + 1], torch.uint8), T(h[b:b + 1])) if b is not None else None
+                rec.frame(env, ids, o, A, upd, x=xr)
                 env.send(ids, A)
                 for r in env.episodes[n_ep:]:
                     tg = r["tag"]                            # PFSP score: only battles whose snapshot stayed loaded to the end
@@ -410,6 +562,7 @@ def main():
             rows = C[C >= 0].cpu().numpy(); X = {}; xrow = {}; tx = time.time()
             if a.vlive:
                 _, retl, xrow["expl_var_live"] = live_targets(a, net, g, buf, traj, pending, final, n, rows); X["RETL"] = T(retl)
+            if a.aux_w: X.update(aux_targets(a, net, g, buf, traj, final, n, rows, xrow, T))
             if X: xrow["extra_s"] = round(time.time() - tx, 2)
             pu = upd - a.bc_updates
             beta = 0.0 if ref is None else max(a.kl_floor, a.kl_beta * (1 - pu / max(1, a.kl_updates)))

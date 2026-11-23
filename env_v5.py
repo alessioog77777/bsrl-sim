@@ -9,6 +9,9 @@ solo: the sim has 10 players, the real mode 12) teams, and `agents` policy-contr
 The battle is still Solo Showdown underneath (teams only change who can hurt whom), so MAEnv's rank / place reward is
 per player; `Env` holds a grouped agent's final transition until its team's rank is known and swaps in the team's
 place / win (`team_ranks`). Solo players: unchanged.
+Aux-head labels (trainer --aux-w, model.Policy.aux), from the sim's true state: `Env.aux_now(ids)` at poll time (AUX
+row: true positions, alive enemies, own index, gas margin, hidden enemies in bushes by sector), and the enemy damage
+taken per step `te` in every transition's terms.
 """
 import argparse, json, os, re, sys, time
 import numpy as np
@@ -147,7 +150,7 @@ def gas_margin(x, y, ring, W, H):
     (env.c in_gas_tile: a tile is gas iff min(tx, ty, W-1-tx, H-1-ty) < ring), ring = the latched storm step
     (NbeResp.reserved[0], 1 tile per step)"""
     tx, ty = np.clip(np.asarray(x) // 300, 0, W - 1), np.clip(np.asarray(y) // 300, 0, H - 1)
-    return np.minimum(np.minimum(tx, ty), np.minimum(W - 1 - tx, H - 1 - ty)) - ring, (min(W, H) - 1) / 2.0 - ring
+    return np.minimum(np.minimum(tx, ty), np.minimum(W - 1 - tx, H - 1 - ty)) - ring, (np.minimum(W, H) - 1) / 2.0 - ring
 
 
 def slider_terms(sl, pl, n=10, ring=0):
@@ -226,6 +229,20 @@ def slider_terms(sl, pl, n=10, ring=0):
     sl["hid"], sl["hp"], sl["low"] = hid, np.where(alive, hp, np.nan), low & (hp < 0.8 * mhp)
     sl["held"], sl["was"] = held, alive
     return T
+
+
+# Env.aux_now row layout (float32): name -> (offset, shape). tpos = the 10 players' true positions (tiles), talive = an
+# alive, not respawning enemy of mine, me = own player index, gm = gas margin (tiles, < 0 in the gas), be = per 45-degree
+# sector (0 = right, clockwise as the y-down screen; centred on k x 45 degrees) an enemy hidden from me (fair rule) in a
+# bush within 5 tiles (1500 units: the design's "hidden enemy near me", beyond the 900-unit bush reveal)
+AUX = {"tpos": (0, (10, 2)), "talive": (20, (10,)), "me": (30, ()), "gm": (31, ()), "be": (32, (8,))}
+AUX_W = 40
+BUSH_NEAR = 1500.0
+
+
+def aux_split(A):
+    """(B, AUX_W) aux_now rows -> {name: (B, ...) array} (AUX layout)"""
+    return {k: A[:, o:o + int(np.prod(sh, dtype=int))].reshape((len(A),) + sh) for k, (o, sh) in AUX.items()}
 
 
 def player_ranks(r):
@@ -343,6 +360,7 @@ class Env(MAEnv):
         for p, aid in agents.items(): (self.dead_aids.add if p in wait else self.dead_aids.discard)(aid)
         s.wprev = wait
         shaped = {}; s.hud = self._hud(s, r)             # cond's HUD numbers for the next poll (a reset sets them anew)
+        te = [max(r.pl[p].damage_taken - r.pl[p].gas_damage, 0) / 1000.0 for p in range(10)]   # enemy damage taken (aux hit label)
         if self.cube_k:                                  # B3, from r before super() may reset the instance
             for p in list(s.ep):
                 pl = r.pl[p]; after = 0 if (pl.eliminated or not pl.alive) and p not in wait else int(pl.cubes_total)
@@ -353,7 +371,7 @@ class Env(MAEnv):
             if p in back - elim: rew -= self.w.get("hp", 0) * t["hp"]; t = {**t, "hp": 0.0}   # respawn refill is no hp gain
             if p in shaped: rew += shaped[p] - self.w.get("cubes", 0) * t["cubes"]; t = {**t, "cube_shaped": shaped[p]}
             if fin: self.dead_aids.discard(aid)
-            self._trans[k] = (aid, rew + float(extra[p]), fin, {**t, **{"s_" + m: float(v) for m, v in zip(SL, T[p])}, "_act": lab.get(p), "dead": float(p in wait)}, rank)
+            self._trans[k] = (aid, rew + float(extra[p]), fin, {**t, **{"s_" + m: float(v) for m, v in zip(SL, T[p])}, "_act": lab.get(p), "dead": float(p in wait), "te": te[p]}, rank)
         if g.any():                                      # duo / trio: placement = the team's (Solo Showdown underneath)
             for k in range(len(self._trans) - 1, n0 - 1, -1):
                 p = self._trans[k][0] & 15
@@ -369,6 +387,35 @@ class Env(MAEnv):
             row["terms"].update({"sn_" + m: round(float(v), 4) for m, v in zip(SL, sl["sumw"][p])})
             row["terms"].update({"sa_" + m: round(float(v), 4) for m, v in zip(SL, sl["asum"][p])})
             row["beh"] = {k: round(float(v), 3) for k, v in zip(BEH, sl["beh"][p])}
+
+    def aux_now(self, ids):
+        """(B, AUX_W) aux-head labels of the agents of the last poll() from the true state of their battle's current
+        response (as train_ppo.priv): AUX layout. The fair visibility rule as nbpc.fair / slider_terms: camera x clamped
+        to [3000, W x 300 - 3000], in view iff |dx| < 4500 and -3500 < dy < 2900, a brawler on a bush tile hidden beyond
+        900 units; bushes = the live slider mask sl["bush"]."""
+        ids = np.asarray(ids, np.int64); B = len(ids); out = np.zeros((B, AUX_W), np.float32)
+        if not B: return out
+        by = {s.battle: s for s in self.I}; ub, inv = np.unique(ids >> 4, return_inverse=True)
+        tab = np.zeros((len(ub), 5, 10)); geo = np.zeros((len(ub), 3))
+        for u, k in enumerate(ub):
+            s = by[int(k)]; r = s.inst.resp; pl = r.pl; H, W = s.sl["bush"].shape
+            x = np.array([pl[q].x for q in range(10)], np.float64); y = np.array([pl[q].y for q in range(10)], np.float64)
+            tx, ty = np.clip(x // 300, 0, W - 1).astype(int), np.clip(y // 300, 0, H - 1).astype(int)
+            tab[u] = [x, y, [bool(pl[q].alive) and not pl[q].eliminated and pl[q].reserved[3] <= 0 for q in range(10)],
+                      [pl[q].reserved[2] for q in range(10)], s.sl["bush"][ty, tx]]
+            geo[u] = int(r.reserved[0]), W, H
+        x, y, al, team, inb = tab[inv].transpose(1, 0, 2); ring, W, H = geo[inv].T; me = ids & 15; ar = np.arange(B)
+        mx, my = x[ar, me], y[ar, me]; dx, dy = x - mx[:, None], y - my[:, None]; d = np.hypot(dx, dy)
+        en = (al > 0.5) & (team != team[ar, me][:, None])
+        camx = np.clip(mx, 3000.0, W * 300 - 3000.0)
+        sees = (np.abs(x - camx[:, None]) < 4500) & (dy > -3500) & (dy < 2900) & ~((inb > 0.5) & (d > 900))
+        hb = en & (inb > 0.5) & ~sees & (d <= BUSH_NEAR)
+        sec = (np.floor((np.degrees(np.arctan2(dy, dx)) + 22.5) % 360.0 / 45.0)).astype(int) % 8
+        col = lambda k: AUX[k][0]
+        out[:, :20] = (np.stack([x, y], -1) / 300.0).reshape(B, 20); out[:, col("talive"):col("talive") + 10] = en
+        out[:, col("me")] = me; out[:, col("gm")] = gas_margin(mx, my, ring, W, H)[0]
+        for k in range(8): out[:, col("be") + k] = (hb & (sec == k)).any(1)
+        return out
 
     def cmd_vel(self, ids):
         """(B, 2) tiles / tick: the agents' last commanded move x their brawler speed (sim_plan A2; what the agent uses live
@@ -517,7 +564,33 @@ def _check():
     f, m = norm_from([nr(3, 0.01, 0.4), nr(3, -0.01, 0.6), nr(1, 0.0, 0.0)])   # band / clump cancel in the sum, not in |term|
     assert np.isclose(m["leash"], 0.5) and np.isclose(f["leash"], 1.0) and np.isclose(f["kite"], 0.5)   # leash: team rows only
     assert np.isclose(norm_from([nr(3, 0.2, None)])[1]["leash"], 0.2)   # rows without sa_: |s_|
+    def fake4(self, i, r):                               # p0 takes 800 damage, 300 of it from the gas
+        self._trans.append((16, 0.0, False, {"hp": 0.0, "place": 0.0, "win": 0.0}, None))
+    env.I = [NS(sl=fresh(), cfg={"tag": {"groups": [0] * 10}}, hold={}, battle=1, pos={}, ptick=0, pjump=set(), agents={0: 16}, wprev=set())]
+    sup, MAEnv._finish_step = MAEnv._finish_step, fake4
+    try: env._finish_step(0, mk([], 0, p0_damage_taken=800, p0_gas_damage=300))
+    finally: MAEnv._finish_step = sup
+    assert np.isclose(env._trans[-1][3]["te"], 0.5), env._trans[-1][3]          # aux hit label: enemy damage only
+    _check_aux(players, tiles, bush, NS)
     print("env_v5 sliders ok")
+
+
+def _check_aux(players, tiles, bush, NS):
+    """Env.aux_now on a synthetic battle: positions, alive enemies (no mate, no respawning player), gas margin, hidden
+    enemies in bushes by sector (900 < d <= 1500 units, a mate / a respawning enemy / one too far do not count)"""
+    tl = tiles.copy()
+    for ty, tx in ((18, 15), (14, 19), (14, 21), (14, 12), (12, 13)): tl[ty, tx] = bush
+    pl = players(p0_x=4650, p0_y=4350, p1_x=4650, p1_y=5400, p2_x=5700, p2_y=4350, p3_x=6450, p3_y=4350, p4_x=3600, p4_y=4350,
+                 p6_x=3900, p6_y=3600)
+    pl[2].reserved = [0, 0, 0, 0]; pl[4].reserved = [0, 0, 4, 50]   # p2: p0's mate; p4: respawning
+    env = Env.__new__(Env)
+    env.I = [NS(battle=1, inst=NS(resp=NS(pl=pl, reserved=[3, 0, 0, 0])), sl=slider_state(tl.ravel(), 60, 40, [], np.random.default_rng(0)))]
+    A = aux_split(env.aux_now([16, 17, 18]))
+    assert np.allclose(A["tpos"][0, 0], [15.5, 14.5]) and np.allclose(A["tpos"][1], A["tpos"][0]) and list(A["me"]) == [0, 1, 2]
+    assert A["talive"][0].tolist() == [0, 1, 0, 1, 0, 1, 1, 1, 1, 1] and A["talive"][1, 0] == 1 and A["talive"][2, 0] == 0
+    assert A["gm"][0] == 14 - 3, A["gm"]                    # tile (15, 14) on a 60 x 40 map, storm ring 3
+    assert np.flatnonzero(A["be"][0]).tolist() == [2, 5], A["be"][0]   # p1 below (90 deg), p6 up-left (225 deg)
+    assert np.flatnonzero(A["be"][2]).tolist() == [3] and env.aux_now([]).shape == (0, AUX_W)   # p2: p1 down-left 1485 away; p3 750 away = seen
 
 
 TEAM_SLIDERS = ("protect", "leash")   # fire only with a mate: normalised over team battles

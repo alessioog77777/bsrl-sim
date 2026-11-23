@@ -16,7 +16,9 @@ What changes (HISTORY 69):
   weights, so the PPO ratio covers it). Evals and checkpoints are only started between updates in this mode.
 Statistically the same algorithm, not bit-identical: every worker has its own battle / noise RNG streams, the rows
 of one forward come from whichever instances were ready, and actions are sampled by Gumbel-max (fast_act.sample).
-Non-acting heads (--vlive): as train_ppo (its helpers: targets / readouts in prepare(), losses in train()).
+Non-acting heads (--vlive, --aux-w): as train_ppo (its helpers: targets / readouts in prepare(), losses in train()); the
+aux labels (env_v5.Env.aux_now) are computed in the workers next to priv and reach the main process in a second shared
+memory block; the replay readout (train_ppo.aux_readout of the recorded row) goes back with the actions.
 progress.jsonl: all train_ppo fields; t_poll_build_act_rest = [main waiting for workers, build per worker (mean),
 act, rest] (workers run in parallel, so they no longer add up to the collect time) + "t_fast" (more timers) and
 "wall_dps" (learner decisions per wall second incl. the update).
@@ -80,7 +82,7 @@ def parse(argv=None):
 
 
 # ------------------------------------------------------------------------------------------------ worker process
-def worker(w, lo, hi, a, loc, out, conn, shm, init):
+def worker(w, lo, hi, a, loc, out, conn, shm, init, ashm=None):
     """instances lo..hi-1 of the run (local index i = global lo + i). Loop: poll -> build -> rows into shm -> message ->
     wait for actions (+ control state) -> send. Never touches torch / CUDA."""
     signal.signal(signal.SIGTERM, signal.SIG_IGN); signal.signal(signal.SIGINT, signal.SIG_IGN)   # the main process stops us
@@ -156,6 +158,7 @@ def worker(w, lo, hi, a, loc, out, conn, shm, init):
         ob = FO.FastObsV5(noise=O.NOISE if a.noise else None, seed=a.seed + 1000 * w)
         rec = Recorder(out) if lo == 0 else None
         X = np.frombuffer(shm, np.float32).reshape(-1, OBS_W); n_ep = 0; tw = np.zeros(4)   # poll / build / wait for main / messages
+        XA = np.frombuffer(ashm, np.float32).reshape(-1, E.AUX_W) if a.aux_w else None     # --aux-w: aux label rows
         while True:
             t0 = time.perf_counter()
             obs, ids, tr = env.poll(min_ready=min(a.min_ready or (hi - lo), hi - lo), max_wait=a.max_wait)
@@ -169,6 +172,7 @@ def worker(w, lo, hi, a, loc, out, conn, shm, init):
                 sl = np.array([t.get("slot", 0) for t in env.last_tags])
                 grp = np.where(~isev & ~opp, 0, np.where(isev & ~opp, 1, np.where(isev & opp, 2, 3 + sl)))   # learner / eval copy / base / league slot
                 msg.update(ids=ids, grp=grp.astype(np.int8), isbc=np.array([k == "bc" for k in kind]), dead=env.dead(ids))
+                if XA is not None: XA[:B] = env.aux_now(ids); msg["rec"] = rec.row(env, ids) if rec is not None else None
             tw[0] += t1 - t0; tw[1] += time.perf_counter() - t1
             msg["tr"] = [(aid, rew, done, t.get("_act"), {k: t[k] for k in TR_X if k in t}) for (aid, rew, done, t, rank) in tr]
             msg["dropped"] = env.dropped; env.dropped = []
@@ -178,12 +182,12 @@ def worker(w, lo, hi, a, loc, out, conn, shm, init):
             if len(env.episodes) > 4096: del env.episodes[:2048]; n_ep = len(env.episodes)   # sent already; the main keeps them
             t2 = time.perf_counter(); conn.send(msg); rep = conn.recv(); tw[2] += time.perf_counter() - t2; tw[3] += 1
             if rep is None: break
-            A, ctl = rep
+            A, ctl, xr = rep
             if ctl:
                 evq.extend(ctl.pop("eval", [])); st.update(ctl)
                 env.record = st["record"]
                 if rec is not None and st.pop("rec_want", False): rec.want = True
-            if rec is not None and B: rec.frame(env, ids, o, A, st["upd"])
+            if rec is not None and B: rec.frame(env, ids, o, A, st["upd"], x=xr)
             env.send(ids if B else [], A if B else [])   # also steps ready instances whose agents had no observation
         env.close()
     except EOFError:
@@ -219,6 +223,7 @@ def main(argv=None):
     from nbpc.maenv import REWARD_W, TERMS
     import env_v5 as E, obs_v5 as O
     from train_ppo import Buffer, chunks, eval_summary, eval_items, eval_presets, split_params, gae, expl_var, live_targets, head_loss
+    from train_ppo import aux_targets, aux_readout
     from fast_act import StackedActor, OBS_W, _OFF
     NS = O.N_SELF + O.N_COND
     out = os.path.join(E.WORK, "runs", a.run); os.makedirs(out, exist_ok=True)
@@ -239,13 +244,15 @@ def main(argv=None):
     lname = [os.path.basename(p) if p else None for p in lpath]
     bc = lambda: upd < a.bc_updates
     NWk = a.workers; cut = np.linspace(0, a.n, NWk + 1).round().astype(int)
-    ctx = mp.get_context("fork"); procs, conns, shms = [], [], []
+    ctx = mp.get_context("fork"); procs, conns, shms, ashms = [], [], [], []
     init = {"bc": bc(), "lname": list(lname), "upd": upd, "record": a.bc_updates > 0, "ver": 0}
     for w in range(NWk):
         shm = mmap.mmap(-1, max(1, (cut[w + 1] - cut[w]) * 10) * OBS_W * 4)     # anonymous shared: up to 10 agents per instance
+        ashm = mmap.mmap(-1, max(1, (cut[w + 1] - cut[w]) * 10) * E.AUX_W * 4) if a.aux_w else None   # aux labels, same rows
         pc, cc = ctx.Pipe()
-        p = ctx.Process(target=worker, args=(w, int(cut[w]), int(cut[w + 1]), a, loc, out, cc, shm, init), daemon=True)
+        p = ctx.Process(target=worker, args=(w, int(cut[w]), int(cut[w + 1]), a, loc, out, cc, shm, init, ashm), daemon=True)
         p.start(); cc.close(); procs.append(p); conns.append(pc); shms.append(np.frombuffer(shm, np.float32).reshape(-1, OBS_W))
+        ashms.append(np.frombuffer(ashm, np.float32).reshape(-1, E.AUX_W) if ashm is not None else None)
     # ---- GPU side (after the fork)
     from model import Policy, HID, masked_kl, dist_logp_ent
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")   # CPU: plumbing checks (--smoke) only
@@ -329,6 +336,7 @@ def main(argv=None):
         X = {}; xrow = {}; tx = time.time()                # the heads that never act: targets, readouts (train_ppo helpers)
         if a.vlive:
             _, retl, xrow["expl_var_live"] = live_targets(a, net, g, buf, traj, pending, final, n, rows); X["RETL"] = T(retl)
+        if a.aux_w: X.update(aux_targets(a, net, g, buf, traj, final, n, rows, xrow, T))
         if X: xrow["extra_s"] = round(time.time() - tx, 2)
         return {"is_bc": is_bc, "C": C, "nrow": nrow, "g": g, "ADV": T(adv), "RET": T(ret), "LIVE": T(~buf.dead[:n], torch.float32),
                 "expl": expl, "acts": acts, "beta": beta, "X": X, "xrow": xrow}
@@ -453,13 +461,15 @@ def main(argv=None):
                         if buf.bc[j] and lab is not None: buf.act[j] = lab
                         elif buf.bc[j]: continue                 # a BC row without a label (recording went off): not trained on
                         traj.setdefault(aid, []).append(j)
+                        buf.te[j] = tx_.get("te", 0.0)
                         if done: final.add(aid)
                     for aid in m_["dropped"]: pending.pop(aid, None); hid.pop(aid, None)
-                live = [(w, m_) for w, m_ in msgs if m_["B"]]; acts_by = {}
+                live = [(w, m_) for w, m_ in msgs if m_["B"]]; acts_by = {}; xr_by = {}
                 if live:
                     ids = np.concatenate([m_["ids"] for _, m_ in live]); grp = np.concatenate([m_["grp"] for _, m_ in live]).astype(np.int64)
                     isbc = np.concatenate([m_["isbc"] for _, m_ in live]); dead = np.concatenate([m_["dead"] for _, m_ in live])
                     X = np.concatenate([shms[w][:m_["B"]] for w, m_ in live]); B = len(ids)
+                    XA = np.concatenate([ashms[w][:m_["B"]] for w, m_ in live]) if a.aux_w else None
                     h = np.stack([hid.get(int(x), z) for x in ids])
                     tq = time.perf_counter()
                     A, lp, v, h2 = actor.act_block([anet, enet, bnet] + lnets, grp, X, h)
@@ -469,16 +479,23 @@ def main(argv=None):
                     if m.any():
                         Xm = X[m]
                         rows = buf.add(s=Xm[:, :NS], ent=Xm[:, _OFF[1]:_OFF[2]].reshape(-1, O.N_ENT, O.F_ENT), grid=Xm[:, _OFF[2]:_OFF[3]].reshape(-1, O.G, O.G),
-                                       h=h[m], priv=Xm[:, _OFF[3]:_OFF[4]], act=A[m], logp=lp[m], val=v[m], bc=isbc[m], dead=dead[m])
+                                       h=h[m], priv=Xm[:, _OFF[3]:_OFF[4]], act=A[m], logp=lp[m], val=v[m], bc=isbc[m], dead=dead[m],
+                                       **(E.aux_split(XA[m]) if XA is not None else {}))
                         for aid, j in zip(ids[m], rows): pending[int(aid)] = int(j)
                         agent_steps += int(m.sum()); dec_n += int(m.sum())
                     off = 0
-                    for w, m_ in live: acts_by[w] = A[off:off + m_["B"]]; off += m_["B"]
+                    for w, m_ in live:
+                        acts_by[w] = A[off:off + m_["B"]]
+                        if m_.get("rec") is not None:            # --aux-w: the aux heads' readout of the row the worker records
+                            q = off + m_["rec"]; xq = X[q:q + 1]
+                            xr_by[w] = aux_readout(anet, T(xq[:, :NS]), T(xq[:, _OFF[1]:_OFF[2]].reshape(1, O.N_ENT, O.F_ENT)),
+                                                   T(xq[:, _OFF[2]:_OFF[3]].reshape(1, O.G, O.G), torch.uint8), T(h[q:q + 1]))
+                        off += m_["B"]
                 for w, m_ in msgs:
                     c_ = None
                     if sent[w] != ctl["ver"]:
                         c_ = {k: v_ for k, v_ in ctl.items()}; c_.update(extra[w]); extra[w] = {}; sent[w] = ctl["ver"]
-                    conns[w].send((acts_by.get(w), c_)); waiting.discard(w)
+                    conns[w].send((acts_by.get(w), c_, xr_by.get(w))); waiting.discard(w)
                 for w, m_ in msgs: episodes.extend(m_["eps"])
                 for r in episodes[n_ep:]:
                     tg = r["tag"]                            # PFSP score: only battles whose snapshot stayed loaded to the end

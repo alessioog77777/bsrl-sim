@@ -114,6 +114,10 @@ function draw(){
   chart('opt','c_ev','Explained variance','1 = the critic predicts returns perfectly · live = the value head without priv (--vlive)',[S('expl_var','critic (with priv)',0),S('expl_var_live','live value (no priv)',1)],o);
   chart('opt','c_kl','KL to the BC policy and clip fraction','PPO only',[S('kl_bc','KL(BC ‖ policy)',0),S('clipfrac','clip fraction',1)],{...o,zero:1});
   chart('opt','c_dps','Throughput','decisions per second while collecting',[S('decisions_per_s','decisions / s',0)],{...o,zero:1});
+  if(P.some(r=>r.aux_bush_auc!=null||r.aux_fut_tiles!=null)){   // --aux-w: readouts of the aux heads (pre-update predictions)
+    chart('opt','c_auxf','Aux: enemy position in 1 s','median error in tiles · the head must beat constant velocity',[S('aux_fut_tiles','aux head',0),S('aux_fut_cv_tiles','constant velocity',1),S('aux_fut_still_tiles','stays where seen',2)],{...o,zero:1});
+    chart('opt','c_auxa','Aux: hit next 1 s / hidden bush enemy','ROC AUC · 0.5 = chance',[S('aux_hit_auc','hit',0),S('aux_bush_auc','bush sectors',1)],{...o,ref:0.5,refLabel:'chance'});
+    chart('opt','c_auxg','Aux: gas margin','mean absolute error, tiles',[S('aux_gas_mae_tiles','gas',0)],{...o,zero:1})}
   const cols=['update','minutes','episodes','rank','ci95','win','top3','dealt','taken','kills','cubes','hit_rate','ticks'];
   $('evt').innerHTML='<tr>'+cols.map(c=>`<th>${c}</th>`).join('')+'</tr>'+EV.slice().reverse().map(r=>'<tr>'+cols.map(c=>`<td>${fmt(r[c])}</td>`).join('')+'</tr>').join('')}
 
@@ -148,9 +152,18 @@ function frame(){if(!RP)return;const F=RP.frames[fi],cv=$('map'),g=cv.getContext
   for(const e of F.e){const n=RP.ent[e[0]],ex=mx+e[1]*10*t,ey=my+e[2]*10*t,r=/projectile/.test(n)?3:/box|cube/.test(n)?5:6;h.fillStyle=css(ECOL[n]);
     if(/box|cube|area/.test(n))h.fillRect(ex-r,ey-r,2*r,2*r);else{h.beginPath();h.arc(ex,ey,r,0,7);h.fill()}h.lineWidth=1.5;h.strokeStyle=css('--surf');h.strokeRect(ex-r,ey-r,2*r,2*r)}
   h.beginPath();h.arc(mx,my,6,0,7);h.fillStyle=css('--c1');h.fill();
+  let ax='';if(F.x){const P_=F.x,G=RP.groups,c7=css('--c7'),c8=css('--c8');   // --aux-w readout: predicted (filled / rings) vs truth (outlines / crosses)
+    for(let k=0;k<8;k++){const a0=(k*45-22.5)*Math.PI/180;h.beginPath();h.moveTo(mx,my);h.arc(mx,my,5*t,a0,a0+Math.PI/4);h.closePath();
+      h.globalAlpha=Math.min(.6,P_.b[k]);h.fillStyle=c7;h.fill();h.globalAlpha=1;if(F.xt&&F.xt.b[k]){h.lineWidth=2;h.strokeStyle=c7;h.stroke()}}
+    h.strokeStyle=c8;h.lineWidth=1.5;
+    for(const f of P_.f){const sx=mx+f[0]*10*t,sy=my+f[1]*10*t,px=mx+f[2]*10*t,py=my+f[3]*10*t;h.beginPath();h.moveTo(sx,sy);h.lineTo(px,py);h.stroke();h.beginPath();h.arc(px,py,5,0,7);h.stroke()}
+    const F2=RP.frames[fi+10];if(F2&&F2.f==F.f)F2.p.forEach((p,q)=>{if(q==F.f||!p[4]||(G&&G[q]&&G[q]==G[F.f]))return;const qx=mx+(p[0]-me[0])/300*t,qy=my+(p[1]-me[1])/300*t;
+      h.beginPath();h.moveTo(qx-4,qy-4);h.lineTo(qx+4,qy+4);h.moveTo(qx+4,qy-4);h.lineTo(qx-4,qy+4);h.stroke()});
+    const hit=RP.frames.slice(fi+1,fi+11).some(x=>x.xt&&x.xt.h);
+    ax=`<br>aux: P(hit in 1 s) ${(100*P_.h).toFixed(0)} % (${hit?'hit':'no hit'}) · gas margin ${P_.g} tiles (true ${F.xt?F.xt.g:'–'}) · rings = enemies in 1 s, crosses = truth · wedges = hidden bush enemy (outline = true)`}
   if(a[1]>0){const q=a[2]*Math.PI/180;h.strokeStyle=css(a[1]==2?'--c4':'--c8');h.lineWidth=2;h.beginPath();h.moveTo(mx,my);h.lineTo(mx+9*t*Math.cos(q),my+9*t*Math.sin(q));h.stroke()}
   const alive=F.p.filter(p=>p[4]).length;$('scrub').value=fi;$('finfo').textContent=`step ${fi+1}/${RP.frames.length} · tick ${F.t} · ${alive} alive`;
-  $('act').innerHTML=`focus = player ${F.f} · HP ${(100*F.s[0]).toFixed(0)} % · ammo ${(3*F.s[1]).toFixed(1)} · super ${F.s[2]?'ready':'–'} · sees ${F.e.length} entities<br>action: move ${a[0]?(a[0]-1)*22.5+'°':'stop'} · ${['no fire','ATTACK at '+a[2]+'°','SUPER at '+a[2]+'°'][a[1]]}`}
+  $('act').innerHTML=`focus = player ${F.f} · HP ${(100*F.s[0]).toFixed(0)} % · ammo ${(3*F.s[1]).toFixed(1)} · super ${F.s[2]?'ready':'–'} · sees ${F.e.length} entities<br>action: move ${a[0]?(a[0]-1)*22.5+'°':'stop'} · ${['no fire','ATTACK at '+a[2]+'°','SUPER at '+a[2]+'°'][a[1]]}${ax}`}
 $('play').onclick=()=>{playing=!playing;$('play').textContent=playing?'Pause':'Play'};
 $('scrub').oninput=e=>{fi=+e.target.value;playing=false;$('play').textContent='Play';frame()};
 $('rsel').onchange=e=>{follow=idx.length&&e.target.value==idx[idx.length-1].file;loadRp(e.target.value)};
