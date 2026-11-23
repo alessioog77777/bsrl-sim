@@ -93,5 +93,6 @@ it (see Credits).
 
 Built on [nirkt](https://github.com/nirkt)'s work: the battle host
 ([bulletlabels](https://github.com/nirkt/bulletlabels) @ `52184b2`) and the environment
-([nbrl-env](https://github.com/nirkt/nbrl-env) @ `7ff57bc`) in `deps/` are nirkt's code, under nirkt's terms, with
-this project's changes from `host/*.patch` applied.
+([nbrl-env](https://github.com/nirkt/nbrl-env) @ `7ff57bc`) in `deps/` are nirkt's code, redistributed here with
+nirkt's permission and under nirkt's terms (not this project's licence), with this project's changes from `host/*.patch`
+applied.
