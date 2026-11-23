@@ -34,9 +34,9 @@ everything. Game files are not included: you supply them.
 ## Vision models
 
 The detector and segmentation models this observation is built around are in
-**[showdown-vision-v6](https://github.com/mlgdoggynoob/showdown-vision-v6)**: model files (ONNX and PyTorch) on its
-[v6 release](https://github.com/mlgdoggynoob/showdown-vision-v6/releases/tag/v6), the exact pre / post-processing,
-class lists, val numbers and the validation set.
+**[showdown-vision](https://github.com/mlgdoggynoob/showdown-vision)**. Each model version is a release there with its
+model files (ONNX and PyTorch), class lists, val numbers and validation set; the README gives the exact
+pre / post-processing.
 
 ## Requirements
 
