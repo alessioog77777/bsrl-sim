@@ -1,6 +1,6 @@
 """Policy for the ObsV5 observation: entity set + seg-class grid + self / conditioning vector -> GRU -> heads.
 
-    net = Policy(); logits, v, h = net(s, ent, grid, h)      # one decision; s = cat[self (8), cond (30)], h (B, HID)
+    net = Policy(); logits, v, h = net(s, ent, grid, h)      # one decision; s = cat[self (8), cond (30), intent (11)], h (B, HID)
     logits, v = net.seq(s, ent, grid, h0)                     # (N, L, ...) chunks from stored h0 -> flat (N * L) outputs
     logits = move 17 | fire 3 (none / attack / super) | aim 360 (pointer over visible enemies / boxes + free) | distance 8
 
@@ -16,6 +16,9 @@ Obs v5.3 (obs_v5.OBS_VERSION): 4 area-effect columns at the end of the observati
 load_state_dict zero-pads v5.2 checkpoints there (same outputs).
 Obs v5.4: cond grew by 2 sliders (leash, gas_safe) at its end = the end of `s`; the generic pad zero-fills those
 `vec.0` input columns of a v5.3 checkpoint (same outputs; slot 7 push -> aggressive keeps its column).
+Obs v5.5: the intent block (obs_v5.N_INT, intent.py) at the end of `s`; its `vec.0` input columns start at zero (a fresh
+Policy draws the same weights as before plus zero columns) and the generic pad zero-fills them for a v5.4 checkpoint,
+which then acts the same whatever the block holds (free play = an all-zero block = the old input exactly).
 Heads the actor never runs (NONACT; fast_act / act_stacked skip them, old checkpoints load with strict=False and get
 fresh ones; built on their own RNG stream, so Policy() under a given seed has the acting weights it had without them):
 * live value `vl` (trainer --vlive): MLP on the detached cat[x, h], no priv, so it works live (priv does not exist
@@ -55,7 +58,7 @@ def lead(ent, s):
     meets it, and the flight time / 2 s. 0 for other rows, melee and targets faster than the shot. The frame is LAT ticks
     old when the shot leaves (obs latency 1-2 decisions, sim and live), so the foe is first moved on by its velocity
     relative to ours (s3 aimed behind movers: scorecard lead slope -0.41, HISTORY 82).
-    ent (..., N_ENT, F_ENT): dx, dy in 10-tile units, vx, vy tiles / tick; s (..., N_SELF + N_COND), self[6:8] own velocity."""
+    ent (..., N_ENT, F_ENT): dx, dy in 10-tile units, vx, vy tiles / tick; s (..., N_S), self[6:8] own velocity."""
     p0 = ent[..., O.XY:O.XY + 2] * 10.0; v = ent[..., O.VEL:O.VEL + 2]
     p = p0 + (v - s[..., None, 6:8]) * LAT
     sp = (s[..., O.N_SELF + 3] * _PSPEED)[..., None]
@@ -82,6 +85,8 @@ class Policy(nn.Module):
                                   nn.Flatten(), nn.Linear(64 * 7 * 7, 256), nn.ReLU())
         self.ent = nn.Sequential(nn.Linear(F_IN, 128), nn.ReLU(), nn.Linear(128, 128), nn.ReLU())
         self.vec = nn.Sequential(nn.Linear(O.N_SELF + O.N_COND, 128), nn.ReLU())
+        with torch.no_grad():                            # + the intent columns (v5.5), zero: same draws as before, same start
+            v0 = self.vec[0]; v0.weight = nn.Parameter(torch.cat([v0.weight, v0.weight.new_zeros(128, O.N_INT)], 1)); v0.in_features = O.N_S
         self.trunk = nn.Sequential(nn.Linear(512, d), nn.ReLU())
         self.hemb = nn.Embedding(HMAX + 1, d); nn.init.zeros_(self.hemb.weight)
         self.register_buffer("hero_stats", torch.full((HMAX, N_STAT), 1e4))   # empty rows match nothing
@@ -266,7 +271,7 @@ def masked_kl(ref, new):
 
 def _check():
     torch.manual_seed(0); net = Policy(); N, L = 3, 4
-    s = torch.randn(N, L, O.N_SELF + O.N_COND); ent = torch.zeros(N, L, O.N_ENT, O.F_ENT)
+    s = torch.randn(N, L, O.N_S); ent = torch.zeros(N, L, O.N_ENT, O.F_ENT)
     grid = torch.randint(0, O.UNKNOWN + 1, (N, L, O.G, O.G), dtype=torch.uint8)
     ent[:, :, 0, 0] = 1; ent[:, :, 0, 1 + O.ENT.index("enemy")] = 1; ent[:, :, 0, O.XY] = 0.3      # an enemy straight right
     ent[:, :, 1, 0] = 1; ent[:, :, 1, 1 + O.ENT.index("teammate")] = 1; ent[:, :, 1, O.XY + 1] = 0.3   # a teammate below
@@ -334,7 +339,7 @@ def _check_aux(net, s, ent, grid):
 
 def _check_stage2():
     """lead hint math; an old-format checkpoint (no lead columns / hero table) acts the same after loading; hero rows"""
-    s = torch.zeros(1, O.N_SELF + O.N_COND); s[0, O.N_SELF + 3] = 1.0                    # shot 0.667 tiles / tick
+    s = torch.zeros(1, O.N_S); s[0, O.N_SELF + 3] = 1.0                    # shot 0.667 tiles / tick
     ent = torch.zeros(1, O.N_ENT, O.F_ENT); ent[0, :2, 0] = 1; ent[0, :2, 1 + O.ENT.index("enemy")] = 1
     ent[0, :2, O.XY] = 0.3; ent[0, 0, O.VEL + 1] = 0.12                                  # 3 tiles right, slot 0 walks down
     ld = lead(ent, s)[0]; sp = 4000 / 6000                                               # slot 0: brute-force intercept
@@ -346,7 +351,7 @@ def _check_stage2():
     t0 = 3.0 / (sp ** 2 - 0.12 ** 2) ** 0.5
     assert abs(lead(ent, s2)[0, 0, 0] - 0.12 * t0 / np.hypot(3.0, 0.12 * t0)) < 1e-3
     torch.manual_seed(1); N, L = 2, 3
-    s = torch.randn(N, L, O.N_SELF + O.N_COND); s[..., O.N_SELF:O.N_SELF + N_STAT] = s[:, :1, O.N_SELF:O.N_SELF + N_STAT]
+    s = torch.randn(N, L, O.N_S); s[..., O.N_SELF:O.N_SELF + N_STAT] = s[:, :1, O.N_SELF:O.N_SELF + N_STAT]
     s[..., O.N_SELF + 3] = 1.0                                                            # one hero per sequence
     ent = torch.zeros(N, L, O.N_ENT, O.F_ENT); ent[..., :3, 0] = 1; ent[..., :3, 1 + O.ENT.index("enemy")] = 1
     ent[..., :3, O.XY:O.HP] = torch.randn(N, L, 3, 4) * 0.2
@@ -372,6 +377,24 @@ def _check_stage2():
     assert (hero_index(s, b.hero_stats) < N).all() and (hero_index(torch.randn(4, s.shape[-1]), b.hero_stats) == HMAX).all()
     nn.init.normal_(b.hemb.weight, std=0.5)
     assert max((x - y).abs().max().item() for x, y in zip(ref, b.seq(s, ent, grid, h0)[0])) > 1e-3   # the embedding is used
+    _check_v55(ent, grid, h0)
+
+
+def _check_v55(ent, grid, h0):
+    """obs v5.5: a v5.4 checkpoint (vec.0 without the intent columns) acts the same with a zero and with any intent block;
+    a fresh Policy's intent columns start at zero and get a gradient"""
+    torch.manual_seed(2); N, L = ent.shape[:2]
+    assert not Policy().vec[0].weight[:, O.S_INT:].any() and Policy().vec[0].weight.shape == (128, O.N_S)
+    s = torch.randn(N, L, O.N_S); s[..., O.N_SELF + 3] = 1.0; s0 = s.clone(); s0[..., O.S_INT:] = 0   # free play: block zero
+    a = Policy(); nn.init.normal_(a.pi.weight, std=0.1)
+    old = dict(a.state_dict()); old["vec.0.weight"] = old["vec.0.weight"][:, :O.S_INT]          # the v5.4 layout: 38 columns
+    with torch.no_grad(): nn.init.normal_(a.vec[0].weight[:, O.S_INT:], std=0.3)               # a v5.5 net that reads the block
+    b = Policy(); b.load_state_dict(old, strict=False); assert not b.vec[0].weight[:, O.S_INT:].any()
+    ref, got0, got = a.seq(s0, ent, grid, h0)[0], b.seq(s0, ent, grid, h0)[0], b.seq(s, ent, grid, h0)[0]
+    d = lambda x, y: max((u - v).abs().max().item() for u, v in zip(x, y))
+    assert d(ref, got0) < 1e-6 and d(got0, got) < 1e-6, "v5.4 checkpoint acts differently"
+    assert d(ref, a.seq(s, ent, grid, h0)[0]) > 1e-3                                           # the block is an input
+    b.zero_grad(); b.seq(s, ent, grid, h0)[0][0].sum().backward(); assert b.vec[0].weight.grad[:, O.S_INT:].abs().sum() > 0
 
 
 if __name__ == "__main__":

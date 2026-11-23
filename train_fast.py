@@ -19,6 +19,8 @@ of one forward come from whichever instances were ready, and actions are sampled
 Non-acting heads (--vlive, --aux-w): as train_ppo (its helpers: targets / readouts in prepare(), losses in train()); the
 aux labels (env_v5.Env.aux_now) are computed in the workers next to priv and reach the main process in a second shared
 memory block; the replay readout (train_ppo.aux_readout of the recorded row) goes back with the actions.
+Intents (--intent-scale > 0, train_ppo's flags): env_v5.Env.intents runs in the workers (train_ppo.policy_s, after the
+observation build), so the block reaches the main process inside s and both trainers share one implementation.
 Hard scenarios (--eval-scenarios): every worker records its scenario episodes (scenarios.Recorder) and sends their
 index entries; the main process writes replays/scn/index.json and, at the eval's end, scenarios.jsonl.
 progress.jsonl: all train_ppo fields; t_poll_build_act_rest = [main waiting for workers, build per worker (mean),
@@ -48,7 +50,8 @@ def parse(argv=None):
     ap.add_argument("--kmix", default="1,2,3,4,5"); ap.add_argument("--brawler", default="Sniper", help="Sniper = Piper")
     ap.add_argument("--loc", default=None, help="Showdown location (default: the first of env_v5.locations())")
     ap.add_argument("--slider-scale", type=float, default=0.0, help="weight of the slider rewards (stage 1: off)")
-    from train_ppo import slider_flags, head_flags, scenario_flags; slider_flags(ap); head_flags(ap); scenario_flags(ap)   # sliders; --vlive / --aux-w; --eval-scenarios
+    from train_ppo import slider_flags, head_flags, scenario_flags, intent_flags
+    slider_flags(ap); head_flags(ap); scenario_flags(ap); intent_flags(ap)   # sliders; --vlive / --aux-w; --eval-scenarios; --intent-scale
     ap.add_argument("--reward-w", default="", help='JSON overrides of maenv.REWARD_W, e.g. {"taken": -0.25, "dealt": 0.3, "shots": -0.03} (HISTORY 77)')
     ap.add_argument("--noise", type=int, default=1, help="ObsV5 vision noise + latency")
     ap.add_argument("--eval-min", type=float, default=30.0); ap.add_argument("--eval-episodes", type=int, default=200)
@@ -91,7 +94,7 @@ def worker(w, lo, hi, a, loc, out, conn, shm, init, ashm=None):
     try:
         from nbpc import diversity as D
         import env_v5 as E, obs_v5 as O, fast_obs as FO, scenarios as SC
-        from train_ppo import Recorder, eval_tag, TR_X
+        from train_ppo import Recorder, eval_tag, TR_X, policy_s, set_intents
         from fast_act import OBS_W, _OFF
         st = dict(init); evq = []; rng_b = np.random.default_rng(a.seed + 7 + 1000 * w)
         kmix = [int(x) for x in a.kmix.split(",")]; M = a.opp_slots; NW = a.workers
@@ -121,7 +124,7 @@ def worker(w, lo, hi, a, loc, out, conn, shm, init, ashm=None):
                 if kd == "evalscn": return SC.battle_cfg(pre)   # hard scenario (its own map / brawlers / teams)
                 if a.eval_team > 1: cfg = teams(cfg, tag, a.eval_team); tag = cfg["tag"]
                 return {**cfg, "seed": sd, "ctl": list(range(10)) if b else [0], "end": "player0",
-                        "tag": {**tag, "kind": kd, "opp": list(range(1, 10)) if b else [], **eval_tag(a, pre)}}
+                        "tag": {**tag, "kind": kd, "opp": list(range(1, 10)) if b else [], "intent": "none", **eval_tag(a, pre)}}   # evals: free play
             if roster or len(locs) > 1 or gen:           # A3: random brawlers / map per training battle
                 g = gen.get(li) if li in gen and rng_b.random() < a.p_gen else None
                 lc = E.GEN_BASE if g else locs[int(rng_b.integers(len(locs)))]
@@ -155,7 +158,7 @@ def worker(w, lo, hi, a, loc, out, conn, shm, init, ashm=None):
 
         E.Env.slider_scale = a.slider_scale; E.Env.record = st["record"]
         E.Env.cube_k, E.Env.cube_gamma = a.cube_shaping, a.gamma
-        E.Env.slider_sample, E.Env.slider_norm = a.slider_sample, E.slider_norm(a.slider_norm)
+        E.Env.slider_sample, E.Env.slider_norm = a.slider_sample, E.slider_norm(a.slider_norm); set_intents(a)
         env = WEnv(hi - lo, battle_fn, ticks=2, fair=True, max_ticks=a.max_ticks, verbose=True, seed=a.seed + 1000 * w, tag="pf%d_%d" % (os.getpid(), w),
                    reward_w=json.loads(a.reward_w) if a.reward_w else None)
         ob = FO.FastObsV5(noise=O.NOISE if a.noise else None, seed=a.seed + 1000 * w)
@@ -169,7 +172,7 @@ def worker(w, lo, hi, a, loc, out, conn, shm, init, ashm=None):
             t1 = time.perf_counter(); B = len(ids); msg = {"B": B}
             if B:
                 o = ob.build(obs["vec"], obs["grid"], env.last_meta, ids, cmd=env.cmd_vel(ids) if a.cmd_vel else None)
-                X[:B, :_OFF[1]] = np.concatenate([o["self"], env.cond(ids)], 1); X[:B, _OFF[1]:_OFF[2]] = o["ent"].reshape(B, -1)
+                X[:B, :_OFF[1]] = policy_s(env, ids, o); X[:B, _OFF[1]:_OFF[2]] = o["ent"].reshape(B, -1)   # s = self | cond | intent
                 X[:B, _OFF[2]:_OFF[3]] = o["grid"].reshape(B, -1); X[:B, _OFF[3]:_OFF[4]] = FO.priv_fast(env, ids)
                 kind = [t["kind"] for t in env.last_tags]; isev = np.char.startswith(np.array(kind), "eval")
                 opp = np.array([int(x) & 15 in t.get("opp", ()) for x, t in zip(ids, env.last_tags)], bool)
@@ -229,10 +232,10 @@ def main(argv=None):
     from nbpc.maenv import REWARD_W, TERMS
     import env_v5 as E, obs_v5 as O
     from train_ppo import Buffer, chunks, eval_summary, eval_items, eval_presets, split_params, gae, expl_var, live_targets, head_loss
-    from train_ppo import aux_targets, aux_readout, scenario_items, scenario_eval
+    from train_ppo import aux_targets, aux_readout, scenario_items, scenario_eval, intent_stats, load_opt
     import scenarios as SC
     from fast_act import StackedActor, OBS_W, _OFF
-    NS = O.N_SELF + O.N_COND
+    NS = O.N_S
     out = os.path.join(E.WORK, "runs", a.run); os.makedirs(out, exist_ok=True)
     loc = a.loc or E.locations()[0]
     json.dump({**vars(a), "loc": loc, "reward_w": {**REWARD_W, **(json.loads(a.reward_w) if a.reward_w else {})}, "trainer": "train_fast"}, open(os.path.join(out, "config.json"), "w"), indent=1)
@@ -270,10 +273,9 @@ def main(argv=None):
     opt = torch.optim.Adam(main_p, lr=a.bc_lr, eps=1e-5); opt_x = torch.optim.Adam(x_p, lr=a.bc_lr, eps=1e-5)
     if ck:
         net.load_state_dict(ck["model"], strict=False)
-        try: opt.load_state_dict(ck["opt"])
-        except ValueError: print("optimizer state not loaded (new parameters): fresh Adam", flush=True)
-        try: ck.get("opt_x") and opt_x.load_state_dict(ck["opt_x"])
-        except ValueError: print("optimizer state of the non-acting heads not loaded (heads changed): fresh Adam", flush=True)
+        if ck.get("obs_version") != O.OBS_VERSION:   # older inputs: the new columns load zero-padded (model.load_state_dict), same actions
+            print("checkpoint obs %s, this code %s: new input columns zero-padded" % (ck.get("obs_version", "< v5.4"), O.OBS_VERSION), flush=True)
+        load_opt(opt, ck["opt"]); load_opt(opt_x, ck.get("opt_x"), "optimizer state of the non-acting heads")
         if ck.get("ref"): ref = frozen(ck["ref"])
         bnet = frozen(torch.load(a.base, map_location="cpu", weights_only=False)["model"] if a.base else ck["model"])
     ck = None
@@ -429,6 +431,7 @@ def main(argv=None):
         for k in sorted({r["tag"]["kind"] for r in ok}): row["rank_" + k] = mean([r["rank"] for r in ok if r["tag"]["kind"] == k])
         row["pfsp"] = {os.path.basename(p)[:-3]: [round(pfr(p), 2), pf.get(os.path.basename(p), [0, 0])[1]] for p in pool}
         for k in TERMS: row["t_" + k] = mean([r["terms"][k] for r in recent])
+        if a.intent_scale: row.update(intent_stats(recent))
         row.update({k: (round(v, 4) if isinstance(v, float) else v) for k, v in P_["xrow"].items()})
         prf.write(json.dumps(row) + "\n"); prf.flush()
         print(json.dumps({k: v for k, v in row.items() if not k.endswith("_hist") and k != "pfsp"}), flush=True)

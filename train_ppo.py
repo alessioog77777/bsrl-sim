@@ -27,7 +27,7 @@
   native, player 0 on the preset's weights, + balanced) -> p_<preset> in evals.jsonl, scorecard.py per preset.
 * Live value (--vlive 1, default 0 = off): model.Policy.vl (no priv, detached features: never changes the policy) is
   trained to its own lambda-return of the reward without the intent reward (rew - rew_int; rew_int = terms "i_rew", 0
-  until intents exist), its values from one no-grad pass over the rollout (model.Policy.row_feats: acting is unchanged).
+  with intents off), its values from one no-grad pass over the rollout (model.Policy.row_feats: acting is unchanged).
   progress.jsonl: expl_var_live (next to expl_var, the critic with priv), vloss_live, extra_s (the pass). The heads that
   never act (model.NONACT) have their own Adam ("opt_x" in the checkpoint) and gradient clip, so the main optimizer and
   its clip see exactly the acting network's parameters.
@@ -43,6 +43,14 @@
   x 2 maps x 2 brawler picks x --scenario-seeds layouts) joins the eval queue as kind "evalscn", played by the frozen
   eval copy on the eval instances -> scenarios.jsonl (one row per eval: pass rate + mean scores per scenario),
   scenario_episodes.jsonl, every episode's replay in replays/scn/ (viz: failures first).
+* Intents (--intent-scale S > 0 switches them on; default 0 = off: the intent block of s is all zeros, no intent reward):
+  env_v5.Env.intents after the observation build gives the block (obs_v5 v5.5: s = cat[self, cond, intent]); per agent
+  and battle --p-steer of the agents are steered, the rest free (always none); a steered agent's planner tick picks a
+  random valid intent with --p-rand-intent, else none (the rule planner's share comes with step E). Reward += S x
+  intent.step_reward (terms "i_rew" = rew_int, which the live value excludes). BC battles (native AI) and evals
+  (tag "intent": "none", scenario battles too) play free. progress.jsonl (only with S > 0): t_i_rew (mean per episode),
+  intents {kind: [started, achieved, timeout, invalid]} and intent_follow (achieved / started) over the recent episodes;
+  replay frames carry "i" (the active intent: kind, target dx / dy, radius, time left).
 shortcut: no exploiters (a second learner trained only to beat this one); add them if b_rank flattens again with PFSP.
 """
 import argparse, glob, json, os, shutil, signal, sys, time
@@ -53,7 +61,7 @@ from nbpc.maenv import REWARD_W, TERMS
 import env_v5 as E, obs_v5 as O, scenarios as SC
 from model import Policy, HID, PRIV, NONACT, dist_logp_ent, masked_kl, act_stacked, aux_losses
 
-NS = O.N_SELF + O.N_COND
+NS = O.N_S                       # s = cat[self, cond, intent] (obs v5.5)
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -62,7 +70,7 @@ class Buffer:
     F = {"s": ((NS,), np.float16), "ent": ((O.N_ENT, O.F_ENT), np.float16), "grid": ((O.G, O.G), np.uint8), "h": ((HID,), np.float16), "priv": ((PRIV,), np.float16),
          "act": ((4,), np.int16), "logp": ((), np.float32), "val": ((), np.float32), "rew": ((), np.float32),
          "done": ((), bool), "complete": ((), bool), "bc": ((), bool), "dead": ((), bool),
-         "rew_int": ((), np.float32)}   # the intent reward inside rew (terms "i_rew"; none yet): the live value's target excludes it
+         "rew_int": ((), np.float32)}   # the intent reward inside rew (terms "i_rew"; 0 with intents off): the live value's target excludes it
 
     def __init__(self, cap):
         self.cap, self.n = cap, 0
@@ -96,7 +104,23 @@ def replay_frame(s, ids, b, o, act):
     return {"t": int(r.tick), "f": int(ids[b]) & 15, "a": [int(x) for x in act[b]],
             "p": [[int(r.pl[p].x), int(r.pl[p].y), int(r.pl[p].hp), int(r.pl[p].max_hp), int(bool(r.pl[p].alive) and not r.pl[p].eliminated)] for p in range(10)],
             "e": [[int(x[1:1 + len(O.ENT)].argmax()), round(float(x[O.XY]), 3), round(float(x[O.XY + 1]), 3), round(float(x[O.HP]), 2)] for x in e],
-            "s": [round(float(x), 2) for x in o["self"][b, :5]], "g": "".join(chr(97 + c) for c in o["grid"][b].ravel())}
+            "s": [round(float(x), 2) for x in o["self"][b, :5]], "g": "".join(chr(97 + c) for c in o["grid"][b].ravel()),
+            **intent_frame(o, b)}
+
+
+def intent_frame(o, b):
+    """replay frame "i" of row b when it has an active intent (o["intent"] = env_v5.Env.intents' block): kind, target
+    dx, dy (10-tile units, as the policy sees it), radius / 10 tiles, time left 1 -> 0"""
+    x = o.get("intent")
+    if x is None or not x[b, :O.I_XY].any(): return {}
+    return {"i": {"k": O.INTENTS[1 + int(x[b, :O.I_XY].argmax())], "t": [round(float(x[b, O.I_XY]), 3), round(float(x[b, O.I_XY + 1]), 3)],
+                  "r": round(float(x[b, O.I_RAD]), 3), "l": round(float(x[b, O.I_LEFT]), 2)}}
+
+
+def policy_s(env, ids, o):
+    """the policy's vector input s = cat[self, cond, intent] of a poll (+ o["intent"] = the block, for the replay)"""
+    c = env.cond(ids); o["intent"] = env.intents(ids, o, c)
+    return np.concatenate([o["self"], c, o["intent"]], 1)
 
 
 class Recorder:
@@ -215,6 +239,32 @@ def slider_flags(ap):
     ap.add_argument("--eval-presets", default="", help="comma list of obs_v5.PRESETS: each also plays the eval seeds vs native (kind evalp, + balanced)")
 
 
+def intent_flags(ap):
+    """step-D intent flags, shared with train_fast (default --intent-scale 0 = off: zero block, no intent reward)"""
+    ap.add_argument("--intent-scale", type=float, default=0.0, help="weight of the intent reward; > 0 switches intents on (start 0.25)")
+    ap.add_argument("--p-steer", type=float, default=0.7, help="with intents on: share of agents per battle that get intents (the rest play free)")
+    ap.add_argument("--p-rand-intent", type=float, default=0.3, help="with intents on: chance per planner tick of a random valid intent (else none)")
+
+
+def set_intents(a):
+    """the intent flags -> env_v5.Env (class attributes: train_fast's workers inherit them)"""
+    E.Env.intent_scale, E.Env.p_steer, E.Env.p_rand_intent = a.intent_scale, a.p_steer, a.p_rand_intent
+    E.Env.intent_jitter = O.NOISE["jitter"] if a.noise else (0.0, 0.0)
+
+
+def intent_stats(rows):
+    """progress.jsonl intent fields of episode rows (env_v5 "intents" / terms "i_rew"): mean i_rew, summed counts per
+    kind, achieved / started"""
+    rows = [r for r in rows if "intents" in r]
+    cnt = {k: [0, 0, 0, 0] for k in O.INTENTS[1:]}
+    for r in rows:
+        for k, v in r["intents"].items(): cnt[k] = [x + y for x, y in zip(cnt[k], v)]
+    st = sum(v[0] for v in cnt.values())
+    return {"t_i_rew": round(float(np.mean([r["terms"].get("i_rew", 0.0) for r in rows])), 4) if rows else None,
+            "intents": {k: v for k, v in cnt.items() if v[0]}, "intent_follow": round(sum(v[1] for v in cnt.values()) / st, 3) if st else None,
+            "steered": round(float(np.mean([r.get("intent_mode") == "steered" for r in rows])), 3) if rows else None}
+
+
 TR_X = ("i_rew",)   # transition terms the buffer keeps besides rew / done (train_fast's workers send these)
 
 
@@ -222,6 +272,21 @@ def head_flags(ap):
     """step-C flags of the heads that never act, shared with train_fast (defaults = off, the original behaviour)"""
     ap.add_argument("--vlive", type=int, default=0, help="1 = train the live value head (model.Policy.vl: no priv, return without the intent reward)")
     ap.add_argument("--aux-w", type=float, default=0.0, help="weight of the aux head losses (model.Policy.aux; 0 = off: no loss, no gradient; start 0.1)")
+
+
+def load_opt(opt, sd, what="optimizer state"):
+    """an optimizer state from a checkpoint; moments of a parameter that grew since (new input columns, zero-padded by
+    model.load_state_dict) are zero-padded the same way (torch loads them unchecked and the first step would fail); a
+    different parameter set -> the fresh Adam is kept (printed)"""
+    if not sd: return
+    try: opt.load_state_dict(sd)
+    except ValueError: print("%s not loaded (parameters changed): fresh Adam" % what, flush=True); return
+    for g in opt.param_groups:
+        for p in g["params"]:
+            st = opt.state.get(p, {})
+            for k, v in st.items():
+                if torch.is_tensor(v) and v.dim() == p.dim() and v.shape != p.shape and all(x <= y for x, y in zip(v.shape, p.shape)):
+                    z = torch.zeros_like(p); z[tuple(slice(0, n) for n in v.shape)] = v; st[k] = z
 
 
 def split_params(net):
@@ -380,7 +445,7 @@ def eval_summary(rows):
 
 def _check():
     """gae == the original inline loop; aux_labels on a synthetic trajectory (slot matching, 1 s label, masks, hit
-    window, baselines); auc"""
+    window, baselines); auc; the replay frame "i" and the progress intent fields"""
     rng = np.random.default_rng(0); n = 60; buf = Buffer(n)
     buf.rew[:n] = rng.normal(size=n); buf.val[:n] = rng.normal(size=n); buf.done[29] = True; buf.n = n
     traj, pending, final = {1: list(range(30)), 2: list(range(30, 55))}, {2: 57}, {1}
@@ -411,6 +476,16 @@ def _check():
     assert lab["m"][20] == 0 and lab["m"][19] == 1 and np.allclose(lab["gas"], 0)
     assert auc([0.1, 0.2, 0.8, 0.9], [0, 0, 1, 1]) == 1.0 and auc([0.5] * 4, [0, 1, 0, 1]) == 0.5 and auc([1, 2], [1, 1]) is None
     assert abs(auc([0.9, 0.2, 0.8, 0.1], [0, 0, 1, 1]) - 0.25) < 1e-9                      # 1 of 4 pairs ordered
+    a_ = torch.nn.Linear(38, 4); o_ = torch.optim.Adam(a_.parameters()); a_(torch.randn(2, 38)).sum().backward(); o_.step()
+    b_ = torch.nn.Linear(49, 4); o2 = torch.optim.Adam(b_.parameters()); load_opt(o2, o_.state_dict())   # an input that grew
+    m_ = o2.state[b_.weight]["exp_avg"]; assert m_.shape == (4, 49) and not m_[:, 38:].any() and torch.equal(m_[:, :38], o_.state[a_.weight]["exp_avg"])
+    b_(torch.randn(2, 49)).sum().backward(); o2.step()
+    import intent as I                                   # replay frame "i", progress intent fields
+    o = {"intent": I.encode([0, 5], [0, 3.0], [0, -1.0], [0, 1.0], [0, 0.5])}
+    assert intent_frame(o, 0) == {} and intent_frame({}, 0) == {} and intent_frame(o, 1)["i"] == {"k": "farm", "t": [0.3, -0.1], "r": 0.1, "l": 0.5}
+    st = intent_stats([{"intents": {"farm": [2, 1, 1, 0]}, "terms": {"i_rew": 0.02}, "intent_mode": "steered"},
+                       {"intents": {}, "terms": {"i_rew": 0.0}, "intent_mode": "free"}, {"terms": {}}])
+    assert st == {"t_i_rew": 0.01, "intents": {"farm": [2, 1, 1, 0]}, "intent_follow": 0.5, "steered": 0.5}, st
     print("train_ppo helpers ok")
 
 
@@ -428,7 +503,7 @@ def main():
     ap.add_argument("--kmix", default="1,2,3,4,5"); ap.add_argument("--brawler", default="Sniper", help="Sniper = Piper")
     ap.add_argument("--loc", default=None, help="Showdown location (default: the first of env_v5.locations())")
     ap.add_argument("--slider-scale", type=float, default=0.0, help="weight of the slider rewards (stage 1: off)")
-    slider_flags(ap); head_flags(ap); scenario_flags(ap)
+    slider_flags(ap); head_flags(ap); scenario_flags(ap); intent_flags(ap)
     ap.add_argument("--noise", type=int, default=1, help="ObsV5 vision noise + latency")
     ap.add_argument("--eval-min", type=float, default=30.0); ap.add_argument("--eval-episodes", type=int, default=200)
     ap.add_argument("--max-ticks", type=int, default=4000); ap.add_argument("--seed", type=int, default=0)
@@ -459,10 +534,9 @@ def main():
     if a.resume:
         ck = torch.load(a.resume, map_location="cpu", weights_only=False)
         net.load_state_dict(ck["model"], strict=False); upd, agent_steps = ck["update"], ck["agent_steps"]
-        try: opt.load_state_dict(ck["opt"])
-        except ValueError: print("optimizer state not loaded (new parameters): fresh Adam", flush=True)
-        try: ck.get("opt_x") and opt_x.load_state_dict(ck["opt_x"])
-        except ValueError: print("optimizer state of the non-acting heads not loaded (heads changed): fresh Adam", flush=True)
+        if ck.get("obs_version") != O.OBS_VERSION:   # older inputs: the new columns load zero-padded (model.load_state_dict), same actions
+            print("checkpoint obs %s, this code %s: new input columns zero-padded" % (ck.get("obs_version", "< v5.4"), O.OBS_VERSION), flush=True)
+        load_opt(opt, ck["opt"]); load_opt(opt_x, ck.get("opt_x"), "optimizer state of the non-acting heads")
         if ck.get("ref"): ref = frozen(ck["ref"])
         bnet = frozen(torch.load(a.base, map_location="cpu", weights_only=False)["model"] if a.base else ck["model"])
     kmix = [int(x) for x in a.kmix.split(",")]; rng_b = np.random.default_rng(a.seed + 7)
@@ -485,7 +559,7 @@ def main():
             sd, kd, pre = eval_queue.pop(0); b = kd == "evalb"
             if kd == "evalscn": return SC.battle_cfg(pre)
             return {**cfg, "seed": sd, "ctl": list(range(10)) if b else [0], "end": "player0",
-                    "tag": {**tag, "kind": kd, "opp": list(range(1, 10)) if b else [], **eval_tag(a, pre)}}
+                    "tag": {**tag, "kind": kd, "opp": list(range(1, 10)) if b else [], "intent": "none", **eval_tag(a, pre)}}   # evals: free play
         sd = int(rng_b.integers(10_000_000, 2 ** 31 - 1))
         if bc():
             return {**cfg, "seed": sd, "ctl": list(range(10)), "native_ctl": True, "tag": {**tag, "kind": "bc"}}
@@ -497,7 +571,7 @@ def main():
         return {**cfg, "seed": sd, "ctl": sorted(rng_b.choice(10, k, replace=False).tolist()), "tag": {**tag, "kind": "k%d" % k}}
 
     E.Env.slider_scale = a.slider_scale; E.Env.record = a.bc_updates > 0
-    E.Env.slider_sample, E.Env.slider_norm = a.slider_sample, E.slider_norm(a.slider_norm)
+    E.Env.slider_sample, E.Env.slider_norm = a.slider_sample, E.slider_norm(a.slider_norm); set_intents(a)
     env = E.Env(a.n, battle_fn, ticks=2, fair=True, max_ticks=a.max_ticks, verbose=True, seed=a.seed, tag="ppo%d" % os.getpid())
     ob = O.ObsV5(noise=O.NOISE if a.noise else None, seed=a.seed); rec = Recorder(out)
     srec, sidx = (SC.Recorder(out), SC.ScnIndex(out)) if a.eval_scenarios else (None, None)   # every scenario episode's replay
@@ -557,7 +631,7 @@ def main():
                 env.dropped = []
                 if not len(ids): continue
                 tq = time.perf_counter(); o = ob.build(obs["vec"], obs["grid"], env.last_meta, ids); tm[1] += time.perf_counter() - tq
-                s = np.concatenate([o["self"], env.cond(ids)], 1); h = np.stack([hid.get(int(x), z) for x in ids])
+                s = policy_s(env, ids, o); h = np.stack([hid.get(int(x), z) for x in ids])
                 pv = priv(env, ids); B = len(ids); kind = np.array([t["kind"] for t in env.last_tags])
                 isev = np.char.startswith(kind, "eval"); opp = np.array([int(x) & 15 in t.get("opp", ()) for x, t in zip(ids, env.last_tags)], bool)
                 A = np.zeros((B, 4), np.int64); h2 = np.zeros((B, HID), np.float32); lp = np.zeros(B, np.float32); v = np.zeros(B, np.float32)
@@ -678,6 +752,7 @@ def main():
             for k in sorted({r["tag"]["kind"] for r in ok}): row["rank_" + k] = mean([r["rank"] for r in ok if r["tag"]["kind"] == k])
             row["pfsp"] = {os.path.basename(p)[:-3]: [round(pfr(p), 2), pf.get(os.path.basename(p), [0, 0])[1]] for p in pool}
             for k in TERMS: row["t_" + k] = mean([r["terms"][k] for r in recent])
+            if a.intent_scale: row.update(intent_stats(recent))
             row.update({k: (round(v, 4) if isinstance(v, float) else v) for k, v in xrow.items()})
             prf.write(json.dumps(row) + "\n"); prf.flush()
             print(json.dumps({k: v for k, v in row.items() if not k.endswith("_hist") and k != "pfsp"}), flush=True)

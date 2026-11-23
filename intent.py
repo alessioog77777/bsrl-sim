@@ -1,0 +1,268 @@
+"""Intents: per-second goals for the reflex policy (behaviour design 4). The kind specs, the one observation encoder
+shared by sim and live, the intent-following reward and the random-valid sampler. Numpy only, no host.
+
+    python -m intent        # self-check (no game)
+
+    blk = encode(kind, dx, dy, radius, left)     # (B, N_INT) intent block; kind 0 (none) = all zeros
+    it = new(cand, d0, range_t)                   # an intent episode from a sampler / planner candidate
+    rew, end = step_reward(it, ev)                # one env step: reward before --intent-scale, end None | achieved | timeout | invalid
+    cand = sample(scene, rng)                     # a random kind among those with a valid target, a random valid target (or None)
+
+Kinds (obs_v5.INTENTS; distances in tiles, true positions in the sim):
+  id kind     target                       achieved                                               max
+  1  move_to  point, r 1                   d <= r                                                 4 s
+  2  avoid    point, R 8                   d >= R                                                 4 s
+  3  hold     point, r 1.5                 inside r when the time runs out                        5 s
+  4  engage   enemy player (anchored)      the target goes down after my damage in range in the last 2 s (or my kill)  5 s
+  5  farm     box or cube (static point)   box: gone after my box damage in the last 2 s; cube: I picked one up within 1.5  5 s
+  6  regroup  mate player (anchored)       1.5 <= d <= 4 (the leash band, 450-1200 units)         3 s
+  7  hide     bush tile                    on the tile, hidden by it (hid_vs) or no enemy in view 5 s
+Invalid (no bonus): me knocked out / eliminated; the target player down (engage: not after my damage); an anchored or
+static target not seen by me for 1 s (fair rule); a farm target in the gas or gone without my doing; a hide tile that is
+no longer a bush. After any end: none until the next planner tick; achieved -> a re-plan on the next decision (Env).
+Block (obs_v5.N_INT = 11): one-hot of kinds 1..7 | dx, dy (target - own position, 10-tile units, clip +-2.5) | radius /
+10 tiles (engage: 0.8 x own range, regroup: the band's outer edge 4) | time left 1 -> 0.
+Reward per step (signed progress on a potential phi(d), so it telescopes: no dithering profit), c = 0.01 per tile:
+  move_to  c * (phi_prev - phi), phi = min(d, 10)                    + 0.03 achieved
+  avoid    phi = -min(d, R)                                          + 0.03 achieved
+  hold     phi = min(max(d, r), 5), + 0.002 per step inside r        (no bonus)
+  engage   phi = min(max(d - 0.8 range, 0), 5), + 0.5 x own damage / 1000 while the target is in range (<= 0.05 per intent)  + 0.05
+  farm     phi = min(d, 8), + 0.2 x own box damage / 1000 (box target, <= 0.03 per intent)  + 0.03
+  regroup  phi = min(max(d - 4, 0), 10) + max(1.5 - d, 0)             + 0.02
+  hide     phi = min(d, 6), + 0.002 on the tile while hidden          + 0.02
+Every intent's total is capped at CAP = 0.15 (min(total + r, CAP) - total: telescoping kept, nothing past the cap), x
+--intent-scale (start 0.25): <= 0.04 per intent, < 1/10 of a rank step (0.56). The step an intent goes invalid pays 0.
+"""
+import sys
+import numpy as np
+import obs_v5 as O
+
+KINDS = O.INTENTS
+K = {k: i for i, k in enumerate(KINDS)}
+C = 0.01                  # reward per tile of progress
+CAP = 0.15                # per-intent total (design 4.3: <= c x start distance + bonus <= ~0.15)
+SEEN_S, HIT_S = 1.0, 2.0  # s: an unseen target is lost after 1 s; "my damage in the last 2 s" (engage / farm a box)
+PICK = 1.5                # tiles: a cube picked up this close to the target is the target
+TILE, VIEW = 300.0, (4500.0, 3500.0, 2900.0)   # camera rule of nbpc.fair / env_v5.slider_terms: |dx| < 4500 from the
+                                               # clamped camera x, -3500 < dy < 2900
+# per kind: radius r (tiles), max seconds, end bonus, distance cap of the potential (tiles), per-step pay while there
+SPEC = {
+    "move_to": dict(r=1.0, max_s=4, bonus=0.03, dcap=10.0),
+    "avoid":   dict(r=8.0, max_s=4, bonus=0.03, dcap=8.0),
+    "hold":    dict(r=1.5, max_s=5, bonus=0.0, dcap=5.0, stay=0.002),
+    "engage":  dict(r=None, max_s=5, bonus=0.05, dcap=5.0, dk=0.5, dk_cap=0.05),   # r = 0.8 x own range
+    "farm":    dict(r=1.0, max_s=5, bonus=0.03, dcap=8.0, box=0.2, box_cap=0.03),
+    "regroup": dict(r=4.0, max_s=3, bonus=0.02, dcap=10.0, band=(1.5, 4.0)),
+    "hide":    dict(r=0.5, max_s=5, bonus=0.02, dcap=6.0, stay=0.002),
+}
+END = ("achieved", "timeout", "invalid")      # episode counts per kind: [started, achieved, timeout, invalid]
+
+
+def encode(kind, dx, dy, radius, left):
+    """(B, N_INT) float32 intent blocks. kind (B,) ints (0 = none -> the row is all zeros), dx, dy = target - own
+    position in tiles (x right, y down), radius in tiles, left = time left 1 -> 0"""
+    kind = np.asarray(kind, np.int64).reshape(-1); B = len(kind); out = np.zeros((B, O.N_INT), np.float32)
+    on = kind > 0
+    if not on.any(): return out
+    out[on, kind[on] - 1] = 1.0
+    out[:, O.I_XY] = np.clip(np.broadcast_to(np.asarray(dx, np.float64), (B,)) / 10.0, -2.5, 2.5)
+    out[:, O.I_XY + 1] = np.clip(np.broadcast_to(np.asarray(dy, np.float64), (B,)) / 10.0, -2.5, 2.5)
+    out[:, O.I_RAD] = np.broadcast_to(np.asarray(radius, np.float64), (B,)) / 10.0
+    out[:, O.I_LEFT] = np.clip(np.broadcast_to(np.asarray(left, np.float64), (B,)), 0.0, 1.0)
+    out[~on] = 0.0
+    return out
+
+
+def radius(kind, range_t=None):
+    """encoded / achieving radius in tiles of a kind (engage: 0.8 x own range in tiles)"""
+    return 0.8 * float(range_t) if kind == "engage" else SPEC[kind]["r"]
+
+
+def phi(it, d):
+    """the kind's potential at distance d (tiles): reward = C x (phi_prev - phi)"""
+    k, sp = it["kind"], SPEC[it["kind"]]; cap = sp["dcap"]
+    if k == "avoid": return -min(d, sp["r"])
+    if k == "hold": return min(max(d, sp["r"]), cap)
+    if k == "engage": return min(max(d - it["r"], 0.0), cap)
+    if k == "regroup": lo, hi = sp["band"]; return min(max(d - hi, 0.0), cap) + max(lo - d, 0.0)
+    return min(d, cap)
+
+
+def new(cand, d0, range_t=None, steps_per_s=10):
+    """an intent episode from a candidate {kind, q (anchored player, -1 none), pt (x, y units, static), obj ('box' / 'cube'
+    / None)}: d0 = the start distance (tiles), range_t = own range (tiles), steps_per_s = env steps per second"""
+    k = cand["kind"]
+    it = {"kind": k, "q": int(cand.get("q", -1)), "pt": cand.get("pt"), "obj": cand.get("obj"), "r": radius(k, range_t),
+          "range": float(range_t or 0.0), "t": 0, "T": int(round(SPEC[k]["max_s"] * steps_per_s)), "sps": int(steps_per_s),
+          "tot": 0.0, "dk": 0.0, "box": 0.0, "unseen": 0, "hit_t": -10 ** 6, "box_t": -10 ** 6, "reason": cand.get("reason", "random")}
+    it["phi"] = phi(it, d0)
+    return it
+
+
+def left(it):
+    """time left 1 -> 0"""
+    return 1.0 - it["t"] / max(1, it["T"])
+
+
+def step_reward(it, ev):
+    """one env step of intent `it` (updated in place) -> (reward before --intent-scale, end or None). ev: d (tiles, true
+    distance to the target after the step), out (I am knocked out / eliminated), lost (the target is lost: down, unseen
+    for SEEN_S, in the gas, gone without me, not a bush any more), got (engage: down after my damage; farm: box broken
+    by me / cube picked), dk (own damage dealt / 1000), box (own box damage / 1000), in_range (engage), on (hide: on the
+    tile), hid (hide: hidden by it or no enemy in view)"""
+    if ev.get("out") or ev.get("lost"): return 0.0, "invalid"
+    k, sp, d = it["kind"], SPEC[it["kind"]], float(ev["d"]); it["t"] += 1
+    p = phi(it, d); r = C * (it["phi"] - p); it["phi"] = p
+    ach = False
+    if k == "move_to": ach = d <= sp["r"]
+    elif k == "avoid": ach = d >= sp["r"]
+    elif k == "hold": r += sp["stay"] * (d <= sp["r"])
+    elif k == "engage":
+        if ev.get("in_range"):
+            g = min(sp["dk"] * float(ev.get("dk", 0.0)), sp["dk_cap"] - it["dk"]); it["dk"] += g; r += g
+        ach = bool(ev.get("got"))
+    elif k == "farm":
+        if it["obj"] == "box":
+            g = min(sp["box"] * float(ev.get("box", 0.0)), sp["box_cap"] - it["box"]); it["box"] += g; r += g
+        ach = bool(ev.get("got"))
+    elif k == "regroup": ach = sp["band"][0] <= d <= sp["band"][1]
+    elif k == "hide":
+        hid = bool(ev.get("on")) and bool(ev.get("hid")); r += sp["stay"] * hid; ach = hid
+    end = "achieved" if ach else None
+    if end is None and it["t"] >= it["T"]: end = "achieved" if (k == "hold" and d <= sp["r"]) else "timeout"   # hold: inside at the end
+    if end == "achieved": r += sp["bonus"]
+    r = min(it["tot"] + r, CAP) - it["tot"]; it["tot"] += r
+    return float(r), end
+
+
+# ------------------------------------------------------------------ random valid intents (training, design 4.4)
+def on_screen(mx, my, x, y, W):
+    """(x, y) on the screen of a player at (mx, my) on a W-tile-wide map (the fair camera rule)"""
+    camx = np.clip(mx, 3000.0, W * TILE - 3000.0)
+    return (np.abs(np.asarray(x) - camx) < VIEW[0]) & (np.asarray(y) - my > -VIEW[1]) & (np.asarray(y) - my < VIEW[2])
+
+
+def gas_margin_t(tx, ty, ring, W, H):
+    """tiles from the gas edge of tile (tx, ty) (< 0 = in the gas; env_v5.gas_margin's rule)"""
+    return np.minimum(np.minimum(tx, ty), np.minimum(W - 1 - tx, H - 1 - ty)) - ring
+
+
+def _tiles(scene, lo, hi, mask=None, screen=False, margin=1):
+    """tile centres (n, 2) units with lo <= distance <= hi tiles from me, inside the map, gas margin >= margin, mask[ty, tx]"""
+    mx, my = scene["me"]; W, H = scene["W"], scene["H"]; tx0, ty0 = int(mx // TILE), int(my // TILE); n = int(np.ceil(hi)) + 1
+    ty, tx = np.mgrid[max(ty0 - n, 0):min(ty0 + n + 1, H), max(tx0 - n, 0):min(tx0 + n + 1, W)]
+    cx, cy = (tx + 0.5) * TILE, (ty + 0.5) * TILE; d = np.hypot(cx - mx, cy - my) / TILE
+    ok = (d >= lo) & (d <= hi) & (gas_margin_t(tx, ty, scene["ring"], W, H) >= margin)
+    if mask is not None: ok &= mask[ty, tx]
+    if screen: ok &= on_screen(mx, my, cx, cy, W)
+    return np.stack([cx[ok], cy[ok]], 1)
+
+
+def candidates(scene):
+    """{kind: [candidate, ...]} of every kind with a valid target. scene: me (x, y) units, range (units), W, H, ring
+    (storm step), walk / bush (H, W) bool, foes / mates (n, 3) [player, x, y] of the enemies I see (fair rule) / the mates
+    on my screen (both alive, not respawning), boxes / cubes (n, 2) in my view (x, y units)"""
+    mx, my = scene["me"]; W, H = scene["W"], scene["H"]; out = {}
+    dist = lambda xy: np.hypot(np.asarray(xy, np.float64)[..., 0] - mx, np.asarray(xy, np.float64)[..., 1] - my) / TILE
+    pts = lambda kind, xy, **kw: [dict(kind=kind, q=-1, pt=(float(x), float(y)), obj=None, **kw) for x, y in xy]
+    out["move_to"] = pts("move_to", _tiles(scene, 3, 8, scene["walk"]))             # 3-8 tiles, walkable, out of the gas
+    foes = np.asarray(scene["foes"], np.float64).reshape(-1, 3); mates = np.asarray(scene["mates"], np.float64).reshape(-1, 3)
+    near = foes[dist(foes[:, 1:]) < SPEC["avoid"]["r"] - 1] if len(foes) else foes   # an enemy within 7 tiles: away from it
+    out["avoid"] = pts("avoid", near[:, 1:]) if len(near) else pts("avoid", _tiles(scene, 2, 5, margin=-99))
+    out["hold"] = pts("hold", _tiles(scene, 2, 4, scene["walk"]))
+    out["engage"] = [dict(kind="engage", q=int(q), pt=None, obj=None) for q, x, y in foes if dist((x, y)) <= 12]
+    lo, hi = SPEC["regroup"]["band"]
+    out["regroup"] = [dict(kind="regroup", q=int(q), pt=None, obj=None) for q, x, y in mates if not lo <= dist((x, y)) <= hi]
+    farm = []
+    for obj, key in (("box", "boxes"), ("cube", "cubes")):
+        for x, y in np.asarray(scene[key], np.float64).reshape(-1, 2):
+            tx, ty = min(max(int(x // TILE), 0), W - 1), min(max(int(y // TILE), 0), H - 1)
+            if gas_margin_t(tx, ty, scene["ring"], W, H) >= 0: farm.append(dict(kind="farm", q=-1, pt=(float(x), float(y)), obj=obj))
+    out["farm"] = farm
+    out["hide"] = pts("hide", _tiles(scene, 1, 6, scene["bush"], screen=True))
+    return {k: v for k, v in out.items() if v}
+
+
+def sample(scene, rng):
+    """a random kind among those with a valid target, then a random valid target of it; None when there is none"""
+    c = candidates(scene)
+    if not c: return None
+    ks = sorted(c, key=K.get); k = ks[int(rng.integers(len(ks)))]
+    return dict(c[k][int(rng.integers(len(c[k])))])
+
+
+# ------------------------------------------------------------------ self-check
+def _check():
+    # encode: none = zeros, one-hot, clipping, layout
+    z = encode([0, 0], [5, 1], [3, 2], [1, 1], [1, 1]); assert z.shape == (2, O.N_INT) and not z.any()
+    b = encode([1, 4, 0, 7], [3.0, 40.0, 2.0, -1.0], [-2.0, 0.0, 1.0, 0.5], [1.0, 2.4, 1.0, 0.5], [1.0, 0.5, 1.0, 0.0])
+    assert b[0, 0] == 1 and b[0, 1:7].sum() == 0 and b[1, 3] == 1 and b[3, 6] == 1 and not b[2].any()
+    assert np.allclose(b[0, 7:], [0.3, -0.2, 0.1, 1.0]) and b[1, 7] == 2.5 and np.isclose(b[1, 9], 0.24) and b[3, 10] == 0
+    assert (encode(np.arange(1, 8), 0, 0, 1, 1)[:, :7] == np.eye(7)).all()
+    rng = np.random.default_rng(0)
+
+    def run(cand, ds, evs=None, rt=6.0):
+        it = new(cand, ds[0], rt); tot, ends = 0.0, []
+        for j, d in enumerate(ds[1:]):
+            ev = {"d": d, **((evs or {}).get(j, {}))}; r, e = step_reward(it, ev); tot += r; ends.append(e)
+            if e: break
+        return it, tot, ends
+
+    P = lambda k, **kw: {**dict(kind=k, q=-1, pt=(0.0, 0.0), obj=None), **kw}
+    # telescoping: a random walk that never arrives pays C x (phi(d0) - phi(d_end)) whatever the path
+    for k in ("move_to", "hold", "farm", "hide", "regroup"):
+        ds = np.r_[7.0, 7.0 + np.cumsum(rng.choice([-0.3, 0.3], 30))]; ds = np.maximum(ds, 4.6)   # stays > every r / band
+        it, tot, ends = run(P(k), ds)
+        assert abs(tot - C * (phi(new(P(k), 7.0), 7.0) - phi(new(P(k), 7.0), ds[len(ends)]))) < 1e-9, (k, tot)
+        assert ends[-1] in (None, "timeout") and (ends[-1] == "timeout") == (len(ends) == it["T"])
+    it, tot, _ = run(P("move_to"), [5.0] + [5.3, 5.0] * 19 + [5.0]); assert abs(tot) < 1e-12           # dithering earns nothing
+    it, tot, ends = run(P("move_to"), [5.0, 4.0, 3.0, 2.0, 1.0, 0.8, 0.5])                           # arrives: progress + bonus once
+    assert ends == [None, None, None, "achieved"] and np.isclose(tot, C * 4 + 0.03) and it["tot"] == tot
+    it, tot, ends = run(P("avoid"), [3.0, 5.0, 7.0, 9.5]); assert ends[-1] == "achieved" and np.isclose(tot, C * 5 + 0.03)   # min(d, R)
+    it, tot, ends = run(P("hold"), [3.0, 1.0] + [1.2] * 60)                                          # inside until the time runs out
+    assert ends[-1] == "achieved" and len(ends) == 50 and np.isclose(tot, C * 1.5 + 0.002 * 50)
+    it, tot, ends = run(P("hold"), [3.0, 1.0] + [1.2] * 10 + [3.0] * 60); assert ends[-1] == "timeout"
+    it, tot, ends = run(P("regroup"), [8.0, 6.0, 3.0]); assert ends[-1] == "achieved" and np.isclose(tot, C * 4 + 0.02)
+    it, tot, ends = run(P("regroup"), [0.5, 0.5, 1.6]); assert ends[-1] == "achieved" and np.isclose(tot, C * 1.0 + 0.02)   # away from a clump
+    it, tot, ends = run(P("hide"), [3.0, 1.0, 0.0, 0.0], {1: {"on": True, "hid": False}, 2: {"on": True, "hid": True}})
+    assert ends == [None, None, "achieved"] and np.isclose(tot, C * 3 + 0.002 + 0.02)
+    # engage: closing to 0.8 range, damage in range (capped), achieved once; then nothing more
+    E = dict(kind="engage", q=3, pt=None, obj=None)
+    it, tot, ends = run(E, [9.0, 6.0, 4.0, 4.0, 4.0], {1: {"in_range": True, "dk": 0.06}, 2: {"in_range": True, "dk": 5.0}, 3: {"got": True}})
+    assert ends == [None, None, None, "achieved"] and np.isclose(tot, C * (9.0 - 4.8) + 0.05 + 0.05), tot
+    # invalid on target loss / knocked out: no bonus, pays 0 that step
+    for ev in ({"lost": True}, {"out": True}):
+        it, tot, ends = run(E, [9.0, 8.0, 7.0], {1: ev}); assert ends == [None, "invalid"] and np.isclose(tot, C * 1.0)
+    # the per-intent cap holds for every kind under the best case (start far, damage every step, bonus)
+    for k in SPEC:
+        cand = E if k == "engage" else P(k, **({"obj": "box"} if k == "farm" else {}))
+        best = {"move_to": [50.0, 0.0], "avoid": [0.0, 20.0], "hold": [50.0] + [0.0] * 60, "engage": [50.0] + [0.0] * 60,
+                "farm": [50.0] + [0.0] * 60, "regroup": [50.0, 3.0], "hide": [50.0] + [0.0] * 60}[k]
+        ev = {j: {"in_range": True, "dk": 9.0, "box": 9.0, "got": j == 40, "on": True, "hid": j == 40} for j in range(60)}
+        it, tot, ends = run(cand, best, ev, rt=30.0); assert 0 < tot <= CAP + 1e-12 and ends[-1] == "achieved", (k, tot, ends)
+    # the sampler only returns valid targets
+    W = H = 40; walk = np.ones((H, W), bool); walk[:, 22] = False; bush = np.zeros((H, W), bool); bush[18, 17] = bush[25, 20] = True
+    scene = dict(me=(20.5 * TILE, 20.5 * TILE), range=2400.0, W=W, H=H, ring=2, walk=walk, bush=bush,
+                 foes=[[3, 22.5 * TILE, 20.5 * TILE], [4, 40 * TILE, 5 * TILE]], mates=[[1, 21.0 * TILE, 20.5 * TILE], [2, 28.5 * TILE, 20.5 * TILE]],
+                 boxes=[[18.5 * TILE, 21.5 * TILE], [20.5 * TILE, 1.0 * TILE]], cubes=[[23.5 * TILE, 23.5 * TILE]])
+    c = candidates(scene); mx, my = scene["me"]
+    assert set(c) == set(SPEC), set(c)
+    tile = lambda pt: (int(pt[0] // TILE), int(pt[1] // TILE)); dd = lambda pt: np.hypot(pt[0] - mx, pt[1] - my) / TILE
+    assert all(3 <= dd(x["pt"]) <= 8 and walk[tile(x["pt"])[::-1]] and gas_margin_t(*tile(x["pt"]), 2, W, H) >= 1 for x in c["move_to"])
+    assert [x["pt"] for x in c["avoid"]] == [(22.5 * TILE, 20.5 * TILE)]                              # the enemy 2 tiles away
+    assert [x["q"] for x in c["engage"]] == [3] and [x["q"] for x in c["regroup"]] == [1, 2]           # q 4 is 25 tiles off
+    assert sorted((x["obj"], x["pt"]) for x in c["farm"]) == [("box", (18.5 * TILE, 21.5 * TILE)), ("cube", (23.5 * TILE, 23.5 * TILE))]   # box 2: in the gas
+    assert sorted(tile(x["pt"]) for x in c["hide"]) == [(17, 18), (20, 25)]
+    seen = {}
+    for _ in range(400):
+        x = sample(scene, rng); seen[x["kind"]] = seen.get(x["kind"], 0) + 1
+        assert any(x == y for y in c[x["kind"]]), x
+    assert set(seen) == set(c) and min(seen.values()) > 20, seen                                       # every valid kind drawn
+    empty = dict(scene, foes=[], mates=[], boxes=[], cubes=[], walk=np.zeros((H, W), bool), bush=np.zeros((H, W), bool))
+    assert set(candidates(empty)) == {"avoid"} and all(2 <= dd(x["pt"]) <= 5 for x in candidates(empty)["avoid"])
+    assert candidates(dict(empty, ring=30)) == {"avoid": candidates(empty)["avoid"]} and sample(dict(empty, ring=30), rng)["kind"] == "avoid"
+    print("intent ok: %d kinds, encode, telescoping progress, bonus once, invalid on target loss, cap %.2f, sampler valid" % (len(SPEC), CAP))
+
+
+if __name__ == "__main__":
+    sys.exit(_check())

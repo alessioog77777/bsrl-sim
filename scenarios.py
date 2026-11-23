@@ -33,6 +33,8 @@ Scenarios (horizon; scored; pass; set-up details in SCENARIOS):
   mate_under_fire  15 s  trio, a mate 5 tiles away with 2 enemies 3 tiles from it: mate and agent never knocked out
   bush_memory       5 s  an enemy seen 4 tiles away for 1 s, then teleported into an adjacent bush: attacks within 20 deg
                          of it in the 2 s after >= 2x those toward a control bush at the same distance (and >= 1)
+Intents: scenario battles are tagged "intent": "none" (env_v5.Env.intents gives them the zero block), so their results
+compare across the intent / planner steps. send_step mirrors MAEnv's step command (unchanged by the intents).
 Damage: NbePlayer.damage_dealt / damage_taken are per step (the host clears them after every response), so scores
 sum them over the episode's steps.
 Trainer hook (train_ppo / train_fast --eval-scenarios 1, every --scenario-every-th eval): the items queue on the eval
@@ -305,7 +307,8 @@ def battle_cfg(it, native=False):
     if sp["team"] > 1: div["team_groups"] = groups
     sd = SEED0 + zlib.crc32(("%s:%s:%d:%d" % (it["name"], it["loc"], it["pick"], it["seed"])).encode()) % 1_000_000
     tag = {"kind": "evalscn", "scn": it["name"], "loc": it["loc"], "chr": chr_, "team_size": sp["team"], "groups": groups,
-           "sliders": [float(v) for v in O.preset_vec("balanced")], "preset": "balanced", "item": dict(it)}
+           "sliders": [float(v) for v in O.preset_vec("balanced")], "preset": "balanced", "item": dict(it),
+           "intent": "none"}   # fixed (env_v5.Env.intents): scenario results compare across the intent / planner steps
     cfg = {"seed": sd, "ctl": [0], "end": "agents", "div": div, "tag": tag,
            "scenario": {"name": it["name"], "tiles": lay["tiles"], "extra": lay["extra"], "park": lay["park"], "k": lay["k"]}}
     if native: cfg["native_ctl"] = True
@@ -667,7 +670,7 @@ def _check():
         for name in SCENARIOS:
             for loc in MAPS:
                 L = layouts(name, loc); assert len(L) == 4, (name, loc, len(L)); n_real += 1
-        cfg = battle_cfg(items(["mate_under_fire"])[0]); assert cfg["div"]["team_groups"] == TRIO and cfg["tag"]["kind"] == "evalscn"
+        cfg = battle_cfg(items(["mate_under_fire"])[0]); assert cfg["div"]["team_groups"] == TRIO and cfg["tag"]["kind"] == "evalscn" and cfg["tag"]["intent"] == "none"
     print("scenarios ok: %d scenarios, specs, layouts on a synthetic map, scores / pass rules%s" % (
         len(SCENARIOS), ", 4 layouts each on %s" % ", ".join(MAPS) if n_real else ""))
 
@@ -679,7 +682,7 @@ def run(a):
     import torch
     import env_v5 as E, obs_v5 as O
     from model import Policy, HID, dist_logp_ent
-    from train_ppo import priv
+    from train_ppo import priv, policy_s
     its = items([x for x in a.only.split(",") if x] or None, a.seeds); queue = list(its)
     out = a.out or os.path.join(E.WORK, "scenarios", "native" if a.native else os.path.splitext(os.path.basename(a.ckpt or "fresh"))[0])
     os.makedirs(out, exist_ok=True)
@@ -701,7 +704,7 @@ def run(a):
             if all(s.state == "idle" for s in env.I): break
             if not len(ids): continue
             if t0 is None: t0 = time.time()
-            o = ob.build(obs["vec"], obs["grid"], env.last_meta, ids); s = np.concatenate([o["self"], env.cond(ids)], 1)
+            o = ob.build(obs["vec"], obs["grid"], env.last_meta, ids); s = policy_s(env, ids, o)
             h = np.stack([hid.get(int(x), z) for x in ids])
             with torch.no_grad():
                 lg, _, h2 = net(T(s), T(o["ent"]), T(o["grid"], torch.uint8), T(h), T(priv(env, ids)))

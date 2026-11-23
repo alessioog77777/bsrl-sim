@@ -15,12 +15,21 @@ trace and puts the scores / pass into the agent's episode row ("scn").
 Aux-head labels (trainer --aux-w, model.Policy.aux), from the sim's true state: `Env.aux_now(ids)` at poll time (AUX
 row: true positions, alive enemies, own index, gas margin, hidden enemies in bushes by sector), and the enemy damage
 taken per step `te` in every transition's terms.
+Intents (intent.py, behaviour design 4; on iff Env.intent_scale > 0 = trainer --intent-scale): `Env.intents(ids, o,
+cond)` after the observation build gives the (B, N_INT) block of s (all zeros when off). Per agent and battle: free
+(always none) or steered (p_steer); a steered agent's planner tick (every INTENT_EVERY decisions, staggered by player
+index, and the decision right after an achieved end) with no active intent picks a random valid intent with
+p_rand_intent, the planner's (step E: Env.planner, p_plan; 0 until then) or none. Battles tagged "intent": "none"
+(evals, scenarios) and native-AI battles (BC) stay none. The world target is kept per agent; reward and ends are
+computed in _finish_step on the true positions: reward += intent_scale x intent.step_reward, transition term "i_rew"
+(the scaled part; the trainers' rew_int), episode rows "intents" {kind: [started, achieved, timeout, invalid]},
+"intent_mode" free | steered and terms "i_rew".
 """
 import argparse, json, os, re, sys, time
 import numpy as np
-from nbpc import diversity as D, proto as P
+from nbpc import diversity as D, proto as P, fair as FAIR
 from nbpc.maenv import MAEnv
-import obs_v5 as O
+import obs_v5 as O, intent as I
 
 SKIP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skip.json")   # {"brawlers": [...], "locations": [...]}
 
@@ -89,6 +98,7 @@ def make_battle_fn(agents=10, seed0=10_000_000, roster=None, locs=None, p_team=0
 
 SL = O.SLIDERS
 _COVER = [O.SEG.index(c) for c in ("indestructible", "destructible_wall", "fragile_wall", "bouncer", "gravity", "destructible")]
+_WALK = [O.SEG.index(c) for c in ("floor", "bush", "slow_tile", "fast_tile", "ice")]   # where a random move_to / hold point may be
 _PL = ("x", "y", "hp", "max_hp", "damage_dealt", "bomb_damage", "damage_taken", "gas_damage", "box_damage", "cubes",
        "cubes_total", "in_gas", "kills")
 # behaviour counters per player and battle (row["beh"]; scorecard's per-preset / slider-slope metrics), steps unless noted:
@@ -128,14 +138,14 @@ def sample_sliders(rng, n, mode="uniform"):
 
 
 def slider_map(sl, tiles, W, H):
-    """sl["bush"] / sl["nearcover"] (cover within 2 tiles) from the host's tile ids (H*W,), in place; Env calls it again
-    whenever the live tiles change (a bush or wall destroyed)"""
+    """sl["bush"] / sl["nearcover"] (cover within 2 tiles) / sl["walk"] (intent points) from the host's tile ids (H*W,),
+    in place; Env calls it again whenever the live tiles change (a bush or wall destroyed)"""
     t = O._tile_lut()[np.clip(np.asarray(tiles).reshape(H, W) % 1000000 + 1, 0, 255)] if tiles is not None else np.zeros((H, W), np.uint8)
     cover = np.pad(np.isin(t, _COVER), 2)
     near = np.zeros((H, W), bool)
     for dy in range(5):
         for dx in range(5): near |= cover[dy:dy + H, dx:dx + W]
-    sl["bush"], sl["nearcover"] = t == O.SEG.index("bush"), near
+    sl["bush"], sl["nearcover"], sl["walk"] = t == O.SEG.index("bush"), near, np.isin(t, _WALK)
     return sl
 
 
@@ -159,6 +169,16 @@ def gas_margin(x, y, ring, W, H):
     (NbeResp.reserved[0], 1 tile per step)"""
     tx, ty = np.clip(np.asarray(x) // 300, 0, W - 1), np.clip(np.asarray(y) // 300, 0, H - 1)
     return np.minimum(np.minimum(tx, ty), np.minimum(W - 1 - tx, H - 1 - ty)) - ring, (np.minimum(W, H) - 1) / 2.0 - ring
+
+
+def fair_vis(x, y, inb, W):
+    """the fair visibility of nbpc.fair on true positions (10,): screen[q, p] = p is on q's screen (camera x clamped to
+    [3000, W x 300 - 3000], |dx| < 4500, -3500 < dy < 2900), sees[q, p] = and not hidden in a bush (on a bush tile,
+    > 900 away); d = distances (units)"""
+    d = np.hypot(x[None, :] - x[:, None], y[None, :] - y[:, None])
+    camx = np.clip(x, 3000.0, W * 300 - 3000.0); ry = y[None, :] - y[:, None]
+    screen = (np.abs(x[None, :] - camx[:, None]) < 4500) & (ry > -3500) & (ry < 2900)
+    return screen, screen & ~(inb[None, :] & (d > 900)), d
 
 
 def slider_terms(sl, pl, n=10, ring=0):
@@ -280,7 +300,8 @@ class Env(MAEnv):
     weights 0-2 per battle (tag "sliders": fixed, one vector for every player or one per player; else sample_sliders
     with slider_sample); reward += slider_scale x sum(weight x slider_norm x term). The transitions' terms carry the raw
     terms ("s_<slider>"); the episode rows carry the raw sums ("s_<slider>"), the reward they gave ("sn_<slider>"), the
-    weights ("sliders"), the sums of |term| ("sa_<slider>", slider_norm's measure) and the behaviour counters ("beh", BEH)."""
+    weights ("sliders"), the sums of |term| ("sa_<slider>", slider_norm's measure) and the behaviour counters ("beh", BEH).
+    Intents (module doc): intents(ids, o, cond) -> the block; reward += intent_scale x intent reward (term "i_rew")."""
     crashes = []
     slider_scale = 1.0
     slider_sample = "uniform"     # train --slider-sample
@@ -297,6 +318,25 @@ class Env(MAEnv):
     # of host time per request (us_state 575 vs 530 us), ~4.5 us per step at k = 10; the rebuild (~120 us) only when a tile
     # changed (live_check: ~1.7 refreshes per battle)
     MAP_EVERY = 10
+    # intents (module doc; intent.py): off at intent_scale 0 (block all zeros, no reward, no random draws)
+    intent_scale = 0.0             # train --intent-scale (start 0.25)
+    p_steer, p_rand_intent = 0.7, 0.3   # train --p-steer, --p-rand-intent (design 4.4)
+    p_plan, planner = 0.0, None    # step E: the rule planner's share at a tick and the planner (None: no planner yet)
+    intent_jitter = O.NOISE["jitter"]   # per-episode sigma range of the target offset noise (10-tile units; trainer --noise 0: none)
+    INTENT_EVERY = 10              # decisions between planner ticks (1 s at ticks 2)
+
+    def __init__(self, *a, **kw):
+        self._irng = np.random.default_rng([int(kw.get("seed", 0)), 44])   # intents' own stream: the battle draws stay as without
+        super().__init__(*a, **kw)
+
+    def _ir(self):
+        r = getattr(self, "_irng", None)
+        if r is None: r = self._irng = np.random.default_rng([0, 44])
+        return r
+
+    def _gather(self):
+        out = super()._gather(); self.last_vec = out[0]["vec"]   # the fair state2 rows of this poll (intents: boxes / cubes in view)
+        return out
 
     def _flags(self):
         return super()._flags() | (P.F_REC if self.record else 0) | (P.F_MAP if getattr(self, "_map_now", False) else 0)
@@ -349,6 +389,7 @@ class Env(MAEnv):
                                   "terms": {}, "storm_death": 0, "truncated": True, "restart": False, "tag": s.cfg.get("tag"), "ctl": s.ctl,
                                   "invalid": "agent out after the scenario set-up", "scn": None})
         s.hold = {}                                      # player -> its final transition, held until the team's rank is known
+        s.it = {}                                        # player -> intent state (Env.intents)
         tag = s.cfg.get("tag") or {}
         s.sl = slider_state(s.map_tiles, s.W, s.H, tag.get("chr", []), self.rng, w=tag.get("sliders"), mode=self.slider_sample)
         s.map_hash = int(r.map_hash)
@@ -387,6 +428,7 @@ class Env(MAEnv):
         s.wprev = wait
         shaped = {}; s.hud = self._hud(s, r)             # cond's HUD numbers for the next poll (a reset sets them anew)
         te = [max(r.pl[p].damage_taken - r.pl[p].gas_damage, 0) / 1000.0 for p in range(10)]   # enemy damage taken (aux hit label)
+        irew = self._intent_step(s, r) if self.intent_scale and getattr(s, "it", None) else {}   # from r before a reset
         if self.cube_k:                                  # B3, from r before super() may reset the instance
             for p in list(s.ep):
                 pl = r.pl[p]; after = 0 if (pl.eliminated or not pl.alive) and p not in wait else int(pl.cubes_total)
@@ -397,7 +439,12 @@ class Env(MAEnv):
             if p in back - elim: rew -= self.w.get("hp", 0) * t["hp"]; t = {**t, "hp": 0.0}   # respawn refill is no hp gain
             if p in shaped: rew += shaped[p] - self.w.get("cubes", 0) * t["cubes"]; t = {**t, "cube_shaped": shaped[p]}
             if fin: self.dead_aids.discard(aid)
-            self._trans[k] = (aid, rew + float(extra[p]), fin, {**t, **{"s_" + m: float(v) for m, v in zip(SL, T[p])}, "_act": lab.get(p), "dead": float(p in wait), "te": te[p]}, rank)
+            ix = {}
+            if self.intent_scale:                        # the intent reward (scaled) in rew and as term i_rew
+                ix = {"i_rew": self.intent_scale * irew.get(p, 0.0)}; st = s.it.get(p)
+                if st is not None: st["sum"] += ix["i_rew"]
+            self._trans[k] = (aid, rew + float(extra[p]) + ix.get("i_rew", 0.0), fin, {**t, **{"s_" + m: float(v) for m, v in zip(SL, T[p])},
+                              "_act": lab.get(p), "dead": float(p in wait), "te": te[p], **ix}, rank)
         if g.any():                                      # duo / trio: placement = the team's (Solo Showdown underneath)
             for k in range(len(self._trans) - 1, n0 - 1, -1):
                 p = self._trans[k][0] & 15
@@ -413,8 +460,145 @@ class Env(MAEnv):
             row["terms"].update({"sn_" + m: round(float(v), 4) for m, v in zip(SL, sl["sumw"][p])})
             row["terms"].update({"sa_" + m: round(float(v), 4) for m, v in zip(SL, sl["asum"][p])})
             row["beh"] = {k: round(float(v), 3) for k, v in zip(BEH, sl["beh"][p])}
+            st = getattr(s, "it", {}).get(p) if self.intent_scale else None
+            if st is not None:
+                row["ret"] += st["sum"]; row["terms"]["i_rew"] = round(st["sum"], 4); row["intent_mode"] = "steered" if st["steer"] else "free"
+                row["intents"] = {k: list(v) for k, v in st["cnt"].items() if v[0]}
             if getattr(s, "scn", None) is not None and p == 0 and (row["tag"] or {}).get("scn"):   # the scenario's agent
                 row["scn"] = {"name": s.scn["name"], "item": s.scn["item"], "battle": s.scn["battle"], "pre": s.scn["pre"], **SC().score(s.scn)}
+
+    # ------------------------------------------------------------------ intents (intent.py, design 4)
+    def intents(self, ids, o=None, cond=None):
+        """(B, N_INT) intent blocks of the agents of the last poll() (intent.encode; all zeros when intents are off).
+        Runs the planner ticks: a steered agent with no active intent picks one at its tick (decision n with
+        (n + player) % INTENT_EVERY == 0, or the decision after an achieved end; not while respawning). The offset is the
+        target's true world point (an anchored player: where it is now) minus the true own position, plus the episode's
+        detector jitter. o / cond (this poll's observation / conditioning rows) are for the planner (step E)."""
+        ids = np.asarray(ids, np.int64); B = len(ids)
+        if not self.intent_scale or not B: return np.zeros((B, O.N_INT), np.float32)
+        by = {s.battle: s for s in self.I}; rg = self._ir(); ws = {}
+        kind, dx, dy, rad, lf = np.zeros(B, np.int64), np.zeros(B), np.zeros(B), np.zeros(B), np.zeros(B)
+        for b, a in enumerate(ids):
+            s, p = by[int(a) >> 4], int(a) & 15
+            if getattr(s, "it", None) is None: s.it = {}
+            st = s.it.get(p) or self._intent_agent(s, p)
+            tick = (st["n"] + p) % self.INTENT_EVERY == 0 or st["replan"]; st["n"] += 1
+            w = ws.get(s.battle)
+            if st["act"] is None and tick:
+                st["replan"] = False
+                if st["steer"] and int(a) not in self.dead_aids:
+                    w = ws[s.battle] = w or self._world(s)
+                    c = self._choose(s, p, b, w, o, cond)
+                    if c is not None: self._intent_start(s, p, st, c, w)
+            it = st["act"]
+            if it is None: continue
+            w = ws[s.battle] = w or self._world(s)
+            tx, ty = (w["x"][it["q"]], w["y"][it["q"]]) if it["q"] >= 0 else it["pt"]
+            nz = rg.normal(0.0, st["jit"], 2) * 10.0 if st["jit"] > 0 else np.zeros(2)   # 10-tile units -> tiles
+            kind[b] = I.K[it["kind"]]; dx[b] = (tx - w["x"][p]) / 300.0 + nz[0]; dy[b] = (ty - w["y"][p]) / 300.0 + nz[1]
+            rad[b] = it["r"]; lf[b] = I.left(it)
+        return I.encode(kind, dx, dy, rad, lf)
+
+    def _intent_agent(self, s, p):
+        """per agent and battle: free (always none) or steered (p_steer); tag "intent" set (evals / scenarios: "none") or a
+        native-AI battle (BC): free"""
+        rg = self._ir(); fixed = (s.cfg.get("tag") or {}).get("intent") is not None or bool(s.cfg.get("native_ctl"))
+        st = s.it[p] = {"steer": (not fixed) and rg.random() < self.p_steer, "n": 0, "act": None, "replan": False,
+                        "jit": float(rg.uniform(*self.intent_jitter)), "cnt": {k: [0, 0, 0, 0] for k in I.SPEC}, "sum": 0.0}
+        return st
+
+    def _world(self, s, r=None):
+        """true state of a battle for the intents: positions, up (alive, not respawning), team, own tile, bush, fair_vis"""
+        r = r if r is not None else s.inst.resp; pl = r.pl; H, W = s.sl["bush"].shape
+        x = np.array([pl[q].x for q in range(10)], np.float64); y = np.array([pl[q].y for q in range(10)], np.float64)
+        up = np.array([bool(pl[q].alive) and not pl[q].eliminated and pl[q].reserved[3] <= 0 for q in range(10)])
+        tx, ty = np.clip(x // 300, 0, W - 1).astype(int), np.clip(y // 300, 0, H - 1).astype(int); inb = s.sl["bush"][ty, tx]
+        screen, sees, _ = fair_vis(x, y, inb, W)
+        return {"x": x, "y": y, "up": up, "team": np.array([pl[q].reserved[2] for q in range(10)]), "tx": tx, "ty": ty, "inb": inb,
+                "screen": screen, "sees": sees, "W": W, "H": H, "ring": int(r.reserved[0])}
+
+    def _scene(self, s, p, b, w):
+        """intent.candidates' scene of agent p (row b of the last poll): the enemies it sees and the mates on its screen
+        (true positions), the boxes / cubes in its fair state2 row (exact positions), the live walk / bush masks"""
+        x, y, team = w["x"], w["y"], w["team"]; oth = w["up"].copy(); oth[p] = False
+        foes = [[q, x[q], y[q]] for q in np.flatnonzero(oth & (team != team[p]) & w["sees"][p])]
+        mates = [[q, x[q], y[q]] for q in np.flatnonzero(oth & (team == team[p]) & w["screen"][p])]
+        boxes = cubes = np.zeros((0, 2))
+        v = getattr(self, "last_vec", None)
+        if v is not None and b < len(v):
+            bx = v[b, FAIR.BX0:FAIR.BX0 + FAIR.BX_K * FAIR.BX_F].reshape(FAIR.BX_K, FAIR.BX_F)
+            it = v[b, FAIR.IT0:FAIR.IT0 + FAIR.IT_K * FAIR.IT_F].reshape(FAIR.IT_K, FAIR.IT_F)
+            at = lambda blk: np.stack([x[p] + blk[:, 1] * FAIR.R, y[p] + blk[:, 2] * FAIR.R], 1)
+            boxes = at(bx[bx[:, 0] > 0.5]); cubes = at(it[(it[:, 0] > 0.5) & (it[:, 3] > 0.5)])
+        return {"me": (x[p], y[p]), "range": float(s.sl["range"][p]), "W": w["W"], "H": w["H"], "ring": w["ring"],
+                "walk": s.sl["walk"], "bush": s.sl["bush"], "foes": foes, "mates": mates, "boxes": boxes, "cubes": cubes}
+
+    def _choose(self, s, p, b, w, o, cond):
+        """a steered agent's planner tick with no active intent -> an intent.new candidate or None (none for this second).
+        One draw u: u < p_plan -> the planner (step E plugs in here: self.planner.plan(env, s, p, b, w, o, cond), may return
+        None = none); u < p_plan + p_rand_intent -> a random valid intent (intent.sample); else none. Preemption of an
+        active intent (design 4.4: gas rule / target moved > 2 tiles) is E's too: intents() only ticks without one."""
+        u = self._ir().random()
+        if self.planner is not None and u < self.p_plan: return self.planner.plan(self, s, p, b, w, o, cond)
+        if u < self.p_plan + self.p_rand_intent: return I.sample(self._scene(s, p, b, w), self._ir())
+        return None
+
+    def _intent_start(self, s, p, st, c, w):
+        tx, ty = (w["x"][c["q"]], w["y"][c["q"]]) if c.get("q", -1) >= 0 else c["pt"]
+        d0 = np.hypot(tx - w["x"][p], ty - w["y"][p]) / 300.0
+        st["act"] = I.new(c, d0, s.sl["range"][p] / 300.0, steps_per_s=max(1, 20 // self.ticks)); st["cnt"][c["kind"]][0] += 1
+
+    def _raw_has(self, s, r, p, pt, obj):
+        """is a box / cube still at pt (within 1 tile)? From agent p's raw state2 row of this response (the nearest 6 boxes /
+        8 items, any distance); True when the list is full and ends before pt (cannot tell)"""
+        if not (int(getattr(r, "obs_written", 0)) >> p) & 1: return True
+        NV = P.OBS_VEC; v = np.asarray(s.inst.obs_f32[p * (NV + P.OBS_GRID):p * (NV + P.OBS_GRID) + NV])
+        if obj == "box": blk = v[FAIR.BX0:FAIR.BX0 + FAIR.BX_K * FAIR.BX_F].reshape(FAIR.BX_K, FAIR.BX_F); listed = blk[:, 0] > 0.5; mine = listed
+        else: blk = v[FAIR.IT0:FAIR.IT0 + FAIR.IT_K * FAIR.IT_F].reshape(FAIR.IT_K, FAIR.IT_F); listed = blk[:, 0] > 0.5; mine = listed & (blk[:, 3] > 0.5)
+        mx, my = float(r.pl[p].x), float(r.pl[p].y); ex, ey = mx + blk[:, 1] * FAIR.R, my + blk[:, 2] * FAIR.R
+        if (np.hypot(ex - pt[0], ey - pt[1])[mine] <= 300).any(): return True
+        far = np.hypot(ex - mx, ey - my)[listed].max() if listed.any() else 0.0
+        return bool(listed.all() and far < np.hypot(pt[0] - mx, pt[1] - my) + 300)
+
+    def _intent_step(self, s, r):
+        """the active intents of battle s over the step that produced r (true state) -> {player: intent reward before
+        intent_scale}; ends counted per kind, an achieved end asks for a re-plan at the next decision"""
+        act = {p: st for p, st in s.it.items() if st["act"] is not None}
+        if not act: return {}
+        w = self._world(s, r); pl = r.pl; x, y, up, team = w["x"], w["y"], w["up"], w["team"]; out = {}
+        dk = np.array([(pl[q].damage_dealt + pl[q].bomb_damage) / 1000.0 for q in range(10)])
+        te = np.array([max(pl[q].damage_taken - pl[q].gas_damage, 0) for q in range(10)])
+        for p, st in act.items():
+            it = st["act"]; k, q, t, sps = it["kind"], it["q"], it["t"] + 1, it["sps"]   # t: the step being scored
+            px, py = (x[q], y[q]) if q >= 0 else it["pt"]; d = float(np.hypot(px - x[p], py - y[p]) / 300.0)
+            ev = {"d": d, "out": not up[p], "dk": dk[p], "box": pl[p].box_damage / 1000.0}; lost = got = False
+            if q >= 0:
+                seen = w["sees"][p, q] if team[q] != team[p] else w["screen"][p, q]
+                if k == "engage":
+                    ev["in_range"] = d <= it["range"]
+                    if dk[p] > 0 and ev["in_range"] and te[q] > 0: it["hit_t"] = t
+                    if not up[q]: got = pl[p].kills > 0 or t - it["hit_t"] <= I.HIT_S * sps; lost = not got
+                elif not up[q]: lost = True
+            else:
+                seen = k != "farm" or bool(I.on_screen(x[p], y[p], px, py, w["W"]))   # unseen rule: anchored targets (players, farm objects)
+                gx, gy = min(max(int(px // 300), 0), w["W"] - 1), min(max(int(py // 300), 0), w["H"] - 1)
+                if k == "farm":
+                    if I.gas_margin_t(gx, gy, w["ring"], w["W"], w["H"]) < 0: lost = True
+                    elif it["obj"] == "box":
+                        if pl[p].box_damage > 0: it["box_t"] = t
+                        if not self._raw_has(s, r, p, (px, py), "box"): got = t - it["box_t"] <= I.HIT_S * sps; lost = not got
+                    elif pl[p].cubes > 0 and d <= I.PICK: got = True
+                    elif not self._raw_has(s, r, p, (px, py), "cube"): lost = True
+                elif k == "hide":
+                    if not s.sl["bush"][gy, gx]: lost = True
+                    en = up & (team != team[p])
+                    hid = w["inb"][p] and not (en & w["sees"][:, p]).any() and (en & w["screen"][:, p]).any()   # env slider_terms hid_vs
+                    ev["on"] = (w["tx"][p], w["ty"][p]) == (gx, gy); ev["hid"] = hid or not (en & w["sees"][p]).any()
+            it["unseen"] = 0 if seen else it["unseen"] + 1
+            ev["lost"] = lost or (not got and it["unseen"] >= I.SEEN_S * sps); ev["got"] = got
+            out[p], end = I.step_reward(it, ev)
+            if end: st["cnt"][k][1 + I.END.index(end)] += 1; st["act"] = None; st["replan"] = end == "achieved"
+        return out
 
     def aux_now(self, ids):
         """(B, AUX_W) aux-head labels of the agents of the last poll() from the true state of their battle's current
@@ -600,7 +784,8 @@ def _check():
     finally: MAEnv._finish_step = sup
     assert np.isclose(env._trans[-1][3]["te"], 0.5), env._trans[-1][3]          # aux hit label: enemy damage only
     _check_aux(players, tiles, bush, NS)
-    print("env_v5 sliders ok")
+    _check_intents(players, tiles, NS)
+    print("env_v5 sliders, aux labels, intents ok")
 
 
 def _check_aux(players, tiles, bush, NS):
@@ -619,6 +804,62 @@ def _check_aux(players, tiles, bush, NS):
     assert A["gm"][0] == 14 - 3, A["gm"]                    # tile (15, 14) on a 60 x 40 map, storm ring 3
     assert np.flatnonzero(A["be"][0]).tolist() == [2, 5], A["be"][0]   # p1 below (90 deg), p6 up-left (225 deg)
     assert np.flatnonzero(A["be"][2]).tolist() == [3] and env.aux_now([]).shape == (0, AUX_W)   # p2: p1 down-left 1485 away; p3 750 away = seen
+
+
+def _check_intents(players, tiles, NS):
+    """Env.intents and the intent reward in _finish_step on a synthetic solo battle (agents p0, p3): off = zeros and no
+    state; tag "intent" none / native-AI battles = free; the staggered ticks; the block's encoding; signed progress into
+    rew and term i_rew (x intent_scale); achieved -> counts + a re-plan at the next decision; engage invalid when the
+    target goes down without my damage, achieved after it; a box broken by me (raw state2 row); the episode row"""
+    NW = P.OBS_VEC + P.OBS_GRID
+    mk = lambda **o: NS(pl=players(**o), fin=[0] if o.get("p0_eliminated") else [], over=0, tick=1, njumps=0, jumps=[], done=0,
+                        alive=10, winner=-1, reserved=[0] * 8, obs_written=1)
+    def battle(tag=None, **cfg):
+        sl = slider_state(tiles.ravel(), 60, 40, ["Sniper"] * 10, np.random.default_rng(0))
+        return NS(sl=sl, cfg={"tag": {"groups": [0] * 10, **(tag or {})}, **cfg}, hold={}, battle=1, pos={}, ptick=0, pjump=set(),
+                  agents={0: 16, 3: 19}, wprev=set(), it={}, inst=NS(resp=mk(), obs_f32=np.zeros(10 * NW, np.float32)))
+    def fake(self, i, r):                                # MAEnv._finish_step stand-in: base reward 0, p0's row when it is out
+        for p, aid in self.I[i].agents.items(): self._trans.append((aid, 0.0, p in r.fin, {"hp": 0.0, "place": 0.0, "win": 0.0}, None))
+        for p in r.fin: self.episodes.append({"player": p, "ret": 0.0, "terms": {}})
+    def step(r):
+        env.I[0].inst.resp = r; n0 = len(env._trans); sup, MAEnv._finish_step = MAEnv._finish_step, fake
+        try: env._finish_step(0, r)
+        finally: MAEnv._finish_step = sup
+        return {a & 15: (rw, t) for a, rw, _, t, _ in env._trans[n0:]}
+    env = Env.__new__(Env); env._trans, env.episodes, env.w, env.slider_scale, env.ticks, env.dead_aids = [], [], {}, 0.0, 2, set()
+    env.I = [battle()]; ids = np.array([16, 19])
+    assert not env.intents(ids).any() and env.I[0].it == {} and "i_rew" not in step(mk())[0][1]   # off: zeros, no state, no term
+    env.intent_scale, env.p_steer, env.p_rand_intent, env.intent_jitter = 0.25, 1.0, 1.0, (0.0, 0.0)
+    for tag, cfg in (({"intent": "none"}, {}), ({}, {"native_ctl": True})):       # eval / scenario tag, BC: always none
+        env.I = [battle(tag, **cfg)]
+        assert not any(env.intents(ids).any() for _ in range(12)) and not env.I[0].it[0]["steer"]
+    env.I = [battle()]; first = {}
+    for n in range(10):                                  # ticks staggered by player: p0 at its decision 0, p3 at 7
+        blk = env.intents(ids); first.update({int(a): n for b, a in enumerate(ids) if blk[b].any() and int(a) not in first})
+    assert first == {16: 0, 19: 7}, first
+    s = env.I[0]; st = s.it[0]; mv = lambda: I.new(dict(kind="move_to", q=-1, pt=(1650.0 + 1500, 1650.0)), 5.0)
+    st["act"] = mv(); st["cnt"]["move_to"][0] += 1; blk = env.intents(ids[:1])[0]
+    assert blk[I.K["move_to"] - 1] == 1 and blk[:7].sum() == 1 and np.allclose(blk[O.I_XY:], [0.5, 0, 0.1, 1.0]), blk
+    tr = step(mk(p0_x=2250)); assert np.isclose(tr[0][0], 0.25 * 0.01 * 2) and np.isclose(tr[0][1]["i_rew"], tr[0][0])   # 2 tiles closer
+    assert np.isclose(env.intents(ids[:1])[0, O.I_LEFT], 1 - 1 / 40)
+    tr = step(mk(p0_x=3150)); assert np.isclose(tr[0][0], 0.25 * (0.01 * 3 + 0.03)) and st["act"] is None and st["replan"]   # arrived
+    assert st["cnt"]["move_to"][1] == 1 and env.intents(ids[:1]).any() and not st["replan"]   # re-planned at once (off its tick)
+    st["act"] = mv(); st["cnt"]["move_to"][0] += 1
+    tr = step(mk(p0_x=1050)); assert tr[0][0] < 0                               # away from it: negative (signed progress)
+    e = lambda: I.new(dict(kind="engage", q=1, pt=None), 10.0, 10.0)
+    st["act"] = e(); n_inv = st["cnt"]["engage"][3]
+    tr = step(mk(p1_eliminated=1)); assert tr[0][0] == 0 and st["act"] is None and st["cnt"]["engage"][3] == n_inv + 1   # someone else's kill
+    st["act"] = e(); step(mk(p0_damage_dealt=600, p1_damage_taken=600)); tr = step(mk(p1_eliminated=1))
+    assert st["cnt"]["engage"][1] == 1 and tr[0][0] >= 0.25 * 0.05 and st["replan"]
+    raw = s.inst.obs_f32.reshape(10, NW); o = FAIR.BX0; raw[0, o:o + 5] = [1, 900 / FAIR.R, 0, 1, 0.43]   # a box 3 tiles right of p0
+    st["act"] = I.new(dict(kind="farm", q=-1, pt=(1650.0 + 900, 1650.0), obj="box"), 3.0)
+    tr = step(mk(p0_box_damage=1000)); assert np.isclose(tr[0][0], 0.25 * 0.03) and st["act"] is not None   # box part (capped)
+    raw[0, o:o + 5] = 0; tr = step(mk()); assert np.isclose(tr[0][0], 0.25 * 0.03) and st["cnt"]["farm"][1] == 1   # broken by me
+    st["act"] = mv(); st["cnt"]["move_to"][0] += 1
+    tr = step(mk(p0_eliminated=1)); assert tr[0][0] == 0 and st["cnt"]["move_to"][3] >= 1                  # knocked out: invalid
+    row = env.episodes[-1]; got = sum(t.get("i_rew", 0.0) for a, _, _, t, _ in env._trans if a == 16)
+    assert np.isclose(row["terms"]["i_rew"], round(got, 4)) and np.isclose(row["ret"], got) and row["intent_mode"] == "steered"
+    assert row["intents"] == {k: v for k, v in st["cnt"].items() if v[0]} and row["intents"]["move_to"][3] == 1, row
 
 
 TEAM_SLIDERS = ("protect", "leash")   # fire only with a mate: normalised over team battles

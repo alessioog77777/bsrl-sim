@@ -11,6 +11,8 @@
     o["grid"] (B, 25, 25) uint8  seg class id (SEG) per tile around the player, UNKNOWN outside the camera view
     cond(brawler, sliders, team_size, cubes, left) (30,)  own brawler stats + behaviour weights + team size + HUD numbers
     preset_vec(name) (12,)  the slider weights of a named play-style mode (PRESETS: balanced, bush_camper, aggressive, ...)
+    intent block (N_INT 11): one-hot of INTENTS 1..7 | dx, dy | radius | time left (intent.encode; env_v5.Env.intents)
+    policy input s = cat[self (8), cond (30), intent (11)] (N_S = 49; S_INT = 38 = the block's offset)
 
 Source = the host's state2 vector + grid after nbpc.fair (already camera- and bush-limited). Needs the rl-round
 host `nbhost_rl` (enemy features 14 / 15 = summon / on my team, self 18 = hypercharge fraction, grid channel 0 =
@@ -39,8 +41,14 @@ ENT = ("enemy", "teammate", "enemy_summon", "teammate_summon", "power_box", "pow
 SLIDERS = ("bush_camp", "collect", "protect", "retreat", "kite", "peek", "focus", "aggressive", "third_party", "bush_control",
            "leash", "gas_safe")
 # v5.3: + 4 area-effect columns (RAD, HARM, HELP, SLOW) at the end of each entity row; v5.4: slider 7 push -> aggressive,
-# + sliders leash / gas_safe at the end of cond (COND_SLIDERS)
-OBS_VERSION = "v5.4"
+# + sliders leash / gas_safe at the end of cond (COND_SLIDERS); v5.5: + the intent block (N_INT) at the end of s
+OBS_VERSION = "v5.5"
+# per-second goals (intent.py, behaviour design 4): block = one-hot of kinds 1..7 (none = all zeros) | dx, dy (10-tile
+# units, clip +-2.5) | radius / 10 tiles | time left 1 -> 0. s = cat[self, cond, intent]: at the tail, so an older
+# checkpoint's vec.0 zero-pads those columns and free play (none) is exactly its input
+INTENTS = ("none", "move_to", "avoid", "hold", "engage", "farm", "regroup", "hide")
+N_INT = len(INTENTS) - 1 + 4
+I_XY, I_RAD, I_LEFT = len(INTENTS) - 1, len(INTENTS) + 1, len(INTENTS) + 2   # block columns after the one-hot
 N_SELF, N_ENT, F_ENT, G = 8, F.EN_K + F.PJ_K + F.BX_K + F.IT_K, 1 + len(ENT) + 9, 25
 XY, VEL, HP, RAD = 1 + len(ENT), 3 + len(ENT), 5 + len(ENT), 6 + len(ENT)   # RAD, RAD + 1..3 = radius, harms / helps / slows me
 F_ENT_V52 = 1 + len(ENT) + 5             # entity row width up to v5.2 (model.load_state_dict pads old checkpoints)
@@ -49,6 +57,8 @@ N_COND_V53 = 28                          # cond width up to v5.3 (10 sliders); t
 # cond index of each slider (order SLIDERS): the first 10 after the 13 stats, the ones added later at the end, so an older
 # checkpoint's input weights zero-pad at the end (model.load_state_dict) and act the same
 COND_SLIDERS = np.r_[13:23, N_COND_V53:N_COND]
+N_S = N_SELF + N_COND + N_INT            # policy vector input s = cat[self, cond, intent]; S_INT = the intent block's offset
+S_INT = N_SELF + N_COND
 LEFT0 = {1: 10, 2: 5, 3: 4}              # teams left at the start by team size (sim trio = 3 x 3 + 1 solo, live 4 x 3)
 _S, _E = SEG.index, ENT.index
 _AREA_C = [ENT.index("enemy_area_effect"), ENT.index("teammate_area_effect")]
@@ -453,8 +463,10 @@ def _check():
     pv = np.stack([preset_vec(k) for k in PRESETS])
     assert pv.shape == (len(PRESETS), len(SLIDERS)) and pv.min() >= 0 and pv.max() <= 2 and (preset_vec("balanced") == 1).all()
     assert preset_vec("bush_camper")[SLIDERS.index("bush_camp")] == 2 and len({tuple(r) for r in pv}) == len(PRESETS)
-    print("obs_v5 ok: %d brawlers, %d thrown, %d melee, cond %d, ent %dx%d" % (
-        len(hs), st[:, 6].sum(), st[:, 7].sum(), N_COND, N_ENT, F_ENT))
+    assert N_INT == 11 and len(INTENTS) == 8 and INTENTS[0] == "none" and N_S == N_SELF + N_COND + N_INT == 49 and S_INT == 38
+    assert (I_XY, I_RAD, I_LEFT) == (7, 9, 10) and OBS_VERSION == "v5.5"
+    print("obs_v5 ok (%s): %d brawlers, %d thrown, %d melee, cond %d, intent %d, s %d, ent %dx%d" % (
+        OBS_VERSION, len(hs), st[:, 6].sum(), st[:, 7].sum(), N_COND, N_INT, N_S, N_ENT, F_ENT))
 
 
 def _live(decisions=300):

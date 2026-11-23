@@ -12,7 +12,7 @@ the repo root and is run as `python -m <module>` from the root after `source env
 - No game files, binaries, checkpoints, datasets or run outputs go into git (`.gitignore`).
 
 ## Checks
-- Self-checks, no battle (`obs_v5` / `env_v5` need the game files from `setup.sh`): `python -m obs_v5`, `python -m model`, `python -m fast_obs`, `python -m env_v5 --check`,
+- Self-checks, no battle (`obs_v5` / `env_v5` need the game files from `setup.sh`): `python -m obs_v5`, `python -m intent`, `python -m model`, `python -m fast_obs`, `python -m env_v5 --check`,
   `python scorecard.py --check`, `python apply_noise.py --test`. Run the ones for the modules you touched.
 - Host checks (boot takes 60-90 s each, so batch your questions into one run): `python -m live_check`,
   `python -m test_fast` (fast paths must stay bit-equal to the reference paths), `python -m train_ppo --run t --smoke`.

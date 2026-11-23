@@ -25,7 +25,7 @@ import torch.nn.functional as F
 import obs_v5 as O
 from model import Policy, HID, PRIV, _CAND, _FOE, mask_super, lead, hero_index, F_IN, HMAX, NONACT, acting_params
 
-NS = O.N_SELF + O.N_COND
+NS = O.N_S                                              # s = self | cond | intent (obs v5.5)
 _W = [NS, O.N_ENT * O.F_ENT, O.G * O.G, PRIV, HID]      # block layout: s | ent | grid | priv | h
 _OFF = np.cumsum([0] + _W)
 OBS_W = int(_OFF[4])                                     # what a worker writes per row (all but h)
@@ -194,7 +194,9 @@ def _check(B=70, G=4, iters=100):
     s[:, O.N_SELF + 3] = np.abs(s[:, O.N_SELF + 3])                   # projectile speed > 0: lead columns live
     for k, n in enumerate(nets):                                      # stage 2 parts non-zero: hero rows (net 3 has none), lead weights
         if k < 3: n.add_heroes(s[k * 20:k * 20 + 30, O.N_SELF:O.N_SELF + 13])
-        with torch.no_grad(): n.hemb.weight.normal_(0, 0.1); n.ent[0].weight[:, O.F_ENT:].normal_(0, 0.3); n.cand[0].weight[:, -2:].normal_(0, 0.3)
+        with torch.no_grad():
+            n.hemb.weight.normal_(0, 0.1); n.ent[0].weight[:, O.F_ENT:].normal_(0, 0.3); n.cand[0].weight[:, -2:].normal_(0, 0.3)
+            n.vec[0].weight[:, O.S_INT:].normal_(0, 0.3)                  # the intent columns (zero in a fresh Policy)
     actor = StackedActor(dev)
     d = compare(nets, gidx, s, ent, grid, h, pv, actor)
     print("fast_act vs act_stacked (random weights): max |d|", {k: "%.1e" % x for k, x in d.items()})

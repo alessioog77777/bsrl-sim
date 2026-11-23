@@ -166,6 +166,9 @@ function frame(){if(!RP)return;const F=RP.frames[fi],cv=$('map'),g=cv.getContext
   for(const e of F.e){const n=RP.ent[e[0]],ex=mx+e[1]*10*t,ey=my+e[2]*10*t,r=/projectile/.test(n)?3:/box|cube/.test(n)?5:6;h.fillStyle=css(ECOL[n]);
     if(/box|cube|area/.test(n))h.fillRect(ex-r,ey-r,2*r,2*r);else{h.beginPath();h.arc(ex,ey,r,0,7);h.fill()}h.lineWidth=1.5;h.strokeStyle=css('--surf');h.strokeRect(ex-r,ey-r,2*r,2*r)}
   h.beginPath();h.arc(mx,my,6,0,7);h.fillStyle=css('--c1');h.fill();
+  let ix='';if(F.i){const I_=F.i,qx=mx+I_.t[0]*10*t,qy=my+I_.t[1]*10*t;h.strokeStyle=css('--c4');h.lineWidth=2;h.setLineDash([4,3]);   // the active intent: target + radius
+    h.beginPath();h.moveTo(mx,my);h.lineTo(qx,qy);h.stroke();h.beginPath();h.arc(qx,qy,Math.max(3,I_.r*10*t),0,7);h.stroke();h.setLineDash([]);
+    ix=` · intent ${I_.k.replace('_',' ')} (${(Math.hypot(I_.t[0],I_.t[1])*10).toFixed(1)} tiles, ${(100*I_.l).toFixed(0)} % time left)`}
   let ax='';if(F.x){const P_=F.x,G=RP.groups,c7=css('--c7'),c8=css('--c8');   // --aux-w readout: predicted (filled / rings) vs truth (outlines / crosses)
     for(let k=0;k<8;k++){const a0=(k*45-22.5)*Math.PI/180;h.beginPath();h.moveTo(mx,my);h.arc(mx,my,5*t,a0,a0+Math.PI/4);h.closePath();
       h.globalAlpha=Math.min(.6,P_.b[k]);h.fillStyle=c7;h.fill();h.globalAlpha=1;if(F.xt&&F.xt.b[k]){h.lineWidth=2;h.strokeStyle=c7;h.stroke()}}
@@ -177,7 +180,7 @@ function frame(){if(!RP)return;const F=RP.frames[fi],cv=$('map'),g=cv.getContext
     ax=`<br>aux: P(hit in 1 s) ${(100*P_.h).toFixed(0)} % (${hit?'hit':'no hit'}) · gas margin ${P_.g} tiles (true ${F.xt?F.xt.g:'–'}) · rings = enemies in 1 s, crosses = truth · wedges = hidden bush enemy (outline = true)`}
   if(a[1]>0){const q=a[2]*Math.PI/180;h.strokeStyle=css(a[1]==2?'--c4':'--c8');h.lineWidth=2;h.beginPath();h.moveTo(mx,my);h.lineTo(mx+9*t*Math.cos(q),my+9*t*Math.sin(q));h.stroke()}
   const alive=F.p.filter(p=>p[4]).length;$('scrub').value=fi;$('finfo').textContent=`step ${fi+1}/${RP.frames.length} · tick ${F.t} · ${alive} alive`;
-  $('act').innerHTML=(RP.scn?`<b>scenario ${RP.scn.name}: ${RP.scn.pass?'pass':'FAIL'}</b> · ${Object.entries(RP.scn.scores).map(([a,v])=>a+' '+fmt(v)).join(' · ')}<br>`:'')+`focus = player ${F.f} · HP ${(100*F.s[0]).toFixed(0)} % · ammo ${(3*F.s[1]).toFixed(1)} · super ${F.s[2]?'ready':'–'} · sees ${F.e.length} entities<br>action: move ${a[0]?(a[0]-1)*22.5+'°':'stop'} · ${['no fire','ATTACK at '+a[2]+'°','SUPER at '+a[2]+'°'][a[1]]}${ax}`}
+  $('act').innerHTML=(RP.scn?`<b>scenario ${RP.scn.name}: ${RP.scn.pass?'pass':'FAIL'}</b> · ${Object.entries(RP.scn.scores).map(([a,v])=>a+' '+fmt(v)).join(' · ')}<br>`:'')+`focus = player ${F.f} · HP ${(100*F.s[0]).toFixed(0)} % · ammo ${(3*F.s[1]).toFixed(1)} · super ${F.s[2]?'ready':'–'} · sees ${F.e.length} entities${ix}<br>action: move ${a[0]?(a[0]-1)*22.5+'°':'stop'} · ${['no fire','ATTACK at '+a[2]+'°','SUPER at '+a[2]+'°'][a[1]]}${ax}`}
 $('play').onclick=()=>{playing=!playing;$('play').textContent=playing?'Pause':'Play'};
 $('scrub').oninput=e=>{fi=+e.target.value;playing=false;$('play').textContent='Play';frame()};
 $('rsel').onchange=e=>{follow=idx.length&&e.target.value==idx[idx.length-1].file;loadRp(e.target.value)};
