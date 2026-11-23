@@ -6,15 +6,22 @@
     ob = ObsV5()                                     # one per MAEnv
     o = ob.build(obs["vec"], obs["grid"], env.last_meta, ids)
     o["self"] (B, 8)   hp fraction, ammo 0-1, super / gadget / hypercharge ready, in bush, own velocity x, y
-    o["ent"]  (B, 39, 16)  present | class one-hot (ENT) | dx, dy (10 tiles, x right / y down) | vx, vy (tiles/tick) | hp fraction
+    o["ent"]  (B, 39, 20)  present | class one-hot (ENT) | dx, dy (10 tiles, x right / y down) | vx, vy (tiles/tick) | hp fraction
+                       | area effects: radius (10 tiles), harms me, helps me, slows me (0 for every other class)
     o["grid"] (B, 25, 25) uint8  seg class id (SEG) per tile around the player, UNKNOWN outside the camera view
     cond(brawler, sliders, team_size, cubes, left) (28,)  own brawler stats + behaviour weights + team size + HUD numbers
 
 Source = the host's state2 vector + grid after nbpc.fair (already camera- and bush-limited). Needs the rl-round
 host `nbhost_rl` (enemy features 14 / 15 = summon / on my team, self 18 = hypercharge fraction, grid channel 0 =
-tiles.csv row + 1); with an older host teammates read as enemies and the tiles are wrong.
-shortcut: area effects have no radius / kind (one class per side), the host dumps no gadget state (self 3 stays 0), and faded_bush / power_box tiles are
-render states the tile map does not have; add them to snap2 / encode.c when the policy needs them.
+tiles.csv row + 1, item feature 5 of an area effect / bomb = its data id - 16999999); with an older host teammates read as
+enemies, the tiles are wrong and area effects have no radius / kind. The grid follows the live map (live_state host: a
+destroyed wall or bush reads as the open tile it became).
+Area effects (item rows with feature 4 != 0): radius and kind come from the game's tables through the data id (_area_lut:
+area_effects_skin -> area_effects_logic Radius / Type / Damage / status effects; a bomb item through its TriggerAreaEffect),
+relative to the observer: an enemy (or neutral bomb) area harms / slows me, an area of my team helps me.
+shortcut: the host dumps no gadget state (self 3 stays 0), and faded_bush / power_box tiles are render states the tile map
+does not have; add them to snap2 / encode.c when the policy needs them.
+shortcut: an area effect's radius is its table Radius (no ExpandOnDistance growth), and DontShowToEnemy areas stay visible.
 shortcut: no box size (the sim has none; a per-class constant adds nothing to the one-hot); add with the agent adapter.
 """
 import functools, os, sys
@@ -29,11 +36,14 @@ UNKNOWN = len(SEG)
 ENT = ("enemy", "teammate", "enemy_summon", "teammate_summon", "power_box", "power_cube", "enemy_projectile",
        "teammate_projectile", "enemy_area_effect", "teammate_area_effect")
 SLIDERS = ("bush_camp", "collect", "protect", "retreat", "kite", "peek", "focus", "push", "third_party", "bush_control")
-N_SELF, N_ENT, F_ENT, G = 8, F.EN_K + F.PJ_K + F.BX_K + F.IT_K, 1 + len(ENT) + 5, 25
-XY, VEL, HP = 1 + len(ENT), 3 + len(ENT), 5 + len(ENT)
+OBS_VERSION = "v5.3"   # v5.3: + 4 area-effect columns (RAD, HARM, HELP, SLOW) at the end of each entity row
+N_SELF, N_ENT, F_ENT, G = 8, F.EN_K + F.PJ_K + F.BX_K + F.IT_K, 1 + len(ENT) + 9, 25
+XY, VEL, HP, RAD = 1 + len(ENT), 3 + len(ENT), 5 + len(ENT), 6 + len(ENT)   # RAD, RAD + 1..3 = radius, harms / helps / slows me
+F_ENT_V52 = 1 + len(ENT) + 5             # entity row width up to v5.2 (model.load_state_dict pads old checkpoints)
 N_COND = 13 + len(SLIDERS) + 3 + 2      # + own cubes, teams / players left (Showdown HUD; BSRL brain/hud.py live)
 LEFT0 = {1: 10, 2: 5, 3: 4}              # teams left at the start by team size (sim trio = 3 x 3 + 1 solo, live 4 x 3)
 _S, _E = SEG.index, ENT.index
+_AREA_C = [ENT.index("enemy_area_effect"), ENT.index("teammate_area_effect")]
 
 # Ranges, sampled once per episode. Measured by rl/measure_noise.py on the v6 models (HISTORY 61): 0 .. 2 x measured.
 VEL_K = 3   # entity velocity = mean of the last <= VEL_K matched one-decision differences (then an EMA 1 / VEL_K): one
@@ -93,6 +103,47 @@ def _tile_lut():
     return lut
 
 
+AREA_ITEM0 = 1000000   # item feature 5 code: 1 + area_effects_skin row (17xxxxxx), AREA_ITEM0 + 1 + items row (18xxxxxx)
+_HARM_T = {"Damage", "Dot", "DamageAndStatusEffect", "HealAndDamage", "HotAndDot", "DelayedDamage", "BulletExplosion", "Stun", "Pushback"}
+_HELP_T = {"Heal", "Hot", "HealRegen", "HealAndDamage", "HotAndDot", "DamageBoost", "ExtraSuperCharge"}
+
+
+@functools.lru_cache(None)
+def _area_lut():
+    """(n, 4) float32 per item feature-5 code (index: area skin row + 1, then AREA_ITEM0 rows from index NA): radius / 3000
+    (10-tile units, as dx / dy), harms enemies, helps allies, slows enemies; row 0 / unknown = 0. From area_effects_skin
+    (Logic) -> area_effects_logic (Radius, Type, Damage) + status_effects_logic of StatusEffectEnemy / Ally; an item
+    through its TriggerAreaEffect (the bomb's explosion)."""
+    named = lambda f: [r for r in D._rows(f) if r.get("Name")]
+    lg = {r["Name"]: r for r in named("area_effects_logic.csv")}; se = {r["Name"]: r for r in named("status_effects_logic.csv")}
+    num = lambda r, k: int((r.get(k) or "0").split(";")[0] or 0)   # one row has Radius '720;1200' (first = the base)
+
+    def row(L):
+        if L is None: return [0.0] * 4
+        en, al = se.get(L.get("StatusEffectEnemy"), {}), se.get(L.get("StatusEffectAlly"), {})
+        harm = L.get("Type") in _HARM_T or num(L, "Damage") > 0 or num(en, "Damage") > 0 or en.get("FullStun", "").lower() == "true"
+        help_ = L.get("Type") in _HELP_T or any(num(al, k) > 0 for k in ("Healing", "SpeedBoostPercent", "SpeedBoostAbsolute", "DamageBoostPercent", "ShieldPercent"))
+        slow = num(en, "SpeedReducePercent") > 0 or num(en, "SpeedReduceAbsolute") > 0
+        return [num(L, "Radius") / 3000.0, harm, help_, slow]
+    sk, items = named("area_effects_skin.csv"), named("items.csv")
+    lut = np.zeros((1 + len(sk) + 1 + len(items), 4), np.float32)
+    for k, r in enumerate(sk): lut[1 + k] = row(lg.get(r.get("Logic") or r["Name"]))
+    skl = {r["Name"]: r.get("Logic") or r["Name"] for r in sk}   # TriggerAreaEffect names a skin row or a logic row
+    for k, r in enumerate(items):
+        t = r.get("TriggerAreaEffect"); lut[1 + len(sk) + 1 + k] = row(lg.get(t) or lg.get(skl.get(t)))
+    return lut, 1 + len(sk)
+
+
+def area_feats(code, side):
+    """(..., 4) entity columns RAD.. of item rows: feature-5 code (host data id - 16999999), side = item feature 4
+    (1 enemy / neutral, -1 my team) -> radius, harms me, helps me, slows me"""
+    lut, na = _area_lut(); c = np.rint(code).astype(np.int64)
+    i = np.where(c > AREA_ITEM0, na + np.clip(c - AREA_ITEM0, 0, len(lut) - na - 1), np.clip(c, 0, na - 1))
+    f = lut[i].copy(); foe = side > 0.5
+    f[..., 1] *= foe; f[..., 3] *= foe; f[..., 2] *= side < -0.5
+    return f
+
+
 def from_state2(vec, grid, meta):
     """fair state2 vec (B, 436), grid (B, 6, 25, 25), meta (B, 5) = x, y, tick, W, H (MAEnv.last_meta) -> clean obs"""
     B = len(vec)
@@ -121,6 +172,8 @@ def from_state2(vec, grid, meta):
     it = it.copy(); it[..., 0] *= (it[..., 3] > 0.5) | (np.abs(it[..., 4]) > 0.5)  # other items are not detected classes
     # item 4: 1 = showdown bomb or enemy area effect, -1 = area effect of my team (nbhost_rl encode.c)
     fill(k, it, np.select([it[..., 3] > 0.5, it[..., 4] < -0.5], [_E("power_cube"), _E("teammate_area_effect")], _E("enemy_area_effect")))
+    area = (it[..., 0] > 0.5) & (it[..., 3] < 0.5) & (np.abs(it[..., 4]) > 0.5)
+    ent[:, k:k + F.IT_K, RAD:RAD + 4] = area_feats(it[..., 5], it[..., 4]) * area[..., None]
 
     g = _tile_lut()[grid[:, 0]]
     g[(grid[:, 3] > 0) & (g == _S("floor"))] = _S("poison")
@@ -200,12 +253,15 @@ class ObsV5:
         ent[here & (r.random(here.shape) < pd)] = 0.0
         nse = r.normal(size=(B, N_ENT, 2)).astype(np.float32) * jit[:, None, None] * ent[..., :1]
         ent[..., XY:XY + 2] += nse
+        rj = r.normal(size=(B, N_ENT)).astype(np.float32) * jit[:, None] * (ent[..., RAD] > 0)   # radius from the drawn ring:
+        ent[..., RAD] = np.maximum(ent[..., RAD] + rj, 0.0)                                       # the centre's sigma (not measured)
         n = int(false.sum())
         if n:
             row = np.zeros((n, F_ENT), np.float32); row[:, 0] = 1.0
-            row[np.arange(n), 1 + r.integers(len(ENT), size=n)] = 1.0
+            fc = r.integers(len(ENT), size=n); row[np.arange(n), 1 + fc] = 1.0
             row[:, XY] = r.uniform(-1.5, 1.5, n); row[:, XY + 1] = r.uniform(-F.VIEW_UP, F.VIEW_DOWN, n) / F.R
             row[:, HP] = r.random(n)
+            row[:, RAD] = np.isin(fc, _AREA_C) * r.uniform(0.1, 0.5, n)   # a false area effect: a 300-1500 radius, no kind
             ent[false] = row
         hud = hud_mask(meta, r); g[hud] = UNKNOWN          # the seg model labels the HUD controls 'ui'
         bl = np.array([e[7] for e in eps], np.float32)
@@ -278,7 +334,9 @@ def _check():
     grid[:, 0] = tile("Open")
     row(F.PJ0, F.PJ_F, 0, [1, 0.1, 0.1, 1, 0, 1, 0]); row(F.PJ0, F.PJ_F, 1, [1, 0.2, 0.1, 0, 1, 0, 1])
     row(F.BX0, F.BX_F, 0, [1, 0.3, 0.3, 0.6])
-    row(F.IT0, F.IT_F, 0, [1, 0.4, 0, 1, 0]); row(F.IT0, F.IT_F, 1, [1, 0.4, 0, 0, 1]); row(F.IT0, F.IT_F, 2, [1, 0.4, 0, 0, 0]); row(F.IT0, F.IT_F, 3, [1, 0.4, 0, 0, -1])
+    lut, na = _area_lut(); slow = int(np.nonzero(lut[1:na, 3])[0][0]) + 1        # codes: 1 Brock_def_atk_area (damage, 450), 155 Heal
+    row(F.IT0, F.IT_F, 0, [1, 0.4, 0, 1, 0]); row(F.IT0, F.IT_F, 1, [1, 0.4, 0, 0, 1, 1]); row(F.IT0, F.IT_F, 2, [1, 0.4, 0, 0, 0]); row(F.IT0, F.IT_F, 3, [1, 0.4, 0, 0, -1, 155])
+    row(F.IT0, F.IT_F, 4, [1, 0.4, 0, 0, 1, slow]); row(F.IT0, F.IT_F, 5, [1, 0.4, 0, 0, -1, 1]); row(F.IT0, F.IT_F, 6, [1, 0.4, 0, 0, 1, AREA_ITEM0 + 1 + 35])
     grid[0, 0, 12, 13] = tile("Indestructible"); grid[0, 0, 12, 14] = tile("Forest"); grid[0, 3, 12, 14] = 1
     grid[0, 0, 12, 15] = tile("Wall1"); grid[0, 0, 12, 16] = tile("Water"); grid[0, 0, 12, 17] = tile("RopeFence")
     grid[0, 3, 5, 5] = 1; grid[0, 4, 3, 3] = 1; grid[0, 0, 3, 3] = 0
@@ -288,9 +346,14 @@ def _check():
     e = o["ent"][0]; cls = lambda k: ENT[int(e[k, 1:1 + len(ENT)].argmax())]
     got = [(k, cls(k)) for k in np.nonzero(e[:, 0])[0]]
     assert got == [(0, "enemy"), (1, "teammate"), (2, "enemy_summon"), (3, "teammate_summon"), (9, "teammate_projectile"),
-                   (10, "enemy_projectile"), (25, "power_box"), (31, "power_cube"), (32, "enemy_area_effect"), (34, "teammate_area_effect")], got
-    assert np.allclose(e[0, XY:], [0.5, -0.2, 40 / 300, 0, 0.8]) and np.allclose(e[10, VEL:VEL + 2], [0, 200 / 300])
-    assert e[:, 1:1 + len(ENT)].sum() == 10 and not o["ent"][1].any()
+                   (10, "enemy_projectile"), (25, "power_box"), (31, "power_cube"), (32, "enemy_area_effect"), (34, "teammate_area_effect"), (35, "enemy_area_effect"),
+                   (36, "teammate_area_effect"), (37, "enemy_area_effect")], got
+    assert np.allclose(e[0, XY:RAD], [0.5, -0.2, 40 / 300, 0, 0.8]) and np.allclose(e[10, VEL:VEL + 2], [0, 200 / 300])
+    assert e[:, 1:1 + len(ENT)].sum() == 13 and not o["ent"][1].any()
+    # area columns: radius, harms / helps / slows me; an area of my team never harms me; the Piper bomb = its explosion
+    assert np.allclose(e[32, RAD:], [0.15, 1, 0, 0]) and np.allclose(e[34, RAD:], [800 / 3000, 0, 1, 0]), (e[32, RAD:], e[34, RAD:])
+    assert e[35, RAD] > 0 and e[35, RAD + 3] == 1 and np.allclose(e[36, RAD:], [0.15, 0, 0, 0]) and np.allclose(e[37, RAD:], [0.2, 1, 0, 0])
+    assert not e[:32, RAD:].any() and lut[1:na, 0].mean() > 0.1 and lut[1:na, 1:].sum(0).min() > 50   # every kind occurs in the tables
     g = o["grid"][0]
     assert (g[12, 13], g[12, 14], g[5, 5], g[3, 3], g[12, 12]) == (_S("indestructible"), _S("bush"), _S("poison"),
                                                                  _S("out_of_bounds"), _S("floor"))
@@ -317,13 +380,15 @@ def _check():
         n = nz.build(vec, grid, meta, ids)
         assert all(n[k].shape == o[k].shape and n[k].dtype == o[k].dtype for k in o) and n["grid"].max() <= UNKNOWN
         assert not ((n["grid"] == UNKNOWN) & (o["grid"] != UNKNOWN) & ~hud).any() and (n["grid"][o["grid"] == UNKNOWN] == UNKNOWN).all() and np.array_equal(n["self"], o["self"])
+        ar = np.isin(n["ent"][..., 1:1 + len(ENT)].argmax(-1), _AREA_C) & (n["ent"][..., 0] > 0)   # radius only on area rows, >= 0
+        assert (n["ent"][..., RAD] >= 0).all() and not n["ent"][~ar][:, RAD:].any() and (n["ent"][ar][:, RAD] > 0).mean() > 0.9
         on = n["ent"][0, :, 0] > 0; was = o["ent"][0, :, 0] > 0
         kept += (on & was).sum(); fps += (on & ~was).sum(); flips += (n["grid"] != o["grid"]).mean()
         if on[0]: d.append(n["ent"][0, 0, XY] - 0.5)
         back += on[0] and not on0; vback += on[0] and not on0 and n["ent"][0, 0, VEL:VEL + 2].any()
         on0 = on[0]
     assert back > 50 and vback <= 3, (back, vback)       # back after a drop: no velocity (rare: matched to a false positive)
-    assert 0.4 < kept / (300 * 9) < 0.6 and 0.15 < fps / (300 * (N_ENT - 9)) < 0.25, (kept, fps)
+    assert 0.4 < kept / (300 * 13) < 0.6 and 0.15 < fps / (300 * (N_ENT - 13)) < 0.25, (kept, fps)
     assert 0.1 < flips / 300 < 0.2 and 0.02 < np.std(d) < 0.04, (flips, np.std(d))
     dc = ObsV5(noise=dict(hi, jitter=(0, 0), drop=(0, 0), drop_cls=(2, 2), fp=(0, 0), seg=(0, 0)))   # per-class miss chance
     was = o["ent"][0, :, 0] > 0; pk = 1 - np.minimum(1, 2 * DROP_CLS[o["ent"][0, was, 1:1 + len(ENT)].argmax(-1)])

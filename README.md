@@ -14,13 +14,13 @@ everything. Game files are not included: you supply them.
 | File | What it does |
 |---|---|
 | `env_v5.py` | Randomised Showdown battles on top of nirkt's `MAEnv`: random map, brawlers, solo / duo / trio teams, policy-controlled slots vs the native AI, team placement reward, behaviour-slider reward terms. `python -m env_v5 --check` |
-| `obs_v5.py` | The observation: `self` (8), `ent` (39 x 16 entity slots), `grid` (25 x 25 tile classes), `cond` (28: brawler stats, 10 slider weights, team size, cubes, players left). Per-episode detector noise, latency and HUD masking. `python -m obs_v5` |
+| `obs_v5.py` | The observation: `self` (8), `ent` (39 x 20 entity slots; area effects with radius and harms / helps / slows me), `grid` (25 x 25 tile classes), `cond` (28: brawler stats, 10 slider weights, team size, cubes, players left). Per-episode detector noise, latency and HUD masking. `python -m obs_v5` |
 | `fast_obs.py`, `fast_act.py` | Batched, vectorised versions of the observation builder and the actor for the multi-process trainer (bit-equal to the reference paths). |
 | `model.py` | Policy: entity set + tile grid + conditioning -> GRU -> move (17) / fire (3) / aim (360, pointer over targets) / distance heads, critic with a privileged branch. `python -m model` |
 | `train_ppo.py` | Behaviour cloning from the native AI, then PPO with a KL anchor, league / self-play, evals, replays. |
 | `train_fast.py` | Same trainer with environment collection split over worker processes (shared memory). |
 | `scorecard.py` | Skill metrics of a run from its logs: placement, win rate, trade, hit rate, aim lead, cube and gas stats. |
-| `live_check.py` | One-boot check of the host round: team reward, area effects, generated maps, teammate respawn, HUD mask. |
+| `live_check.py` | One-boot check of the host round: team reward, area effects (radius, kind), generated maps, teammate respawn, HUD mask, live map tiles, cubes lost at a knock-out. |
 | `test_fast.py` | Equality and timing of the fast paths against the reference paths on real battles. |
 | `apply_noise.py` | Writes a measured detector-noise report into `obs_v5.NOISE` (with sanity limits). |
 | `viz.html` | Run dashboard: training / eval curves, action histograms, battle replay with the policy's view. |
@@ -28,7 +28,7 @@ everything. Game files are not included: you supply them.
 | `env.sh` | Environment variables for the host, nirkt's packages and the work folder. |
 | `setup.sh` | One-command setup: host build, venv, game files (SETUP.md). |
 | `deps/` | nirkt's `bulletlabels` and the `py/` + `train/` parts of `nbrl-env`, with this project's changes applied. |
-| `host/training_round.patch`, `host/fair_view.patch` | Record of this project's changes to nirkt's host and camera rules (already applied in `deps/`). |
+| `host/training_round.patch`, `host/fair_view.patch`, `host/live_state.patch` | Record of this project's changes to nirkt's host and camera rules (already applied in `deps/`). |
 | `pro_strategies.md` | Community Showdown habits and what each means for the observation / reward. |
 
 ## Requirements
@@ -78,7 +78,7 @@ cd $SIM_WORK/runs && python -m http.server 8766      # dashboard: http://localho
   what it is; the log itself is not published.
 - The fire head is none / attack / super: gadgets and hypercharge cannot be triggered on this host.
 - Observation layout changes must be mirrored by anything that consumes exported policies. `obs_v5` carries the
-  version (`v5.2`) that exported policies are checked against.
+  version (`obs_v5.OBS_VERSION`, now `v5.3`; saved in every checkpoint) that exported policies are checked against.
 
 ## Licence
 

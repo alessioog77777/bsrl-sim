@@ -13,7 +13,7 @@ Per-agent state lives in slots (one per entry of ObsV5.ep, freed with its evicti
 """
 import numpy as np
 import obs_v5 as O
-from obs_v5 import smooth_vel, N_ENT, F_ENT, XY, VEL, G, ENT, from_state2, hud_mask, UNKNOWN, SEG, DROP_CLS, BLEED_ROW, _TALL_M, _BLEED_CLS, _S, F as FAIR
+from obs_v5 import smooth_vel, N_ENT, F_ENT, XY, VEL, G, ENT, from_state2, hud_mask, UNKNOWN, SEG, DROP_CLS, BLEED_ROW, _TALL_M, _BLEED_CLS, _S, RAD, _AREA_C, F as FAIR
 
 
 class FastObsV5(O.ObsV5):
@@ -60,12 +60,15 @@ class FastObsV5(O.ObsV5):
         ent[here & (r.random(here.shape) < pd)] = 0.0
         nse = r.normal(size=(B, N_ENT, 2)).astype(np.float32) * jit[:, None, None] * ent[..., :1]
         ent[..., XY:XY + 2] += nse
+        rj = r.normal(size=(B, N_ENT)).astype(np.float32) * jit[:, None] * (ent[..., RAD] > 0)   # radius from the drawn ring:
+        ent[..., RAD] = np.maximum(ent[..., RAD] + rj, 0.0)                                       # the centre's sigma (not measured)
         n = int(false.sum())
         if n:
             row = np.zeros((n, F_ENT), np.float32); row[:, 0] = 1.0
-            row[np.arange(n), 1 + r.integers(len(ENT), size=n)] = 1.0
+            fc = r.integers(len(ENT), size=n); row[np.arange(n), 1 + fc] = 1.0
             row[:, XY] = r.uniform(-1.5, 1.5, n); row[:, XY + 1] = r.uniform(-FAIR.VIEW_UP, FAIR.VIEW_DOWN, n) / FAIR.R
             row[:, O.HP] = r.random(n)
+            row[:, O.RAD] = np.isin(fc, _AREA_C) * r.uniform(0.1, 0.5, n)   # a false area effect: a 300-1500 radius, no kind
             ent[false] = row
         hud = hud_mask(meta, r); g[hud] = UNKNOWN
         bl = np.array([e[7] for e in eps], np.float32)
@@ -127,6 +130,9 @@ def _synthetic(rng, B, n_ids=40):
         vec[:, o + 3:o + 5] = rng.normal(size=(B, 2)) * 0.2; vec[:, o + 5] = rng.random(B)
     for k in range(FAIR.PJ_K):
         o = FAIR.PJ0 + k * FAIR.PJ_F; vec[:, o] = rng.random(B) < 0.3; vec[:, o + 1:o + 3] = rng.normal(size=(B, 2)) * 0.4
+    for k in range(FAIR.IT_K):                           # area effects of both sides (radius / kind columns)
+        o = FAIR.IT0 + k * FAIR.IT_F; vec[:, o] = rng.random(B) < 0.3; vec[:, o + 1:o + 3] = rng.normal(size=(B, 2)) * 0.4
+        vec[:, o + 4] = rng.choice([-1.0, 1.0], B); vec[:, o + 5] = rng.integers(1, 1320, B)
     grid[:, 0] = rng.integers(0, 30, (B, 25, 25))
     meta = np.stack([rng.integers(300, 17000, B), rng.integers(300, 17000, B), np.full(B, 100), np.full(B, 60), np.full(B, 60)], 1).astype(np.int32)
     ids = 16 + rng.choice(n_ids, B, replace=False)

@@ -12,6 +12,8 @@ Stage 2 (BSRL v2 plan), both zero-initialised so s3 / s4 checkpoints act the sam
   where a shot fired now meets it, and the flight time; own projectile speed = cond stats[3].
 * per-brawler embedding `hemb` (a learned trunk bias per hero): the hero is found by matching cond's 13 stats against
   the `hero_stats` table (add_heroes; saved in the checkpoint, rows never reorder), unknown = the last row.
+Obs v5.3 (obs_v5.OBS_VERSION): 4 area-effect columns at the end of the observation's entity row, before the lead columns;
+load_state_dict zero-pads v5.2 checkpoints there (same outputs).
 """
 import numpy as np
 import torch
@@ -88,10 +90,19 @@ class Policy(nn.Module):
         return int((t[:, 0] < 1e3).sum())
 
     def load_state_dict(self, sd, strict=True, **kw):
-        """old checkpoints: the entity input weights grew by the lead columns -> zero-padded (same outputs); no hemb ->
-        zeros (a reused league slot must not keep the previous snapshot's rows; the hero table may stay)"""
+        """old checkpoints: the entity input weights grew by the lead columns and (obs v5.3) by the area-effect columns
+        between the observation's row and the lead columns -> zero-padded in place (same outputs); no hemb -> zeros (a
+        reused league slot must not keep the previous snapshot's rows; the hero table may stay)"""
         own = self.state_dict(); sd = dict(sd)
         if "hemb.weight" not in sd: sd["hemb.weight"] = torch.zeros_like(own["hemb.weight"])
+        for k in ("ent.0.weight", "cand.0.weight"):     # input = [x part (cand)] | obs row (F_ENT) | lead (N_LEAD)
+            v, o = sd.get(k), own[k]
+            if v is None or v.dim() != 2 or v.shape[1] >= o.shape[1]: continue
+            pre = o.shape[1] - F_IN; n_lead = v.shape[1] - pre - O.F_ENT_V52   # v5.2 row, with (2) or without (0) lead
+            assert n_lead in (0, N_LEAD) and v.shape[0] == o.shape[0], (k, tuple(v.shape))
+            t = torch.zeros_like(o); t[:, :pre + O.F_ENT_V52] = v[:, :pre + O.F_ENT_V52]
+            if n_lead: t[:, -N_LEAD:] = v[:, -N_LEAD:]
+            sd[k] = t
         for k, v in sd.items():
             o = own.get(k)
             if o is not None and v.shape != o.shape and v.dim() == o.dim() and all(a <= b for a, b in zip(v.shape, o.shape)):
@@ -229,9 +240,18 @@ def _check_stage2():
     ent = torch.zeros(N, L, O.N_ENT, O.F_ENT); ent[..., :3, 0] = 1; ent[..., :3, 1 + O.ENT.index("enemy")] = 1
     ent[..., :3, O.XY:O.HP] = torch.randn(N, L, 3, 4) * 0.2
     grid = torch.randint(0, O.UNKNOWN + 1, (N, L, O.G, O.G), dtype=torch.uint8); h0 = torch.zeros(N, HID)
-    a = Policy(); nn.init.normal_(a.pi.weight, std=0.1); ref = a.seq(s, ent, grid, h0)[0]
+    ent[..., :3, O.RAD:] = torch.rand(N, L, 3, 4)                                        # new inputs present: an old net ignores them
+    a = Policy(); nn.init.normal_(a.pi.weight, std=0.1); na = O.F_ENT - O.F_ENT_V52; pre = a.cand[0].weight.shape[1] - F_IN
+    with torch.no_grad():                                                                 # a v5.2 net: lead used, no area columns
+        nn.init.normal_(a.ent[0].weight[:, O.F_ENT:], std=0.3); nn.init.normal_(a.cand[0].weight[:, -N_LEAD:], std=0.3)
+        a.ent[0].weight[:, O.F_ENT_V52:O.F_ENT] = 0; a.cand[0].weight[:, pre + O.F_ENT_V52:pre + O.F_ENT] = 0
+    ref = a.seq(s, ent, grid, h0)[0]
     old = {k: v for k, v in a.state_dict().items() if k not in ("hemb.weight", "hero_stats")}
-    old["ent.0.weight"] = old["ent.0.weight"][:, :O.F_ENT]; old["cand.0.weight"] = old["cand.0.weight"][:, :-N_LEAD]
+    v52 = lambda w, p: torch.cat([w[:, :p + O.F_ENT_V52], w[:, p + O.F_ENT:]], 1)        # the v5.2 layout: row 16 | lead 2
+    old["ent.0.weight"] = v52(old["ent.0.weight"], 0); old["cand.0.weight"] = v52(old["cand.0.weight"], pre)
+    assert old["ent.0.weight"].shape[1] == O.F_ENT_V52 + N_LEAD and na == 4
+    c = Policy(); c.load_state_dict({**old, "ent.0.weight": old["ent.0.weight"][:, :O.F_ENT_V52]}, strict=False)   # pre-lead format
+    assert torch.equal(c.ent[0].weight[:, :O.F_ENT_V52], a.ent[0].weight[:, :O.F_ENT_V52]) and not c.ent[0].weight[:, O.F_ENT_V52:].any()
     b = Policy(); b.load_state_dict(old, strict=False)
     assert b.add_heroes(s[:, 0, O.N_SELF:O.N_SELF + N_STAT]) == N and b.add_heroes(s[:1, 0, O.N_SELF:O.N_SELF + N_STAT]) == N
     got = b.seq(s, ent, grid, h0)[0]
