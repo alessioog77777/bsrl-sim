@@ -31,6 +31,13 @@ everything. Game files are not included: you supply them.
 | `host/training_round.patch`, `host/fair_view.patch` | Record of this project's changes to nirkt's host and camera rules (already applied in `deps/`). |
 | `pro_strategies.md` | Community Showdown habits and what each means for the observation / reward. |
 
+## Vision models
+
+The detector and segmentation models this observation is built around are in
+**[showdown-vision-v6](https://github.com/mlgdoggynoob/showdown-vision-v6)**: model files (ONNX and PyTorch) on its
+[v6 release](https://github.com/mlgdoggynoob/showdown-vision-v6/releases/tag/v6), the exact pre / post-processing,
+class lists, val numbers and the validation set.
+
 ## Requirements
 
 - Linux or WSL2 (developed on Ubuntu 24.04), Python 3.11+, PyTorch (CUDA or ROCm for real runs; CPU is fine for the
