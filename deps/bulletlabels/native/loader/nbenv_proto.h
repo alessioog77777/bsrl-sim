@@ -93,6 +93,7 @@ typedef struct {
 typedef struct {          /* per player slot, reward bookkeeping of THIS step (the phone env's info.terms) */
     int32_t present, char_id, alive, hp, max_hp, x, y;
     int32_t damage_dealt, damage_taken, gas_damage, kills, hits, box_damage, cubes, cubes_total, gas_ticks, in_gas;
+                          /* cubes = picked up this step; cubes_total = held now (all picked up, 0 after a team knock-out) */
     int32_t bomb_damage;  /* PC extra: leap-bomb damage dealt (the phone agent applies it from JS: not in damage_dealt) */
     int32_t eliminated, elim_rank, elim_tick, elim_gas; /* elimination tracker (rank 10 = first out) */
     int32_t leaping, super_charge, super_max, ammo;
@@ -112,7 +113,7 @@ typedef struct {
     int32_t steps_in_frame, frame;
     int32_t us_step, us_state, us_wait;  /* timing of the last step (microseconds) */
     int32_t njumps; int32_t jumps[NBE_MAXP][5];   /* active leaps: char id, t, T, x1, y1 */
-    int32_t ncubes; int32_t cubes[NBE_MAXP][2];   /* char id, cubes held */
+    int32_t ncubes; int32_t cubes[NBE_MAXP][2];   /* char id, cubes held (= NbePlayer.cubes_total) */
     int32_t reserved[8];  /* [0] latched storm step used by this step, [1] storm latch phase, [2] env steps since the reset observation,
                              [3] client tick (client mode), [4] pixel format of the pixel block (cmd reserved[2]),
                              [5] lead-aim corrections since the reset (lead_mask), [6] AI attack calls of lead players left unchanged */

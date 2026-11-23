@@ -285,7 +285,8 @@ int snap2(void *sim, int32_t *out, int cap, void *cmgr) {
     out[1] = k; out[3] = np; out[4] = nch; out[5] = npj; out[6] = nit;
     return k;
 }
-/* map tile data ids (x + width*y) + FNV-1a hash (the agent's snap_map) */
+/* map tile data ids (x + width*y) + FNV-1a hash (the agent's snap_map). area round: the cell's current data (+0: Open once a
+ * wall / bush is destroyed) instead of its battle-start data (+8), so F_MAP and the encoder's grid follow the live map */
 static uint32_t snap_map(void *sim, int32_t *out, int cap, int *wh) {
     uint32_t hash = 2166136261u; wh[0] = wh[1] = 0;
     void *m = sim ? PTR(sim, 0x68) : NULL; if (!m) return 0;
@@ -293,7 +294,7 @@ static uint32_t snap_map(void *sim, int32_t *out, int cap, int *wh) {
     if (w < 1 || hh < 1 || w * hh > 16384 || w * hh > cap) return 0;
     void **tiles = PTR(m, 0x20); if (!tiles) return 0;
     for (int i = 0; i < w * hh; i++) {
-        void *t = tiles[i], *d = t ? PTR(t, 8) : NULL; int id = d ? I32(d, 0x20) : NIL;
+        void *t = tiles[i], *d = t ? (PTR(t, 0) ? PTR(t, 0) : PTR(t, 8)) : NULL; int id = d ? I32(d, 0x20) : NIL;
         out[i] = id; hash = (hash ^ (uint32_t)id) * 16777619u;
     }
     wh[0] = w; wh[1] = hh;
@@ -354,6 +355,11 @@ static uint64_t my_root(void *victim, int a1, int dmg, int a3, int a4, void *att
     if (vchar && mode3) record_event(victim, attacker, before, I32(victim, 0x3c4));
     if (ow >= 0 && I32(victim, 0x3c4) <= 0 && resp_mate(E.sim, ow)) {   /* knocked out while a teammate lives */
         E.resp_at[ow] = I32(E.sim, 0x10) + RESP_TICKS; E.resp_ai[ow] = U8(victim, 0x469); E.resp_n++;
+        /* area round: it loses its power cubes (Duo Showdown: a respawned brawler starts at 0 cubes) and their +400 max HP
+         * each; cubes0 moves with it so NbePlayer.cubes (picked up this step) stays >= 0. shortcut: they vanish (not dropped) */
+        for (int c = 0; c < E.ncube; c++) if (E.cube_id[c] == I32(victim, 8) && E.cube_n[c] > 0) {
+            I32(victim, 0x3c8) -= 400 * E.cube_n[c]; E.cubes0[ow] -= E.cube_n[c]; E.cube_n[c] = 0;
+        }
         I32(victim, 0x3c4) = I32(victim, 0x3c8); U8(victim, 0x469) = 0; I32(victim, 0x38) = PARK_X; I32(victim, 0x3c) = PARK_Y;
     }
     E.charge_level = saved_level;

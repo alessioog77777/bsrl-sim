@@ -31,6 +31,8 @@ Changes made to nirkt's code, all recorded in `host/`:
 - `host/training_round.patch`: team groups, summons and area effects in the observation, per-instance map folders,
   teammate respawn.
 - `host/fair_view.patch`: camera view window (measured trapezoid, per-episode zoom, teammates never bush-hidden).
+- `host/live_state.patch`: live map tiles in `F_MAP` and the observation grid (a destroyed wall / bush reads as open),
+  area effects' data id in item feature 5 (obs_v5 looks up radius and kind), power cubes lost at a team knock-out.
 - `maenv.py` and `fair.py` copied from `deps/nbrl-env/py/nbpc` into `deps/bulletlabels/vendor/nbpc`, so one `nbpc`
   package holds the host side and the environment side.
 - The game download link removed from `deps/bulletlabels/setup.sh` (this repo's `setup.sh` downloads it instead).

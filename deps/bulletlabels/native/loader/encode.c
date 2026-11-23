@@ -183,9 +183,12 @@ int enc_encode(const EncMap *m, const EncState *s, int pidx, float *vec, float *
     for (int k = 0; k < s->nit && n < 4096; k++) {
         const int32_t *r = s->it + k * I2;
         double dx = (r[3] - mx) / R_SCALE, dy = (r[4] - my) / R_SCALE;
-        /* rl round: [4] = 1 showdown bomb or enemy area effect (data 17xxxxxx = area_effects_skin), -1 area effect of my team */
+        /* rl round: [4] = 1 showdown bomb or enemy area effect (data 17xxxxxx = area_effects_skin), -1 area effect of my team;
+         * area round: [5] of those rows = data id - 16999999 (area skin row + 1, items row + 1000001: radius / kind tables
+         * in Python), of the other items z / 1500 as before */
         int area = r[1] / 1000000 == 17, mine = area && r[2] >= 0 && team_of(s, r[2]) == myteam;
-        double v[6] = {1.0, dx, dy, (double)(r[1] == CUBE_ITEM), mine ? -1.0 : (double)(area || r[1] == BOMB_ITEM || r[1] == BOMB_BOX_ITEM), (r[5] > 0 ? r[5] : 0) / 1500.0};
+        int ae = area || r[1] == BOMB_ITEM || r[1] == BOMB_BOX_ITEM;
+        double v[6] = {1.0, dx, dy, (double)(r[1] == CUBE_ITEM), mine ? -1.0 : (double)ae, ae ? (double)(r[1] - 16999999) : (r[5] > 0 ? r[5] : 0) / 1500.0};
         rows[n].key = dx * dx + dy * dy; rows[n].seq = n; for (int j = 0; j < 6; j++) rows[n].v[j] = (float)v[j]; n++;
     }
     qsort(rows, n, sizeof *rows, cmprow);
