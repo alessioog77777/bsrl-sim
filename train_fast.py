@@ -245,7 +245,7 @@ def main(argv=None):
         p.start(); cc.close(); procs.append(p); conns.append(pc); shms.append(np.frombuffer(shm, np.float32).reshape(-1, OBS_W))
     # ---- GPU side (after the fork)
     from model import Policy, HID, masked_kl, dist_logp_ent
-    dev = torch.device("cuda")
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")   # CPU: plumbing checks (--smoke) only
     def frozen(sd):
         m = Policy().to(dev).eval(); m.load_state_dict(sd, strict=False); [p.requires_grad_(False) for p in m.parameters()]
         return m
@@ -283,7 +283,7 @@ def main(argv=None):
 
     def save(path):
         torch.save({"model": net.state_dict(), "opt": opt.state_dict(), "ref": ref.state_dict() if ref else None, "update": upd,
-                    "agent_steps": agent_steps, "args": vars(a), "loc": loc}, path)
+                    "agent_steps": agent_steps, "args": vars(a), "loc": loc, "obs_version": O.OBS_VERSION}, path)
 
     def start_eval():
         nonlocal enet

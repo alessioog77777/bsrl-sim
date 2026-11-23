@@ -157,7 +157,7 @@ def main():
     loc = a.loc or E.locations()[0]
     json.dump({**vars(a), "loc": loc, "reward_w": REWARD_W}, open(os.path.join(out, "config.json"), "w"), indent=1)
     shutil.copy(os.path.join(HERE, "viz.html"), os.path.join(out, "index.html"))
-    dev = torch.device("cuda")
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")   # CPU: plumbing checks (--smoke) only
     def frozen(sd):
         m = Policy().to(dev).eval(); m.load_state_dict(sd, strict=False); [p.requires_grad_(False) for p in m.parameters()]
         return m
@@ -213,7 +213,7 @@ def main():
 
     def save(path):
         torch.save({"model": net.state_dict(), "opt": opt.state_dict(), "ref": ref.state_dict() if ref else None, "update": upd,
-                    "agent_steps": agent_steps, "args": vars(a), "loc": loc}, path)
+                    "agent_steps": agent_steps, "args": vars(a), "loc": loc, "obs_version": O.OBS_VERSION}, path)
 
     def start_eval():
         nonlocal enet

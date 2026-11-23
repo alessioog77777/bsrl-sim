@@ -1,6 +1,6 @@
 """Equality + timing of the train_fast parts on real game batches (WSL, after `source env.sh`; boots --n instances).
 
-    python -m test_fast --n 2 --polls 400 --ckpt runs/fast_eq/ckpt.pt --base runs/fast_eq/base.pt
+    python -m test_fast --n 2 --polls 400 [--ckpt runs/fast_eq/ckpt.pt --base runs/fast_eq/base.pt]   # GPU if there is one
 
 1. Plays train_ppo-style battles (self-play with league opponents + k vs native) on --n instances, the policy acting
    through fast_act.StackedActor (learner = --ckpt, opponents = --base), and records every poll's raw inputs.
@@ -20,11 +20,18 @@ from train_ppo import priv
 
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument("--n", type=int, default=2); ap.add_argument("--polls", type=int, default=400)
-    ap.add_argument("--ckpt", required=True); ap.add_argument("--base", required=True); ap.add_argument("--seed", type=int, default=3)
+    ap.add_argument("--ckpt", default="", help="learner checkpoint ('' = a fresh Policy with every input column in use)")
+    ap.add_argument("--base", default="", help="league checkpoint ('' = another fresh Policy)"); ap.add_argument("--seed", type=int, default=3)
     a = ap.parse_args()
-    dev = torch.device("cuda"); rng_b = np.random.default_rng(a.seed); loc = "Survival604"
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu"); rng_b = np.random.default_rng(a.seed); loc = "Survival604"
+    made = []
     def net_of(p):
-        m = Policy().to(dev).eval(); m.load_state_dict(torch.load(p, map_location="cpu", weights_only=False)["model"], strict=False); return m
+        m = Policy().to(dev).eval()
+        if p: m.load_state_dict(torch.load(p, map_location="cpu", weights_only=False)["model"], strict=False)
+        else:                                            # fresh: the zero-initialised branches made live, so they are compared too
+            torch.manual_seed(a.seed * 10 + len(made)); made.append(p)
+            with torch.no_grad(): m.hemb.weight.normal_(0, 0.1); m.ent[0].weight.normal_(0, 0.1); m.vp[2].weight.normal_(0, 0.1)
+        return m
     nets = [net_of(a.ckpt), None, None, net_of(a.base), net_of(a.base)]    # learner / (eval) / (base) / league slots 0, 1
 
     def battle_fn(rng, i):
