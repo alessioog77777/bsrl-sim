@@ -149,7 +149,8 @@ def sample(logits):
 def _rand_batch(B, rng):
     s = rng.normal(size=(B, NS)).astype(np.float32); ent = np.zeros((B, O.N_ENT, O.F_ENT), np.float32)
     on = rng.random((B, O.N_ENT)) < 0.3; ent[..., 0] = on; ent[np.arange(B)[:, None], np.arange(O.N_ENT)[None], 1 + rng.integers(0, len(O.ENT), (B, O.N_ENT))] = 1
-    ent[..., O.XY:O.XY + 4] = rng.normal(size=(B, O.N_ENT, 4)) * [1, 1, 0.1, 0.1]; ent *= ent[..., :1]   # + velocity (lead)
+    ent[..., O.XY:O.XY + 4] = rng.normal(size=(B, O.N_ENT, 4)) * [1, 1, 0.1, 0.1]   # + velocity (lead)
+    ent[..., O.ID0:] = rng.random((B, O.N_ENT, O.F_ENT - O.ID0)) < 0.5; ent *= ent[..., :1]   # identity / line of sight (v5.6)
     grid = rng.integers(0, O.UNKNOWN + 1, (B, O.G, O.G)).astype(np.uint8)
     return s, ent, grid, rng.normal(size=(B, HID)).astype(np.float32) * 0.3, rng.normal(size=(B, PRIV)).astype(np.float32)
 
@@ -197,6 +198,8 @@ def _check(B=70, G=4, iters=100):
         with torch.no_grad():
             n.hemb.weight.normal_(0, 0.1); n.ent[0].weight[:, O.F_ENT:].normal_(0, 0.3); n.cand[0].weight[:, -2:].normal_(0, 0.3)
             n.vec[0].weight[:, O.S_INT:].normal_(0, 0.3)                  # the intent columns (zero in a fresh Policy)
+            n.ent[0].weight[:, O.ID0:O.F_ENT].normal_(0, 0.3); pre = n.cand[0].weight.shape[1] - O.F_ENT - 2   # identity / LOS (v5.6)
+            n.cand[0].weight[:, pre + O.ID0:pre + O.F_ENT].normal_(0, 0.3)
     actor = StackedActor(dev)
     d = compare(nets, gidx, s, ent, grid, h, pv, actor)
     print("fast_act vs act_stacked (random weights): max |d|", {k: "%.1e" % x for k, x in d.items()})

@@ -29,20 +29,21 @@ class FastObsV5(O.ObsV5):
                      "grid": np.zeros((cap, R, G, G), np.uint8)}
 
     def _episode(self, aid):
-        """ObsV5._episode (same draws, same eviction) + a state slot as e[9]; evicted slots are freed after this build"""
+        """ObsV5._episode (same draws, same eviction; e[9] = the identity draws) + a state slot as e[10]; evicted slots
+        are freed after this build"""
         e = self.ep.get(aid)
         if e is None:
             n, r = self.noise, self.rng
             e = self.ep[aid] = [r.uniform(*n["jitter"]), r.uniform(*n["drop"]), r.uniform(*n["fp"]), r.uniform(*n["seg"]),
                                 int(r.integers(n["latency"][0], n["latency"][1] + 1)), None, None, r.uniform(*n.get("bleed", (0, 0))),
-                                r.uniform(*n.get("drop_cls", (0, 0))), self.free.pop()]
-            self.t[e[9]] = 0; self.has[e[9]] = False
+                                r.uniform(*n.get("drop_cls", (0, 0))), O.id_draws(n, r), self.free.pop()]
+            self.t[e[10]] = 0; self.has[e[10]] = False
             if len(self.ep) > 4096:   # shortcut (ObsV5's): ended episodes are never reported here, so drop the oldest half
-                for k in list(self.ep)[:2048]: self.unfree.append(self.ep.pop(k)[9])
+                for k in list(self.ep)[:2048]: self.unfree.append(self.ep.pop(k)[10])
         return e
 
-    def build(self, vec, grid, meta, ids, cmd=None):
-        o = from_state2(vec, grid, meta)
+    def build(self, vec, grid, meta, ids, cmd=None, who=None):
+        o = from_state2(vec, grid, meta, who, derived=self.noise is None or not len(ids))
         if self.noise is None or not len(ids):
             return o
         r, B = self.rng, len(ids)
@@ -78,8 +79,12 @@ class FastObsV5(O.ObsV5):
         g[bleed] = front[bleed]
         wrong = (g != UNKNOWN) & (r.random(g.shape) < seg[:, None, None])
         g[wrong] = r.integers(len(SEG), size=int(wrong.sum()))
+        link = r.random((B, N_ENT))                       # identity (v5.6): ObsV5.build's, already batched
+        if who is None: ent[..., O.ID0:O.ID0 + O.N_ID] = 0.0
+        else: O.noisy_id(ent, np.where(here[..., None], who, -1), [e[9] for e in eps], link)
+        ent[..., O.LOS:O.LOS + 2] = O.los(ent, g)
         # ---- velocity (vectorised): difference of two noisy detections, 0 for one not matched to the last decision
-        sl = np.array([e[9] for e in eps], np.int64)
+        sl = np.array([e[10] for e in eps], np.int64)
         on, cls = ent[..., 0] > 0.5, ent[..., 1:1 + len(ENT)].argmax(-1)
         move = (ent[..., VEL:VEL + 2] - o["self"][:, None, 6:8]) * (self.ticks / 10)
         pon, pcls, pxy, pn = self.pon[sl], self.pcls[sl], self.pxy[sl], self.pn[sl]
@@ -139,10 +144,20 @@ def _synthetic(rng, B, n_ids=40):
     return vec, grid, meta, ids
 
 
+def _who(rng, vec):
+    """a synthetic `who` for _synthetic's rows: enemy-block / projectile rows owned by random players, sides, brawlers"""
+    B = len(vec); w = np.full((B, N_ENT, 3), -1, np.int16); nh = len(O.id_lut()[0])
+    for blk, off, K, Fn in ((0, FAIR.EN0, FAIR.EN_K, FAIR.EN_F), (FAIR.EN_K, FAIR.PJ0, FAIR.PJ_K, FAIR.PJ_F)):
+        on = vec[:, off:off + K * Fn].reshape(B, K, Fn)[..., 0] > 0.5
+        q = rng.integers(0, 10, (B, K)); w[:, blk:blk + K] = np.stack([q, (q * 7 + 3) % nh, q % 3 if blk else q % 2], -1)
+        w[:, blk:blk + K][~on] = -1
+    return w
+
+
 def _check(steps=300):
     rng = np.random.default_rng(1)
     a, b = O.ObsV5(seed=5), FastObsV5(seed=5)
-    base = _synthetic(rng, 30)
+    base = _synthetic(rng, 30); bw = _who(rng, base[0]); n_id = 0
     for t in range(steps):                               # the same agents drift; random subsets per poll; new agents now and then
         vec, grid, meta, ids = base
         vec = vec + rng.normal(size=vec.shape).astype(np.float32) * 0.01 * (vec != 0)
@@ -150,14 +165,18 @@ def _check(steps=300):
         ids2 = ids[pick] + 16 * (t // 50)                # every 50 polls a fresh set of agent ids
         x = (vec[pick], grid[pick], meta[pick], ids2)
         cmd = rng.normal(size=(int(pick.sum()), 2)).astype(np.float32) * 0.12 if t % 2 else None   # A2 path every other poll
-        oa, ob = a.build(*[y.copy() for y in x], cmd=cmd), b.build(*[y.copy() for y in x], cmd=cmd)
+        w = bw[pick] if t % 3 else None                  # identities given on 2 of 3 polls
+        oa, ob = a.build(*[y.copy() for y in x], cmd=cmd, who=w), b.build(*[y.copy() for y in x], cmd=cmd, who=w)
         assert same(oa, ob), t
+        n_id += int(oa["ent"][..., O.ID_KNOWN].sum())
+    assert n_id > 1000, n_id                             # the identity path ran (known rows, wrong picks, links)
     # eviction path: > 4096 agents
     a, b = O.ObsV5(seed=6), FastObsV5(seed=6)
     for t in range(250):
         vec, grid, meta, _ = _synthetic(rng, 40)
         ids = np.arange(40) + 16 + 40 * (t // 2) * 16 if t % 3 else np.arange(40) * 16 + 16   # the first set keeps coming back
-        assert same(a.build(vec.copy(), grid.copy(), meta.copy(), ids), b.build(vec, grid, meta, ids)), t
+        w = _who(rng, vec)
+        assert same(a.build(vec.copy(), grid.copy(), meta.copy(), ids, who=w), b.build(vec, grid, meta, ids, who=w)), t
     assert len(a.ep) == len(b.ep) and list(a.ep) == list(b.ep)
     # A2: no noise, no latency; we stand still, the commanded move says 0.12 tiles / tick right -> self = cmd and a still
     # enemy reads -(true own - cmd) = +0.12 x (as the agent: matched position difference + commanded own velocity)

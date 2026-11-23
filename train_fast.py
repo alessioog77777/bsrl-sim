@@ -171,7 +171,7 @@ def worker(w, lo, hi, a, loc, out, conn, shm, init, ashm=None):
             obs, ids, tr = env.poll(min_ready=min(a.min_ready or (hi - lo), hi - lo), max_wait=a.max_wait)
             t1 = time.perf_counter(); B = len(ids); msg = {"B": B}
             if B:
-                o = ob.build(obs["vec"], obs["grid"], env.last_meta, ids, cmd=env.cmd_vel(ids) if a.cmd_vel else None)
+                o = ob.build(obs["vec"], obs["grid"], env.last_meta, ids, cmd=env.cmd_vel(ids) if a.cmd_vel else None, who=env.last_who)
                 X[:B, :_OFF[1]] = policy_s(env, ids, o); X[:B, _OFF[1]:_OFF[2]] = o["ent"].reshape(B, -1)   # s = self | cond | intent
                 X[:B, _OFF[2]:_OFF[3]] = o["grid"].reshape(B, -1); X[:B, _OFF[3]:_OFF[4]] = FO.priv_fast(env, ids)
                 kind = [t["kind"] for t in env.last_tags]; isev = np.char.startswith(np.array(kind), "eval")
@@ -275,7 +275,7 @@ def main(argv=None):
         net.load_state_dict(ck["model"], strict=False)
         if ck.get("obs_version") != O.OBS_VERSION:   # older inputs: the new columns load zero-padded (model.load_state_dict), same actions
             print("checkpoint obs %s, this code %s: new input columns zero-padded" % (ck.get("obs_version", "< v5.4"), O.OBS_VERSION), flush=True)
-        load_opt(opt, ck["opt"]); load_opt(opt_x, ck.get("opt_x"), "optimizer state of the non-acting heads")
+        load_opt(opt, ck["opt"], net=net); load_opt(opt_x, ck.get("opt_x"), "optimizer state of the non-acting heads", net=net)
         if ck.get("ref"): ref = frozen(ck["ref"])
         bnet = frozen(torch.load(a.base, map_location="cpu", weights_only=False)["model"] if a.base else ck["model"])
     ck = None

@@ -704,7 +704,7 @@ def run(a):
             if all(s.state == "idle" for s in env.I): break
             if not len(ids): continue
             if t0 is None: t0 = time.time()
-            o = ob.build(obs["vec"], obs["grid"], env.last_meta, ids); s = policy_s(env, ids, o)
+            o = ob.build(obs["vec"], obs["grid"], env.last_meta, ids, who=env.last_who); s = policy_s(env, ids, o)
             h = np.stack([hid.get(int(x), z) for x in ids])
             with torch.no_grad():
                 lg, _, h2 = net(T(s), T(o["ent"]), T(o["grid"], torch.uint8), T(h), T(priv(env, ids)))

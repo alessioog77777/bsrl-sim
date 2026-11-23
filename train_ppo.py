@@ -103,9 +103,17 @@ def replay_frame(s, ids, b, o, act):
     r = s.inst.resp; e = o["ent"][b]; e = e[e[:, 0] > 0.5]
     return {"t": int(r.tick), "f": int(ids[b]) & 15, "a": [int(x) for x in act[b]],
             "p": [[int(r.pl[p].x), int(r.pl[p].y), int(r.pl[p].hp), int(r.pl[p].max_hp), int(bool(r.pl[p].alive) and not r.pl[p].eliminated)] for p in range(10)],
-            "e": [[int(x[1:1 + len(O.ENT)].argmax()), round(float(x[O.XY]), 3), round(float(x[O.XY + 1]), 3), round(float(x[O.HP]), 2)] for x in e],
+            "e": [[int(x[1:1 + len(O.ENT)].argmax()), round(float(x[O.XY]), 3), round(float(x[O.XY + 1]), 3), round(float(x[O.HP]), 2)]
+                  + id_name(x) for x in e],                # + the brawler the policy was given (v5.6), when known
             "s": [round(float(x), 2) for x in o["self"][b, :5]], "g": "".join(chr(97 + c) for c in o["grid"][b].ravel()),
             **intent_frame(o, b)}
+
+
+def id_name(x):
+    """[name] of the brawler whose obs_v5.brawler_stats an entity row's identity columns hold (known rows), else []"""
+    if x[O.ID_KNOWN] < 0.5: return []
+    names, lut = O.id_lut(); d = ((lut[:-1] - x[O.ID0:O.ID0 + 13].astype(np.float32)) ** 2).sum(1)
+    return [names[int(d.argmin())]] if d.min() < 1e-6 else []
 
 
 def intent_frame(o, b):
@@ -274,19 +282,22 @@ def head_flags(ap):
     ap.add_argument("--aux-w", type=float, default=0.0, help="weight of the aux head losses (model.Policy.aux; 0 = off: no loss, no gradient; start 0.1)")
 
 
-def load_opt(opt, sd, what="optimizer state"):
+def load_opt(opt, sd, what="optimizer state", net=None):
     """an optimizer state from a checkpoint; moments of a parameter that grew since (new input columns, zero-padded by
-    model.load_state_dict) are zero-padded the same way (torch loads them unchecked and the first step would fail); a
-    different parameter set -> the fresh Adam is kept (printed)"""
+    model.load_state_dict) are padded the same way (model.pad_param by the parameter's name in net: the entity inputs
+    get their new columns before the lead columns; without net, or a tail input: zeros at the end; torch loads them
+    unchecked and the first step would fail); a different parameter set -> the fresh Adam is kept (printed)"""
     if not sd: return
     try: opt.load_state_dict(sd)
     except ValueError: print("%s not loaded (parameters changed): fresh Adam" % what, flush=True); return
+    from model import pad_param
+    name = {id(p): k for k, p in net.named_parameters()} if net is not None else {}
     for g in opt.param_groups:
         for p in g["params"]:
             st = opt.state.get(p, {})
             for k, v in st.items():
-                if torch.is_tensor(v) and v.dim() == p.dim() and v.shape != p.shape and all(x <= y for x, y in zip(v.shape, p.shape)):
-                    z = torch.zeros_like(p); z[tuple(slice(0, n) for n in v.shape)] = v; st[k] = z
+                if torch.is_tensor(v) and v.dim() == p.dim() and v.shape != p.shape:
+                    st[k] = pad_param(name.get(id(p), ""), v, p.detach())
 
 
 def split_params(net):
@@ -480,8 +491,17 @@ def _check():
     b_ = torch.nn.Linear(49, 4); o2 = torch.optim.Adam(b_.parameters()); load_opt(o2, o_.state_dict())   # an input that grew
     m_ = o2.state[b_.weight]["exp_avg"]; assert m_.shape == (4, 49) and not m_[:, 38:].any() and torch.equal(m_[:, :38], o_.state[a_.weight]["exp_avg"])
     b_(torch.randn(2, 49)).sum().backward(); o2.step()
+    import model as M                                    # obs v5.6: an entity input's moments get the new columns before the lead
+    from model import Policy as P_, F_IN
+    n_ = P_(); c_ = n_.cand[0].weight; pre = c_.shape[1] - F_IN; F55 = O.F_ENT_V55 + 2
+    a_ = torch.nn.Linear(pre + F55, 128); o_ = torch.optim.Adam(a_.parameters()); a_(torch.randn(2, pre + F55)).sum().backward(); o_.step()
+    o3 = torch.optim.Adam([c_, n_.cand[0].bias]); load_opt(o3, o_.state_dict(), net=n_); m3, m0 = o3.state[c_]["exp_avg"], o_.state[a_.weight]["exp_avg"]
+    assert m3.shape == c_.shape and torch.equal(m3[:, :pre + O.F_ENT_V55], m0[:, :pre + O.F_ENT_V55]) and torch.equal(m3[:, -2:], m0[:, -2:])
+    assert not m3[:, pre + O.F_ENT_V55:pre + O.F_ENT].any() and M.ENT_IN[1] == "cand.0.weight"
     import intent as I                                   # replay frame "i", progress intent fields
     o = {"intent": I.encode([0, 5], [0, 3.0], [0, -1.0], [0, 1.0], [0, 0.5])}
+    x = np.zeros(O.F_ENT, np.float32); assert id_name(x) == []
+    x[O.ID0:O.ID0 + 13] = O.brawler_stats("Sniper"); x[O.ID_KNOWN] = 1; assert id_name(x) == ["Sniper"]
     assert intent_frame(o, 0) == {} and intent_frame({}, 0) == {} and intent_frame(o, 1)["i"] == {"k": "farm", "t": [0.3, -0.1], "r": 0.1, "l": 0.5}
     st = intent_stats([{"intents": {"farm": [2, 1, 1, 0]}, "terms": {"i_rew": 0.02}, "intent_mode": "steered"},
                        {"intents": {}, "terms": {"i_rew": 0.0}, "intent_mode": "free"}, {"terms": {}}])
@@ -536,7 +556,7 @@ def main():
         net.load_state_dict(ck["model"], strict=False); upd, agent_steps = ck["update"], ck["agent_steps"]
         if ck.get("obs_version") != O.OBS_VERSION:   # older inputs: the new columns load zero-padded (model.load_state_dict), same actions
             print("checkpoint obs %s, this code %s: new input columns zero-padded" % (ck.get("obs_version", "< v5.4"), O.OBS_VERSION), flush=True)
-        load_opt(opt, ck["opt"]); load_opt(opt_x, ck.get("opt_x"), "optimizer state of the non-acting heads")
+        load_opt(opt, ck["opt"], net=net); load_opt(opt_x, ck.get("opt_x"), "optimizer state of the non-acting heads", net=net)
         if ck.get("ref"): ref = frozen(ck["ref"])
         bnet = frozen(torch.load(a.base, map_location="cpu", weights_only=False)["model"] if a.base else ck["model"])
     kmix = [int(x) for x in a.kmix.split(",")]; rng_b = np.random.default_rng(a.seed + 7)
@@ -630,7 +650,7 @@ def main():
                 for aid in env.dropped: pending.pop(aid, None); hid.pop(aid, None)
                 env.dropped = []
                 if not len(ids): continue
-                tq = time.perf_counter(); o = ob.build(obs["vec"], obs["grid"], env.last_meta, ids); tm[1] += time.perf_counter() - tq
+                tq = time.perf_counter(); o = ob.build(obs["vec"], obs["grid"], env.last_meta, ids, who=env.last_who); tm[1] += time.perf_counter() - tq
                 s = policy_s(env, ids, o); h = np.stack([hid.get(int(x), z) for x in ids])
                 pv = priv(env, ids); B = len(ids); kind = np.array([t["kind"] for t in env.last_tags])
                 isev = np.char.startswith(kind, "eval"); opp = np.array([int(x) & 15 in t.get("opp", ()) for x, t in zip(ids, env.last_tags)], bool)

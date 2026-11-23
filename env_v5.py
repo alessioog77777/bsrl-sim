@@ -24,8 +24,11 @@ p_rand_intent, the planner's (step E: Env.planner, p_plan; 0 until then) or none
 computed in _finish_step on the true positions: reward += intent_scale x intent.step_reward, transition term "i_rew"
 (the scaled part; the trainers' rew_int), episode rows "intents" {kind: [started, achieved, timeout, invalid]},
 "intent_mode" free | steered and terms "i_rew".
+Identity (obs v5.6): every poll sets `Env.last_who` = who(ids, vec), the owner player / brawler / side of each fair
+observation row, read from the host's snap2 dump of that response (F_STATE; no host change) and matched to the rows by
+position; obs_v5.ObsV5.build(..., who=env.last_who) turns it into the identity columns (with the identity noise).
 """
-import argparse, json, os, re, sys, time
+import argparse, json, os, sys, time
 import numpy as np
 from nbpc import diversity as D, proto as P, fair as FAIR
 from nbpc.maenv import MAEnv
@@ -44,12 +47,10 @@ def SC():
 
 
 def heroes():
-    """playable brawlers = Hero rows that own cards (drops transforms, bosses and the hashed unreleased rows)"""
-    owners = {r["Target"] for r in D._rows("cards.csv")}
+    """playable brawlers = Hero rows that own cards (obs_v5.hero_names: drops transforms, bosses and the hashed unreleased
+    rows) minus skip.json"""
     bad = set(_skip().get("brawlers", []))
-    return [n for n, (_, r) in D.table("characters.csv").items()
-            if r.get("Type") == "Hero" and r.get("Disabled") != "true" and n in owners
-            and not re.fullmatch(r"[0-9a-f]{40}", n) and n not in bad]
+    return [n for n in O.hero_names() if n not in bad]
 
 
 def locations():
@@ -336,10 +337,62 @@ class Env(MAEnv):
 
     def _gather(self):
         out = super()._gather(); self.last_vec = out[0]["vec"]   # the fair state2 rows of this poll (intents: boxes / cubes in view)
+        self.last_who = self.who(out[1], out[0]["vec"])           # the rows' owners (obs_v5 identity columns)
         return out
 
     def _flags(self):
-        return super()._flags() | (P.F_REC if self.record else 0) | (P.F_MAP if getattr(self, "_map_now", False) else 0)
+        # F_STATE: the host keeps state_ints of the snap2 dump it encodes the observations from anyway (env.c: no other
+        # effect), so who() can read the owners of the rows
+        return super()._flags() | P.F_STATE | (P.F_REC if self.record else 0) | (P.F_MAP if getattr(self, "_map_now", False) else 0)
+
+    def who(self, ids, vec):
+        """(B, N_ENT, 3) int16 per observation row (obs_v5 `who`): owner player index, its brawler's obs_v5.id_lut row,
+        side (obs_v5.WHO_FOE / WHO_MATE / WHO_ME); -1 = none. From the host's snap2 dump of this response (the state the
+        encoder wrote the rows from; characters [0] id, [1] data id, [2] owner player, [3, 4] x, y, [6] hp, [18] not a
+        brawler class; projectiles [2] owner, [3, 4] x, y; players [0] index, [1] team, [2] character, [3] controlled),
+        matched to the fair rows by position: a row's dx, dy are float32((x - my x) / 3000) of exactly one dump row (an
+        exact tie of two objects takes the first in dump order). Enemy-block rows that are brawlers (feature 14 = 0) match
+        the players' brawlers, projectile rows the projectiles; summons, boxes, items: -1. The brawler = the character's
+        data id (the tag's pick if its character is gone, e.g. a projectile of an eliminated player)."""
+        B = len(ids); out = np.full((B, O.N_ENT, 3), -1, np.int16)
+        if not B: return out
+        ids = np.asarray(ids, np.int64); by = {s.battle: s for s in self.I}
+        for bat in np.unique(ids >> 4):
+            s = by.get(int(bat)); rows = np.flatnonzero((ids >> 4) == bat)
+            a = np.asarray(s.inst.state_i32) if s is not None else None
+            if a is None or a[0] != 0x4e423253 or not 0 < a[3] <= 16: continue   # no dump (e.g. an older host)
+            npl, nch, npj = int(a[3]), int(a[4]), int(a[5]); k0 = 8 + npl * 8
+            pl = a[8:k0].reshape(npl, 8); ch = a[k0:k0 + nch * 23].reshape(nch, 23); pj = a[k0 + nch * 23:k0 + nch * 23 + npj * 18].reshape(npj, 18)
+            team = np.full(16, -999, np.int64); bid = np.full(16, -1, np.int64); ok = (pl[:, 0] >= 0) & (pl[:, 0] < 16)
+            team[pl[ok, 0]] = pl[ok, 1]
+            bid[pl[ok, 0]] = np.where((pl[ok, 3] != 0) & (pl[ok, 3] != -2 ** 31), pl[ok, 3], pl[ok, 2])
+            own = ch[:, 2]; br = (ch[:, 18] == 0) & (own >= 0) & (own < 16) & (ch[:, 0] == bid[np.clip(own, 0, 15)])
+            hero = np.array([O.id_row(c) for c in ((s.cfg.get("tag") or {}).get("chr") or [""] * 10)] + [-1] * 16, np.int64)[:16]
+            for c in np.flatnonzero(br):                 # the character on the map names the brawler
+                r_ = O.id_row_of_data(ch[c, 1])
+                if r_ >= 0: hero[own[c]] = r_
+            p = ids[rows] & 15; mi = np.full(len(p), -1, np.int64)
+            for j, q in enumerate(p):                    # my brawler's dump row (the encoder's origin)
+                f = np.flatnonzero(br & (own == q))
+                if len(f): mi[j] = f[0]
+            has = mi >= 0; mi = np.maximum(mi, 0)
+            mx, my = ch[mi, 3].astype(np.float64), ch[mi, 4].astype(np.float64)
+            f32 = lambda c, m: ((c[None].astype(np.float64) - m[:, None]) / FAIR.R).astype(np.float32)   # encode.c's dx, dy
+            v = vec[rows]
+            for blk, K, Fn, cand, cx, cy, co in ((0, FAIR.EN_K, FAIR.EN_F, br & (ch[:, 6] > 0) & (ch[:, 1] != 16000120), ch[:, 3], ch[:, 4], own),
+                                                 (FAIR.EN_K, FAIR.PJ_K, FAIR.PJ_F, (pj[:, 2] >= 0) & (pj[:, 2] < 16), pj[:, 3], pj[:, 4], pj[:, 2])):
+                off = FAIR.EN0 if blk == 0 else FAIR.PJ0; e = v[:, off:off + K * Fn].reshape(len(rows), K, Fn)
+                if not cand.any(): continue
+                dx, dy = f32(cx[cand], mx), f32(cy[cand], my); oc = co[cand].astype(np.int64)
+                hit = (e[:, :, 1, None] == dx[:, None]) & (e[:, :, 2, None] == dy[:, None]) & (oc[None, None] != p[:, None, None]) if blk == 0 else \
+                      (e[:, :, 1, None] == dx[:, None]) & (e[:, :, 2, None] == dy[:, None])
+                hit &= (e[:, :, :1] > 0.5) & has[:, None, None]
+                if blk == 0: hit &= e[:, :, 14:15] < 0.5         # summons stay unknown
+                got = hit.any(2); q = oc[hit.argmax(2)]
+                side = np.where(q == p[:, None], O.WHO_ME, np.where(team[q] == team[p][:, None], O.WHO_MATE, O.WHO_FOE))
+                w = np.stack([q, hero[q], side], -1); w[~got] = -1
+                out[rows, blk:blk + K] = w
+        return out
 
     def _send_step(self, i, acts):
         s = self.I[i]; s.nstep = getattr(s, "nstep", 0) + 1; self._map_now = s.nstep % self.MAP_EVERY == 0
@@ -785,7 +838,8 @@ def _check():
     assert np.isclose(env._trans[-1][3]["te"], 0.5), env._trans[-1][3]          # aux hit label: enemy damage only
     _check_aux(players, tiles, bush, NS)
     _check_intents(players, tiles, NS)
-    print("env_v5 sliders, aux labels, intents ok")
+    _check_who(NS)
+    print("env_v5 sliders, aux labels, intents, identity rows ok")
 
 
 def _check_aux(players, tiles, bush, NS):
@@ -804,6 +858,39 @@ def _check_aux(players, tiles, bush, NS):
     assert A["gm"][0] == 14 - 3, A["gm"]                    # tile (15, 14) on a 60 x 40 map, storm ring 3
     assert np.flatnonzero(A["be"][0]).tolist() == [2, 5], A["be"][0]   # p1 below (90 deg), p6 up-left (225 deg)
     assert np.flatnonzero(A["be"][2]).tolist() == [3] and env.aux_now([]).shape == (0, AUX_W)   # p2: p1 down-left 1485 away; p3 750 away = seen
+
+
+def _check_who(NS):
+    """Env.who on a synthetic snap2 dump + the fair rows the encoder would write from it (dx, dy = float32 of the offset
+    / 3000): brawlers -> owner / tag brawler (or the character's data id) / side; summons, boxes, items none; projectiles
+    their owner (mine = WHO_ME); my own brawler is never a row; a vacant slot none"""
+    chr_ = ["Sniper", "BullDude", "ShotgunGirl", "Gunslinger", "RocketGirl", "Sniper", "BullDude", "Sniper", "Sniper", "Sniper"]
+    team = [0, 0, 1, 1, 2, 2, 3, 3, 4, 4]; NIL = -2 ** 31; cd = lambda n: D.table("characters.csv")[n][0]
+    pl = [[i, team[i], 100 + i, NIL if i != 4 else 400, 0, 1, 0, 0] for i in range(10)]   # player 4 controls character 400
+    xy = {i: (3000 + 450 * i, 6000 - 300 * i) for i in range(10)}
+    ch = [[100 + i, cd(chr_[i]), i, *xy[i], 0, 3000, 3000] + [0] * 15 for i in range(10) if i != 4]
+    ch.append([400, cd("Gunslinger"), 4, *xy[4], 0, 3000, 3000] + [0] * 15)         # 4's brawler on the map: Gunslinger, not its tag pick
+    ch.append([200, cd("Sniper"), 3, 3300, 6300, 0, 900, 900] + [0] * 15)            # a summon of player 3 (not its brawler)
+    ch.append([300, 16000120, -1, 3600, 6300, 0, 4000, 4000] + [0] * 15)             # a power box
+    pj = [[500 + k, 0, q, 3000 + 100 * k, 5000, 0] + [0] * 12 for k, q in enumerate([0, 2, 1, 7])]
+    a = np.zeros(8192, np.int32); a[[0, 3, 4, 5, 6]] = [0x4e423253, 10, len(ch), len(pj), 0]
+    flat = np.array(sum(pl, []) + sum(ch, []) + sum(pj, []), np.int32); a[8:8 + len(flat)] = flat
+    env = Env.__new__(Env); env.I = [NS(battle=1, inst=NS(state_i32=a), cfg={"tag": {"chr": chr_}})]
+    vec = np.zeros((1, 436), np.float32); mx, my = xy[0]; f = lambda v, m: np.float32((v - m) / FAIR.R)
+    rows = [(xy[2], 0, 0), (xy[1], 0, 1), (xy[4], 0, 0), ((3300, 6300), 1, 0)]        # (position, summon, on my team): players 2, 1, 4, the summon
+    for k, ((x, y), summ, mate) in enumerate(rows):
+        o = FAIR.EN0 + k * FAIR.EN_F; vec[0, o:o + 3] = [1, f(x, mx), f(y, my)]; vec[0, o + 14] = summ; vec[0, o + 15] = mate
+    for k, r in enumerate(pj): o = FAIR.PJ0 + k * FAIR.PJ_F; vec[0, o:o + 3] = [1, f(r[3], mx), f(r[4], my)]; vec[0, o + 5] = r[2] == 0
+    o = FAIR.BX0; vec[0, o:o + 3] = [1, f(3600, mx), f(6300, my)]
+    w = env.who(np.array([16]), vec)[0]
+    assert w.shape == (O.N_ENT, 3) and w.dtype == np.int16
+    assert w[0].tolist() == [2, O.id_row("ShotgunGirl"), O.WHO_FOE] and w[1].tolist() == [1, O.id_row("BullDude"), O.WHO_MATE], w[:3]
+    assert w[2].tolist() == [4, O.id_row("Gunslinger"), O.WHO_FOE] and (w[3] == -1).all() and (w[4:9] == -1).all()
+    side = [O.WHO_ME, O.WHO_FOE, O.WHO_MATE, O.WHO_FOE]
+    assert [w[FAIR.EN_K + k].tolist() for k in range(4)] == [[q, O.id_row(chr_[q]), sd] for q, sd in zip([0, 2, 1, 7], side)], w[9:13]
+    assert (w[FAIR.EN_K + 4:] == -1).all()                                            # vacant projectile slots, boxes, items
+    vec[0, FAIR.EN0 + 1:FAIR.EN0 + 3] = [0, 0]                                       # a row at my own spot: never my brawler
+    assert (env.who(np.array([16]), vec)[0, 0] == -1).all() and env.who(np.zeros(0, np.int64), vec[:0]).shape == (0, O.N_ENT, 3)
 
 
 def _check_intents(players, tiles, NS):

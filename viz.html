@@ -164,7 +164,8 @@ function frame(){if(!RP)return;const F=RP.frames[fi],cv=$('map'),g=cv.getContext
   for(let i=0;i<625;i++){const n=RP.seg[F.g.charCodeAt(i)-97];if(n=='unknown')continue;h.fillStyle=TILE[n];h.fillRect((i%25)*t,(i/25|0)*t,t,t)}
   const ox=(me[0]%300)/300*t,oy=(me[1]%300)/300*t,mx=12*t+ox,my=12*t+oy;
   for(const e of F.e){const n=RP.ent[e[0]],ex=mx+e[1]*10*t,ey=my+e[2]*10*t,r=/projectile/.test(n)?3:/box|cube/.test(n)?5:6;h.fillStyle=css(ECOL[n]);
-    if(/box|cube|area/.test(n))h.fillRect(ex-r,ey-r,2*r,2*r);else{h.beginPath();h.arc(ex,ey,r,0,7);h.fill()}h.lineWidth=1.5;h.strokeStyle=css('--surf');h.strokeRect(ex-r,ey-r,2*r,2*r)}
+    if(/box|cube|area/.test(n))h.fillRect(ex-r,ey-r,2*r,2*r);else{h.beginPath();h.arc(ex,ey,r,0,7);h.fill()}h.lineWidth=1.5;h.strokeStyle=css('--surf');h.strokeRect(ex-r,ey-r,2*r,2*r);
+    if(e[4]&&!/projectile/.test(n)){h.fillStyle=ink;h.font='10px sans-serif';h.fillText(e[4],ex+r+2,ey-r)}}   // the brawler the policy was given (obs v5.6)
   h.beginPath();h.arc(mx,my,6,0,7);h.fillStyle=css('--c1');h.fill();
   let ix='';if(F.i){const I_=F.i,qx=mx+I_.t[0]*10*t,qy=my+I_.t[1]*10*t;h.strokeStyle=css('--c4');h.lineWidth=2;h.setLineDash([4,3]);   // the active intent: target + radius
     h.beginPath();h.moveTo(mx,my);h.lineTo(qx,qy);h.stroke();h.beginPath();h.arc(qx,qy,Math.max(3,I_.r*10*t),0,7);h.stroke();h.setLineDash([]);
