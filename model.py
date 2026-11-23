@@ -16,6 +16,14 @@ Obs v5.3 (obs_v5.OBS_VERSION): 4 area-effect columns at the end of the observati
 load_state_dict zero-pads v5.2 checkpoints there (same outputs).
 Obs v5.4: cond grew by 2 sliders (leash, gas_safe) at its end = the end of `s`; the generic pad zero-fills those
 `vec.0` input columns of a v5.3 checkpoint (same outputs; slot 7 push -> aggressive keeps its column).
+Heads the actor never runs (NONACT; fast_act / act_stacked skip them, old checkpoints load with strict=False and get
+fresh ones; built on their own RNG stream, so Policy() under a given seed has the acting weights it had without them):
+* live value `vl` (trainer --vlive): MLP on the detached cat[x, h], no priv, so it works live (priv does not exist
+  there) and never changes the policy; zero-initialised. Target: the return without the intent reward.
+
+    lg, v, xc = net.seq(s, ent, grid, h0, priv, feats=True)  # + xc = cat[x, h] (N * L, d + HID) for the heads below
+    vl = net.value_live(xc)                                   # (N * L,)
+    xc = net.row_feats(s, ent, grid, h)                       # cat[x, h'] of single decisions from their stored h (no grad)
 """
 import numpy as np
 import torch
@@ -25,6 +33,7 @@ import obs_v5 as O
 from models4 import UnfoldConv2d, dist_logp_ent      # nirkt (MIOpen-safe conv; masked log-prob / entropy / sampling)
 
 NVEC, HID, PRIV = [17, 3, 360, 8], 256, 40
+NONACT = ("vl.",)                                     # parameter prefixes acting never uses (skipped by fast_act / act_stacked)
 _CAND = list(range(0, 9)) + list(range(25, 31))       # ent slots that can be aimed at: the enemy block + the power boxes
 _FOE = [1 + O.ENT.index(c) for c in ("enemy", "enemy_summon", "power_box")]
 N_LEAD, HMAX, N_STAT = 2, 160, 13                     # lead columns; hero table rows (+1 unknown); cond's brawler stats
@@ -78,6 +87,10 @@ class Policy(nn.Module):
         with torch.no_grad():   # the lead columns start unused
             self.ent[0].weight[:, O.F_ENT:] = 0; self.cand[0].weight[:, -N_LEAD:] = 0
         self.register_buffer("bins", torch.arange(360).float())
+        with torch.random.fork_rng(devices=[]):          # own CPU stream: the acting weights' draws stay as before
+            torch.default_generator.manual_seed((torch.initial_seed() + 1) % 2 ** 63)
+            self.vl = nn.Sequential(nn.Linear(d + HID, 256), nn.ReLU(), nn.Linear(256, 1))   # live value (no priv)
+            nn.init.zeros_(self.vl[2].weight); nn.init.zeros_(self.vl[2].bias)
 
     def add_heroes(self, stats):
         """put each (13,) stats row not in the table yet into the next free row (order-stable across resumes) -> count"""
@@ -139,13 +152,26 @@ class Policy(nn.Module):
         (mv, fi, ai, di), v = self.heads(torch.cat([x, h], -1), ent, s, priv)
         return (mv, mask_super(fi, s), ai, di), v, h
 
-    def seq(self, s, ent, grid, h, priv=None):
+    def seq(self, s, ent, grid, h, priv=None, feats=False):
+        """feats: also return xc = cat[x, h] (N * L, d + HID), the input of value_live / the aux heads"""
         N, L = s.shape[:2]; f = lambda t: t.flatten(0, 1)
         x = self.encode(f(s), f(ent), f(grid)).view(N, L, -1); hs = []
         for t in range(L):
             h = self.gru(x[:, t], h); hs.append(h)
-        (mv, fi, ai, di), v = self.heads(f(torch.cat([x, torch.stack(hs, 1)], -1)), f(ent), f(s), None if priv is None else f(priv))
-        return (mv, mask_super(fi, f(s)), ai, di), v
+        xc = f(torch.cat([x, torch.stack(hs, 1)], -1))
+        (mv, fi, ai, di), v = self.heads(xc, f(ent), f(s), None if priv is None else f(priv))
+        return ((mv, mask_super(fi, f(s)), ai, di), v, xc) if feats else ((mv, mask_super(fi, f(s)), ai, di), v)
+
+    def value_live(self, xc):
+        """(N,) live value from cat[x, h]: no priv, detached input (a probe: its loss reaches only `vl`)"""
+        return self.vl(xc.detach()).squeeze(-1)
+
+    @torch.no_grad()
+    def row_feats(self, s, ent, grid, h):
+        """cat[x, h'] of single decisions from their stored GRU input state h (the acting math; the trainers' pass over a
+        rollout and the replay readout)"""
+        x = self.encode(s, ent, grid)
+        return torch.cat([x, self.gru(x, h)], -1)
 
 
 def mask_super(fi, s):
@@ -170,6 +196,11 @@ class _Act(nn.Module):
 _ACT_META = None
 
 
+def acting_params(net):
+    """name -> parameter of a Policy, without the heads acting never runs (NONACT)"""
+    return {k: v for k, v in net.named_parameters() if not k.startswith(NONACT)}
+
+
 def act_stacked(nets, xs):
     """one vmapped forward for several Policies (different weights) on their own row sets (speed round, HISTORY 68: the
     per-net loop paid ~8 ms of fixed GPU cost per net). nets: list of Policy; xs: list of (s, ent, grid, h, priv) device
@@ -180,7 +211,7 @@ def act_stacked(nets, xs):
     acts = [_Act(n) for n in nets]
     if _ACT_META is None: _ACT_META = _Act(Policy()).to("meta")
     st = lambda ds: {k: torch.stack([d[k].detach() for d in ds]) for k in ds[0]}   # detached: the learner has grads, frozen nets not
-    P, Bf = st([dict(a.named_parameters()) for a in acts]), st([dict(a.named_buffers()) for a in acts])
+    P, Bf = st([{"p." + k: v for k, v in acting_params(n).items()} for n in nets]), st([dict(a.named_buffers()) for a in acts])
     Bm = max(x[0].shape[0] for x in xs)
     pad = lambda t: torch.cat([t, t.new_zeros((Bm - t.shape[0],) + t.shape[1:])]) if t.shape[0] < Bm else t
     X = [torch.stack([pad(x[i]) for x in xs]) for i in range(5)]
@@ -219,8 +250,28 @@ def _check():
     lp, en, a = dist_logp_ent(lg2); assert a.shape == (N * L, 4) and torch.isfinite(lp).all()
     assert masked_kl(lg2, lg2).abs().max() < 1e-5
     (lp.mean() + v2.mean()).backward()
+    _check_live(net, s, ent, grid, pv)
     _check_stage2()
     print("model ok: %d parameters" % sum(x.numel() for x in net.parameters()))
+
+
+def _check_live(net, s, ent, grid, pv):
+    """vl: zero at init, its loss reaches only vl.*, feats / row_feats are the acting features, acting ignores NONACT"""
+    N = s.shape[0]; h0 = torch.zeros(N, HID); net.zero_grad(set_to_none=True)
+    lg, v, xc = net.seq(s, ent, grid, h0, pv, feats=True); lg0, v0 = net.seq(s, ent, grid, h0, pv)
+    assert all(torch.equal(a, b) for a, b in zip(lg, lg0)) and torch.equal(v, v0) and xc.shape == (s.shape[0] * s.shape[1], 512 + HID)
+    assert torch.allclose(net.row_feats(s[:, 0], ent[:, 0], grid[:, 0], h0), xc.view(N, -1, xc.shape[-1])[:, 0], atol=1e-6)
+    vl = net.value_live(xc); assert not vl.any()
+    ((vl - 1.0) ** 2).mean().backward()
+    assert all(p.grad is None for k, p in net.named_parameters() if not k.startswith("vl.")) and net.vl[2].weight.grad.abs().sum() > 0
+    xs = [(s[:, 0], ent[:, 0], grid[:, 0], h0, pv[:, 0])]
+    with torch.no_grad():
+        r0 = act_stacked([net], xs)
+        for k, p in net.named_parameters():
+            if k.startswith(NONACT): p.normal_(0, 0.5)
+        r1 = act_stacked([net], xs)
+    assert all(torch.equal(a, b) for a, b in zip(list(r0[0]) + [r0[1], r0[2]], list(r1[0]) + [r1[1], r1[2]])), "acting reads a non-acting head"
+    assert not any(k.startswith(NONACT) for k in acting_params(net)) and len(acting_params(net)) < len(dict(net.named_parameters()))
 
 
 def _check_stage2():

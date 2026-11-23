@@ -12,7 +12,9 @@ Same math as model.act_stacked (HISTORY 68: one forward for learner / eval copy 
 * rows are grouped and padded on the CPU into ONE pinned float32 block = one upload;
 * sampling = Gumbel-max on log_softmax (the distribution of torch Categorical.sample, without its validation
   overhead); log-prob masking as models4.dist_logp_ent (aim only when firing, distance only for a super);
-* the outputs (action, logp, value, next h) come back as ONE (N, 6 + HID) download.
+* the outputs (action, logp, value, next h) come back as ONE (N, 6 + HID) download;
+* only acting parameters are stacked (model.acting_params: the heads in model.NONACT, e.g. the live value, are skipped,
+  so they cost no stacked memory and their updates do not rebuild the stack).
 
     python -m fast_act      # allclose check vs model.act_stacked + timing (GPU shared with a live run = inflated)
 """
@@ -21,7 +23,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import obs_v5 as O
-from model import Policy, HID, PRIV, _CAND, _FOE, mask_super, lead, hero_index, F_IN, HMAX
+from model import Policy, HID, PRIV, _CAND, _FOE, mask_super, lead, hero_index, F_IN, HMAX, NONACT, acting_params
 
 NS = O.N_SELF + O.N_COND
 _W = [NS, O.N_ENT * O.F_ENT, O.G * O.G, PRIV, HID]      # block layout: s | ent | grid | priv | h
@@ -43,12 +45,12 @@ class StackedActor:
     def _stack(self, nets):
         """stacked weights of these nets (+ the fused head matrix), rebuilt only when any of their parameters changed"""
         key = tuple(id(n) for n in nets)
-        ver = tuple(sum(t._version for t in n.parameters()) + n.hero_stats._version for n in nets)
+        ver = tuple(sum(t._version for t in acting_params(n).values()) + n.hero_stats._version for n in nets)
         hit = self.cache.get(key)
         if hit is not None and hit[0] == ver: return hit[1]
         if len(self.cache) > 32: self.cache.clear()
         with torch.no_grad():
-            sd = [dict(n.named_parameters()) for n in nets]
+            sd = [acting_params(n) for n in nets]
             P = {k: torch.stack([d[k].detach() for d in sd]) for k in sd[0]}
             d = P["pi.weight"].shape[-1]; c1, vp1 = P["cand.0.weight"], P["vp.0.weight"]
             # one matmul for every linear that reads cat[x, h]: pi | v | free | free_score | cand.0 (x part) | vp.0 (x part)
@@ -199,6 +201,14 @@ def _check(B=70, G=4, iters=100):
     assert ok(d), d
     with torch.no_grad(): nets[0].pi.bias += 0.5                  # a weight change must reach the cached stack
     d = compare(nets, gidx, s, ent, grid, h, pv, actor); assert ok(d), ("stale cache", d)
+    X = np.concatenate([np.asarray(x_, np.float32).reshape(B, -1) for x_ in (s, ent, grid, pv)], 1)
+    used, Bm, dest = actor.layout(gidx); xb = np.zeros((len(used) * Bm, int(_OFF[-1])), np.float32); xb[dest, :OBS_W] = X; xb[dest, OBS_W:] = h
+    fw = lambda: actor.forward_padded([nets[g] for g in used], torch.as_tensor(xb, device=dev).view(len(used), Bm, -1))
+    with torch.no_grad():                                         # the non-acting heads (model.NONACT) change nothing here
+        r0 = fw(); [p.normal_(0, 0.5) for n in nets for k, p in n.named_parameters() if k.startswith(NONACT)]; r1 = fw()
+    assert all(torch.equal(x_, y_) for x_, y_ in zip(list(r0[0]) + list(r0[1:]), list(r1[0]) + list(r1[1:]))), "acting reads a non-acting head"
+    assert not any(k.startswith(NONACT) for k in actor._stack(nets)), "non-acting heads stacked"
+    d = compare(nets, gidx, s, ent, grid, h, pv, actor); assert ok(d), ("with non-acting heads", d)
     lgt = torch.tensor([[0.0, 1.0, -1.0, 2.0]], device=dev).expand(200000, 4)   # sampler = Categorical.sample in distribution
     fr = torch.bincount(sample([lgt, lgt[:, :3], lgt, lgt])[0][:, 0], minlength=4).float() / 200000
     assert (fr - torch.softmax(lgt[0], -1)).abs().max() < 0.01, fr

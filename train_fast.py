@@ -16,6 +16,7 @@ What changes (HISTORY 69):
   weights, so the PPO ratio covers it). Evals and checkpoints are only started between updates in this mode.
 Statistically the same algorithm, not bit-identical: every worker has its own battle / noise RNG streams, the rows
 of one forward come from whichever instances were ready, and actions are sampled by Gumbel-max (fast_act.sample).
+Non-acting heads (--vlive): as train_ppo (its helpers: targets / readouts in prepare(), losses in train()).
 progress.jsonl: all train_ppo fields; t_poll_build_act_rest = [main waiting for workers, build per worker (mean),
 act, rest] (workers run in parallel, so they no longer add up to the collect time) + "t_fast" (more timers) and
 "wall_dps" (learner decisions per wall second incl. the update).
@@ -43,7 +44,7 @@ def parse(argv=None):
     ap.add_argument("--kmix", default="1,2,3,4,5"); ap.add_argument("--brawler", default="Sniper", help="Sniper = Piper")
     ap.add_argument("--loc", default=None, help="Showdown location (default: the first of env_v5.locations())")
     ap.add_argument("--slider-scale", type=float, default=0.0, help="weight of the slider rewards (stage 1: off)")
-    from train_ppo import slider_flags; slider_flags(ap)   # --slider-norm / --slider-sample / --eval-sliders / --eval-presets
+    from train_ppo import slider_flags, head_flags; slider_flags(ap); head_flags(ap)   # --slider-norm / --slider-sample / --eval-sliders / --eval-presets; --vlive
     ap.add_argument("--reward-w", default="", help='JSON overrides of maenv.REWARD_W, e.g. {"taken": -0.25, "dealt": 0.3, "shots": -0.03} (HISTORY 77)')
     ap.add_argument("--noise", type=int, default=1, help="ObsV5 vision noise + latency")
     ap.add_argument("--eval-min", type=float, default=30.0); ap.add_argument("--eval-episodes", type=int, default=200)
@@ -86,7 +87,7 @@ def worker(w, lo, hi, a, loc, out, conn, shm, init):
     try:
         from nbpc import diversity as D
         import env_v5 as E, obs_v5 as O, fast_obs as FO
-        from train_ppo import Recorder, eval_tag
+        from train_ppo import Recorder, eval_tag, TR_X
         from fast_act import OBS_W, _OFF
         st = dict(init); evq = []; rng_b = np.random.default_rng(a.seed + 7 + 1000 * w)
         kmix = [int(x) for x in a.kmix.split(",")]; M = a.opp_slots; NW = a.workers
@@ -169,7 +170,7 @@ def worker(w, lo, hi, a, loc, out, conn, shm, init):
                 grp = np.where(~isev & ~opp, 0, np.where(isev & ~opp, 1, np.where(isev & opp, 2, 3 + sl)))   # learner / eval copy / base / league slot
                 msg.update(ids=ids, grp=grp.astype(np.int8), isbc=np.array([k == "bc" for k in kind]), dead=env.dead(ids))
             tw[0] += t1 - t0; tw[1] += time.perf_counter() - t1
-            msg["tr"] = [(aid, rew, done, t.get("_act")) for (aid, rew, done, t, rank) in tr]
+            msg["tr"] = [(aid, rew, done, t.get("_act"), {k: t[k] for k in TR_X if k in t}) for (aid, rew, done, t, rank) in tr]
             msg["dropped"] = env.dropped; env.dropped = []
             msg["eps"] = env.episodes[n_ep:]; n_ep = len(env.episodes)
             msg["busy"] = len(evq) + sum(s.state != "idle" and (s.cfg or {}).get("tag", {}).get("kind", "").startswith("eval") for s in env.I)
@@ -217,7 +218,7 @@ def main(argv=None):
     torch.manual_seed(a.seed); np.random.seed(a.seed)
     from nbpc.maenv import REWARD_W, TERMS
     import env_v5 as E, obs_v5 as O
-    from train_ppo import Buffer, chunks, eval_summary, eval_items, eval_presets
+    from train_ppo import Buffer, chunks, eval_summary, eval_items, eval_presets, split_params, gae, expl_var, live_targets, head_loss
     from fast_act import StackedActor, OBS_W, _OFF
     NS = O.N_SELF + O.N_COND
     out = os.path.join(E.WORK, "runs", a.run); os.makedirs(out, exist_ok=True)
@@ -251,11 +252,14 @@ def main(argv=None):
     def frozen(sd):
         m = Policy().to(dev).eval(); m.load_state_dict(sd, strict=False); [p.requires_grad_(False) for p in m.parameters()]
         return m
-    net = Policy().to(dev); opt = torch.optim.Adam(net.parameters(), lr=a.bc_lr, eps=1e-5); ref = bnet = enet = None
+    net = Policy().to(dev); ref = bnet = enet = None; main_p, x_p = split_params(net)   # x_p: the heads that never act (own Adam)
+    opt = torch.optim.Adam(main_p, lr=a.bc_lr, eps=1e-5); opt_x = torch.optim.Adam(x_p, lr=a.bc_lr, eps=1e-5)
     if ck:
         net.load_state_dict(ck["model"], strict=False)
         try: opt.load_state_dict(ck["opt"])
         except ValueError: print("optimizer state not loaded (new parameters): fresh Adam", flush=True)
+        try: ck.get("opt_x") and opt_x.load_state_dict(ck["opt_x"])
+        except ValueError: print("optimizer state of the non-acting heads not loaded (heads changed): fresh Adam", flush=True)
         if ck.get("ref"): ref = frozen(ck["ref"])
         bnet = frozen(torch.load(a.base, map_location="cpu", weights_only=False)["model"] if a.base else ck["model"])
     ck = None
@@ -285,7 +289,7 @@ def main(argv=None):
     th = {"t": None, "res": None}; t_wall = [time.time(), agent_steps]
 
     def save(path):
-        torch.save({"model": net.state_dict(), "opt": opt.state_dict(), "ref": ref.state_dict() if ref else None, "update": upd,
+        torch.save({"model": net.state_dict(), "opt": opt.state_dict(), "opt_x": opt_x.state_dict(), "ref": ref.state_dict() if ref else None, "update": upd,
                     "agent_steps": agent_steps, "args": vars(a), "loc": loc, "obs_version": O.OBS_VERSION}, path)
 
     def start_eval():
@@ -312,35 +316,33 @@ def main(argv=None):
     def prepare():
         """GAE + the update's tensors (a copy: the buffer can be refilled while a thread trains on this)"""
         is_bc = bc(); n = buf.n
-        adv = np.zeros(n, np.float32); ret = np.zeros(n, np.float32)
-        for aid, rows in traj.items():                   # GAE; bootstrap = the value of the pending (next) row
-            nxt = 0.0 if aid in final else float(buf.val[pending[aid]]) if aid in pending else float(buf.val[rows[-1]]); last = 0.0
-            for j in rows[::-1]:
-                nt = 0.0 if buf.done[j] else 1.0
-                last = buf.rew[j] + a.gamma * nxt * nt - buf.val[j] + a.gamma * a.lam * nt * last
-                adv[j] = last; ret[j] = last + buf.val[j]; nxt = buf.val[j]
+        adv, ret = gae(traj, pending, final, buf.rew[:n], buf.val[:n], a.gamma, a.lam, buf.done[:n])   # bootstrap: the pending row
         use = [r for r in traj.values() if bool(buf.bc[r[0]]) == is_bc]
         C = torch.as_tensor(chunks(use, a.seq), device=dev); nrow = int((C >= 0).sum())
         g = {k: T(getattr(buf, k)[:n], dt) for k, dt in (("s", torch.float32), ("ent", torch.float32), ("grid", torch.uint8),
              ("h", torch.float32), ("priv", torch.float32), ("act", torch.long), ("logp", torch.float32), ("val", torch.float32))}
         rows = C[C >= 0].cpu().numpy()
-        expl = 1 - float(((ret[rows] - buf.val[rows]) ** 2).mean() / (ret[rows].var() + 1e-8)) if len(rows) else 0.0
+        expl = expl_var(ret[rows], buf.val[rows])
         acts = buf.act[rows].copy()
         pu = upd - a.bc_updates
         beta = 0.0 if ref is None else max(a.kl_floor, a.kl_beta * (1 - pu / max(1, a.kl_updates)))
+        X = {}; xrow = {}; tx = time.time()                # the heads that never act: targets, readouts (train_ppo helpers)
+        if a.vlive:
+            _, retl, xrow["expl_var_live"] = live_targets(a, net, g, buf, traj, pending, final, n, rows); X["RETL"] = T(retl)
+        if X: xrow["extra_s"] = round(time.time() - tx, 2)
         return {"is_bc": is_bc, "C": C, "nrow": nrow, "g": g, "ADV": T(adv), "RET": T(ret), "LIVE": T(~buf.dead[:n], torch.float32),
-                "expl": expl, "acts": acts, "beta": beta}
+                "expl": expl, "acts": acts, "beta": beta, "X": X, "xrow": xrow}
 
     def train(P_):
         """train_ppo's update loop, unchanged"""
-        tu = time.time(); is_bc, C, g, ADV, RET, LIVE, beta = P_["is_bc"], P_["C"], P_["g"], P_["ADV"], P_["RET"], P_["LIVE"], P_["beta"]
-        for pg_ in opt.param_groups: pg_["lr"] = a.bc_lr if is_bc else a.lr
-        stats = []; mb = min(a.chunks, len(C))
+        tu = time.time(); is_bc, C, g, ADV, RET, LIVE, beta, X = P_["is_bc"], P_["C"], P_["g"], P_["ADV"], P_["RET"], P_["LIVE"], P_["beta"], P_["X"]
+        for pg_ in opt.param_groups + opt_x.param_groups: pg_["lr"] = a.bc_lr if is_bc else a.lr
+        stats = []; xst = []; mb = min(a.chunks, len(C))
         for _ in range(a.epochs if mb else 0):
             perm = torch.randperm(len(C), device=dev)
             for s0 in range(0, len(C) - mb + 1, mb):
                 c = C[perm[s0:s0 + mb]]; mk = (c >= 0).flatten(); r = c.clamp(min=0); rf = r.flatten()[mk]
-                lg, v = net.seq(g["s"][r], g["ent"][r], g["grid"][r], g["h"][r[:, 0]], g["priv"][r])
+                lg, v, *xc = net.seq(g["s"][r], g["ent"][r], g["grid"][r], g["h"][r[:, 0]], g["priv"][r], feats=bool(X))
                 lg = [x[mk] for x in lg]; v = v[mk]
                 lp, ent, _ = dist_logp_ent(lg, g["act"][rf]); vl = 0.5 * ((v - RET[rf]) ** 2).mean()
                 lv = LIVE[rf]; lm = lambda x: (x * lv).sum() / lv.sum().clamp(min=1)
@@ -355,8 +357,12 @@ def main(argv=None):
                         kl = masked_kl([x[mk] for x in lr_], lg).mean()
                     loss = pg - a.ent * lm(ent) + beta * kl + 0.5 * vl
                     st = [pg.item(), vl.item(), ent.mean().item(), kl.item(), ((ratio - 1).abs() > a.clip).float().mean().item()]
-                opt.zero_grad(set_to_none=True); loss.backward(); torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5); opt.step()
+                if X: hl, hs = head_loss(net, xc[0][mk], rf, X, a); loss = loss + hl; xst.append(hs)
+                opt.zero_grad(set_to_none=True); opt_x.zero_grad(set_to_none=True); loss.backward()
+                torch.nn.utils.clip_grad_norm_(main_p, 0.5); opt.step()
+                if X: torch.nn.utils.clip_grad_norm_(x_p, 0.5); opt_x.step()
                 stats.append(st)
+        for k in sorted({k for d in xst for k in d}): P_["xrow"][k] = round(float(np.mean([d[k] for d in xst if k in d])), 5)
         P_["stats"] = stats; P_["update_s"] = time.time() - tu
         return P_
 
@@ -404,6 +410,7 @@ def main(argv=None):
         for k in sorted({r["tag"]["kind"] for r in ok}): row["rank_" + k] = mean([r["rank"] for r in ok if r["tag"]["kind"] == k])
         row["pfsp"] = {os.path.basename(p)[:-3]: [round(pfr(p), 2), pf.get(os.path.basename(p), [0, 0])[1]] for p in pool}
         for k in TERMS: row["t_" + k] = mean([r["terms"][k] for r in recent])
+        row.update({k: (round(v, 4) if isinstance(v, float) else v) for k, v in P_["xrow"].items()})
         prf.write(json.dumps(row) + "\n"); prf.flush()
         print(json.dumps({k: v for k, v in row.items() if not k.endswith("_hist") and k != "pfsp"}), flush=True)
         if upd % 5 == 0: save(os.path.join(out, "ckpt_last.pt"))
@@ -437,11 +444,12 @@ def main(argv=None):
                     if "error" in m_: raise RuntimeError("worker %d failed:\n%s" % (w, m_["error"]))
                     msgs.append((w, m_)); waiting.add(w); ack[w], busy[w], restarts[w] = m_["ack"], m_["busy"], m_["restarts"]; tw[w] = m_["tw"]
                 for w, m_ in msgs:
-                    for (aid, rew, done, lab) in m_["tr"]:
+                    for (aid, rew, done, lab, tx_) in m_["tr"]:
                         j = pending.pop(aid, None)
                         if done: hid.pop(aid, None)
                         if j is None: continue
                         buf.rew[j] = rew; buf.done[j] = done; buf.complete[j] = True
+                        buf.rew_int[j] = tx_.get("i_rew", 0.0)
                         if buf.bc[j] and lab is not None: buf.act[j] = lab
                         elif buf.bc[j]: continue                 # a BC row without a label (recording went off): not trained on
                         traj.setdefault(aid, []).append(j)

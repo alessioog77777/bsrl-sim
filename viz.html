@@ -111,7 +111,7 @@ function draw(){
   chart('opt','c_ent','Policy entropy','falling = more decided; a collapse to 0 is bad',[S('entropy','entropy',0)],o);
   chart('opt','c_loss','Policy loss','BC: cross-entropy to the native AI · PPO: clipped surrogate',[S('loss_pi','loss',0)],o);
   chart('opt','c_vl','Value loss','',[S('vloss','value loss',0)],{...o,zero:1});
-  chart('opt','c_ev','Explained variance','1 = the critic predicts returns perfectly',[S('expl_var','explained variance',0)],o);
+  chart('opt','c_ev','Explained variance','1 = the critic predicts returns perfectly · live = the value head without priv (--vlive)',[S('expl_var','critic (with priv)',0),S('expl_var_live','live value (no priv)',1)],o);
   chart('opt','c_kl','KL to the BC policy and clip fraction','PPO only',[S('kl_bc','KL(BC ‖ policy)',0),S('clipfrac','clip fraction',1)],{...o,zero:1});
   chart('opt','c_dps','Throughput','decisions per second while collecting',[S('decisions_per_s','decisions / s',0)],{...o,zero:1});
   const cols=['update','minutes','episodes','rank','ci95','win','top3','dealt','taken','kills','cubes','hit_rate','ticks'];

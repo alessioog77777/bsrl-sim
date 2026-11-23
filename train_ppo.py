@@ -24,6 +24,12 @@
 * Sliders (env_v5): --slider-scale x sum(weight x --slider-norm factor x term); weights per battle from --slider-sample.
   Evals use sampled weights unless --eval-sliders balanced; --eval-presets a,b adds "evalp" battles (same seeds vs 9
   native, player 0 on the preset's weights, + balanced) -> p_<preset> in evals.jsonl, scorecard.py per preset.
+* Live value (--vlive 1, default 0 = off): model.Policy.vl (no priv, detached features: never changes the policy) is
+  trained to its own lambda-return of the reward without the intent reward (rew - rew_int; rew_int = terms "i_rew", 0
+  until intents exist), its values from one no-grad pass over the rollout (model.Policy.row_feats: acting is unchanged).
+  progress.jsonl: expl_var_live (next to expl_var, the critic with priv), vloss_live, extra_s (the pass). The heads that
+  never act (model.NONACT) have their own Adam ("opt_x" in the checkpoint) and gradient clip, so the main optimizer and
+  its clip see exactly the acting network's parameters.
 shortcut: no exploiters (a second learner trained only to beat this one); add them if b_rank flattens again with PFSP.
 """
 import argparse, glob, json, os, shutil, signal, sys, time
@@ -32,7 +38,7 @@ import torch
 from nbpc import diversity as D
 from nbpc.maenv import REWARD_W, TERMS
 import env_v5 as E, obs_v5 as O
-from model import Policy, HID, PRIV, dist_logp_ent, masked_kl, act_stacked
+from model import Policy, HID, PRIV, NONACT, dist_logp_ent, masked_kl, act_stacked
 
 NS = O.N_SELF + O.N_COND
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -42,7 +48,8 @@ class Buffer:
     """transition rows: observation + hidden state at action time, action, logp, value; reward / done on completion"""
     F = {"s": ((NS,), np.float16), "ent": ((O.N_ENT, O.F_ENT), np.float16), "grid": ((O.G, O.G), np.uint8), "h": ((HID,), np.float16), "priv": ((PRIV,), np.float16),
          "act": ((4,), np.int16), "logp": ((), np.float32), "val": ((), np.float32), "rew": ((), np.float32),
-         "done": ((), bool), "complete": ((), bool), "bc": ((), bool), "dead": ((), bool)}
+         "done": ((), bool), "complete": ((), bool), "bc": ((), bool), "dead": ((), bool),
+         "rew_int": ((), np.float32)}   # the intent reward inside rew (terms "i_rew"; none yet): the live value's target excludes it
 
     def __init__(self, cap):
         self.cap, self.n = cap, 0
@@ -148,6 +155,65 @@ def slider_flags(ap):
     ap.add_argument("--eval-presets", default="", help="comma list of obs_v5.PRESETS: each also plays the eval seeds vs native (kind evalp, + balanced)")
 
 
+TR_X = ("i_rew",)   # transition terms the buffer keeps besides rew / done (train_fast's workers send these)
+
+
+def head_flags(ap):
+    """step-C flags of the heads that never act, shared with train_fast (defaults = off, the original behaviour)"""
+    ap.add_argument("--vlive", type=int, default=0, help="1 = train the live value head (model.Policy.vl: no priv, return without the intent reward)")
+
+
+def split_params(net):
+    """(acting parameters = the main optimizer's, in the original order; the NONACT heads' parameters)"""
+    named = list(net.named_parameters())
+    return [p for k, p in named if not k.startswith(NONACT)], [p for k, p in named if k.startswith(NONACT)]
+
+
+def gae(traj, pending, final, rew, val, gamma, lam, done):
+    """GAE per buffer row of the rollout's trajectories -> (advantage, lambda-return); bootstrap = the value of the
+    pending (next) row, 0 after the end"""
+    adv = np.zeros(len(rew), np.float32); ret = np.zeros(len(rew), np.float32)
+    for aid, rows in traj.items():
+        nxt = 0.0 if aid in final else float(val[pending[aid]]) if aid in pending else float(val[rows[-1]]); last = 0.0
+        for j in rows[::-1]:
+            nt = 0.0 if done[j] else 1.0
+            last = rew[j] + gamma * nxt * nt - val[j] + gamma * lam * nt * last
+            adv[j] = last; ret[j] = last + val[j]; nxt = val[j]
+    return adv, ret
+
+
+def expl_var(ret, val):
+    return 1 - float(((ret - val) ** 2).mean() / (ret.var() + 1e-8)) if len(ret) else 0.0
+
+
+@torch.no_grad()
+def row_pass(net, g, n, fns, bs=4096):
+    """one no-grad pass over buffer rows 0..n-1 from their stored GRU state (model.Policy.row_feats, the acting math):
+    {name: fn(net, xc, s, ent) for every row} (fn -> a tensor), concatenated over batches of bs rows"""
+    out = {k: [] for k in fns}
+    for a in range(0, n, bs):
+        s, ent = g["s"][a:a + bs], g["ent"][a:a + bs]; xc = net.row_feats(s, ent, g["grid"][a:a + bs], g["h"][a:a + bs])
+        for k, fn in fns.items(): out[k].append(fn(net, xc, s, ent))
+    return {k: torch.cat(v) for k, v in out.items()}
+
+
+def live_targets(a, net, g, buf, traj, pending, final, n, use_rows):
+    """--vlive: the live value of every row (row_pass) and its lambda-return of rew - rew_int -> (values, returns,
+    expl_var_live over the trained rows)"""
+    vl = row_pass(net, g, n, {"vl": lambda net_, xc, s, ent: net_.value_live(xc)})["vl"].float().cpu().numpy()
+    _, ret = gae(traj, pending, final, buf.rew[:n] - buf.rew_int[:n], vl, a.gamma, a.lam, buf.done[:n])
+    return vl, ret, expl_var(ret[use_rows], vl[use_rows])
+
+
+def head_loss(net, xc, rf, X, a):
+    """loss of the heads that never act on a minibatch (xc = cat[x, h] of its rows, rf = their buffer rows) -> (loss,
+    {stat: value}); 0 with the flags off. --vlive: 0.5 x 0.5 MSE to the live lambda-return (as the critic's)"""
+    loss, st = 0.0, {}
+    if a.vlive:
+        lv = 0.5 * ((net.value_live(xc) - X["RETL"][rf]) ** 2).mean(); loss = loss + 0.5 * lv; st["vloss_live"] = lv.item()
+    return loss, st
+
+
 def eval_summary(rows):
     ok = [r for r in rows if r["rank"] is not None and not r["truncated"]]
     rk = np.array([r["rank"] for r in ok], float); m = lambda k: round(float(np.mean([r["terms"][k] for r in ok])), 3) if ok else None
@@ -172,7 +238,7 @@ def main():
     ap.add_argument("--kmix", default="1,2,3,4,5"); ap.add_argument("--brawler", default="Sniper", help="Sniper = Piper")
     ap.add_argument("--loc", default=None, help="Showdown location (default: the first of env_v5.locations())")
     ap.add_argument("--slider-scale", type=float, default=0.0, help="weight of the slider rewards (stage 1: off)")
-    slider_flags(ap)
+    slider_flags(ap); head_flags(ap)
     ap.add_argument("--noise", type=int, default=1, help="ObsV5 vision noise + latency")
     ap.add_argument("--eval-min", type=float, default=30.0); ap.add_argument("--eval-episodes", type=int, default=200)
     ap.add_argument("--max-ticks", type=int, default=4000); ap.add_argument("--seed", type=int, default=0)
@@ -197,13 +263,16 @@ def main():
     def frozen(sd):
         m = Policy().to(dev).eval(); m.load_state_dict(sd, strict=False); [p.requires_grad_(False) for p in m.parameters()]
         return m
-    net = Policy().to(dev); opt = torch.optim.Adam(net.parameters(), lr=a.bc_lr, eps=1e-5); ref = bnet = enet = None
+    net = Policy().to(dev); ref = bnet = enet = None; main_p, x_p = split_params(net)
+    opt = torch.optim.Adam(main_p, lr=a.bc_lr, eps=1e-5); opt_x = torch.optim.Adam(x_p, lr=a.bc_lr, eps=1e-5)
     upd = 0; agent_steps = 0
     if a.resume:
         ck = torch.load(a.resume, map_location="cpu", weights_only=False)
         net.load_state_dict(ck["model"], strict=False); upd, agent_steps = ck["update"], ck["agent_steps"]
         try: opt.load_state_dict(ck["opt"])
         except ValueError: print("optimizer state not loaded (new parameters): fresh Adam", flush=True)
+        try: ck.get("opt_x") and opt_x.load_state_dict(ck["opt_x"])
+        except ValueError: print("optimizer state of the non-acting heads not loaded (heads changed): fresh Adam", flush=True)
         if ck.get("ref"): ref = frozen(ck["ref"])
         bnet = frozen(torch.load(a.base, map_location="cpu", weights_only=False)["model"] if a.base else ck["model"])
     kmix = [int(x) for x in a.kmix.split(",")]; rng_b = np.random.default_rng(a.seed + 7)
@@ -250,7 +319,7 @@ def main():
     T = lambda x, dt=torch.float32: torch.as_tensor(x, device=dev).to(dt)
 
     def save(path):
-        torch.save({"model": net.state_dict(), "opt": opt.state_dict(), "ref": ref.state_dict() if ref else None, "update": upd,
+        torch.save({"model": net.state_dict(), "opt": opt.state_dict(), "opt_x": opt_x.state_dict(), "ref": ref.state_dict() if ref else None, "update": upd,
                     "agent_steps": agent_steps, "args": vars(a), "loc": loc, "obs_version": O.OBS_VERSION}, path)
 
     def start_eval():
@@ -282,6 +351,7 @@ def main():
                     if done: hid.pop(aid, None)
                     if j is None: continue
                     buf.rew[j] = rew; buf.done[j] = done; buf.complete[j] = True
+                    buf.rew_int[j] = terms.get("i_rew", 0.0)
                     if buf.bc[j] and terms.get("_act") is not None: buf.act[j] = terms["_act"]
                     elif buf.bc[j]: continue                 # a BC row without a label (recording went off): not trained on
                     traj.setdefault(aid, []).append(j)
@@ -331,27 +401,25 @@ def main():
             collect_s = time.time() - dec_t; dps = dec_n / max(1e-9, collect_s)
             # ---------------- update
             tu = time.time(); epf.flush(); is_bc = bc(); n = buf.n
-            adv = np.zeros(n, np.float32); ret = np.zeros(n, np.float32)
-            for aid, rows in traj.items():                   # GAE; bootstrap = the value of the pending (next) row
-                nxt = 0.0 if aid in final else float(buf.val[pending[aid]]) if aid in pending else float(buf.val[rows[-1]]); last = 0.0
-                for j in rows[::-1]:
-                    nt = 0.0 if buf.done[j] else 1.0
-                    last = buf.rew[j] + a.gamma * nxt * nt - buf.val[j] + a.gamma * a.lam * nt * last
-                    adv[j] = last; ret[j] = last + buf.val[j]; nxt = buf.val[j]
+            adv, ret = gae(traj, pending, final, buf.rew[:n], buf.val[:n], a.gamma, a.lam, buf.done[:n])   # bootstrap: the pending row
             use = [r for r in traj.values() if bool(buf.bc[r[0]]) == is_bc]
             C = torch.as_tensor(chunks(use, a.seq), device=dev); nrow = int((C >= 0).sum())
             g = {k: T(getattr(buf, k)[:n], dt) for k, dt in (("s", torch.float32), ("ent", torch.float32), ("grid", torch.uint8),
                  ("h", torch.float32), ("priv", torch.float32), ("act", torch.long), ("logp", torch.float32), ("val", torch.float32))}
             ADV, RET = T(adv), T(ret); LIVE = T(~buf.dead[:n], torch.float32)   # respawning rows: value only (actions ignored)
+            rows = C[C >= 0].cpu().numpy(); X = {}; xrow = {}; tx = time.time()
+            if a.vlive:
+                _, retl, xrow["expl_var_live"] = live_targets(a, net, g, buf, traj, pending, final, n, rows); X["RETL"] = T(retl)
+            if X: xrow["extra_s"] = round(time.time() - tx, 2)
             pu = upd - a.bc_updates
             beta = 0.0 if ref is None else max(a.kl_floor, a.kl_beta * (1 - pu / max(1, a.kl_updates)))
-            for pg_ in opt.param_groups: pg_["lr"] = a.bc_lr if is_bc else a.lr
-            stats = []; mb = min(a.chunks, len(C))
+            for pg_ in opt.param_groups + opt_x.param_groups: pg_["lr"] = a.bc_lr if is_bc else a.lr
+            stats = []; xst = []; mb = min(a.chunks, len(C))
             for _ in range(a.epochs if mb else 0):
                 perm = torch.randperm(len(C), device=dev)
                 for s0 in range(0, len(C) - mb + 1, mb):
                     c = C[perm[s0:s0 + mb]]; mk = (c >= 0).flatten(); r = c.clamp(min=0); rf = r.flatten()[mk]
-                    lg, v = net.seq(g["s"][r], g["ent"][r], g["grid"][r], g["h"][r[:, 0]], g["priv"][r])
+                    lg, v, *xc = net.seq(g["s"][r], g["ent"][r], g["grid"][r], g["h"][r[:, 0]], g["priv"][r], feats=bool(X))
                     lg = [x[mk] for x in lg]; v = v[mk]
                     lp, ent, _ = dist_logp_ent(lg, g["act"][rf]); vl = 0.5 * ((v - RET[rf]) ** 2).mean()
                     lv = LIVE[rf]; lm = lambda x: (x * lv).sum() / lv.sum().clamp(min=1)
@@ -366,10 +434,13 @@ def main():
                             kl = masked_kl([x[mk] for x in lr_], lg).mean()
                         loss = pg - a.ent * lm(ent) + beta * kl + 0.5 * vl
                         st = [pg.item(), vl.item(), ent.mean().item(), kl.item(), ((ratio - 1).abs() > a.clip).float().mean().item()]
-                    opt.zero_grad(set_to_none=True); loss.backward(); torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5); opt.step()
+                    if X: hl, hs = head_loss(net, xc[0][mk], rf, X, a); loss = loss + hl; xst.append(hs)
+                    opt.zero_grad(set_to_none=True); opt_x.zero_grad(set_to_none=True); loss.backward()
+                    torch.nn.utils.clip_grad_norm_(main_p, 0.5); opt.step()
+                    if X: torch.nn.utils.clip_grad_norm_(x_p, 0.5); opt_x.step()
                     stats.append(st)
-            rows = C[C >= 0].cpu().numpy()
-            expl = 1 - float(((ret[rows] - buf.val[rows]) ** 2).mean() / (ret[rows].var() + 1e-8)) if len(rows) else 0.0
+            expl = expl_var(ret[rows], buf.val[rows])
+            for k in sorted({k for d in xst for k in d}): xrow[k] = round(float(np.mean([d[k] for d in xst if k in d])), 5)
             acts = buf.act[rows]; fired = acts[acts[:, 1] > 0]
             upd += 1
             if is_bc and not bc():                           # BC done: freeze the anchor, PPO starts with an eval
@@ -404,6 +475,7 @@ def main():
             for k in sorted({r["tag"]["kind"] for r in ok}): row["rank_" + k] = mean([r["rank"] for r in ok if r["tag"]["kind"] == k])
             row["pfsp"] = {os.path.basename(p)[:-3]: [round(pfr(p), 2), pf.get(os.path.basename(p), [0, 0])[1]] for p in pool}
             for k in TERMS: row["t_" + k] = mean([r["terms"][k] for r in recent])
+            row.update({k: (round(v, 4) if isinstance(v, float) else v) for k, v in xrow.items()})
             prf.write(json.dumps(row) + "\n"); prf.flush()
             print(json.dumps({k: v for k, v in row.items() if not k.endswith("_hist") and k != "pfsp"}), flush=True)
             if upd % 5 == 0: save(os.path.join(out, "ckpt_last.pt"))
