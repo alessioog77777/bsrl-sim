@@ -51,6 +51,12 @@ Changes made to nirkt's code, all recorded in `engine/patches/`:
 - `area_gadgets.patch` (issue #3, a diff on top of the patches above): `gadget.c`'s AREA kind (published as SPAWN), the
   gadgets that only drop their area at the brawler (Barley, Poco x2, Tick, Shade, Trunk), spawned with libg's
   `0xb35c40` after the row's ActivationDelay. `python -m super_audit --gadget` checks their effects.
+- `gadgets_batch2.patch` (issue #3, a diff on top of `area_gadgets.patch`): more kinds in `gadget.c`. The gadget's own
+  skill fired as its projectile(s) through libg's projectile spawn `0xb78190` (SHOT, published PROJECTILE) or as its area
+  (Bull's Stomp, 8-Bit's Extra Credits); repeat_shot / spin_shoot volleys of the row's CustomObject projectile; items
+  through the item factory `0xb55684` (Bolt, Gale); R-T's super charge (new `NBE_GAD_SUPER`, mirrored in `nbpc/proto.py`);
+  instant heals through libg's heal `0xb41554` (Kit, Kenji). Eight rows that classify but showed no effect live are masked
+  (`gadget.c` `g_masked`). `python -m super_audit --gadget [--gadget-slot 1]` and `python -m gadget_check` check them.
 - `charge.patch` (issue #5, a diff on top of the four above): the charge supers in `native/loader/env.c`. The skill's
   ChargePushback after each contact hit (the game's knockback 0xb49834), Bull's straight lane that breaks walls and bushes
   up to the first unbreakable tile, El Primo breaking the tiles around his landing, trail areas (Stu, Berry, Trunk)

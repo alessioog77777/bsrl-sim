@@ -8,7 +8,8 @@
   3. fire 3 on a gadget that is not ready (no use left / cooldown / kind not implemented) spends nothing;
   4. env_v5.Env.gadget (obs_v5 self 3) agrees with the response.
 With no implemented kind in play (an old host build) it checks 1, 3 and 4 and says so.
-python -m gadget_check [--minutes 4] [--per-kind 6]      python -m gadget_check --check   (no game: the judging rules)"""
+python -m gadget_check [--minutes 4] [--per-kind 6] [--roster Splitter,Attacher,Samurai]   (--roster: only these brawlers,
+e.g. to reach a kind that one brawler has: R-T's SUPER)      python -m gadget_check --check   (no game: the judging rules)"""
 import argparse, collections, sys, time, numpy as np
 P = None   # nbpc.proto, imported in main / _check (the self-check needs no host)
 
@@ -24,6 +25,7 @@ def snap(r, p):
     return dict(valid=int(getattr(r, "gad_valid", 0)), card=int(r.gad_card[p]), kind=int(r.gad_kind[p]),
                 charges=int(r.gad_charges[p]), cd=int(r.gad_cd[p]), used=int(r.gad_used[p]), tick=int(r.tick),
                 x=float(pl.x), y=float(pl.y), hp=int(pl.hp), max_hp=int(pl.max_hp), alive=int(pl.alive),
+                sc=int(pl.super_charge), sm=int(pl.super_max),
                 out=int(pl.eliminated or pl.reserved[3] > 0))
 
 
@@ -33,10 +35,15 @@ def ready(s):
 
 def effect_dash(a, b): d = float(np.hypot(b["x"] - a["x"], b["y"] - a["y"])); return d >= DASH_MIN, "moved %.0f" % d
 def effect_heal(a, b): return b["hp"] > a["hp"], "hp %d -> %d" % (a["hp"], b["hp"])
-def effect_spawn(a, b):   # an area at the brawler (gadget.c AREA): not in NbeResp; its effects: `super_audit --gadget`
-    return True, "use spent (area: super_audit --gadget)"
-EFFECT = {"DASH": effect_dash, "HEAL": effect_heal, "SPAWN": effect_spawn}   # by GAD_* name; add one with each kind gadget.c implements
-WANT = {"HEAL": lambda s: s["hp"] < 0.9 * s["max_hp"]}   # judged only when the effect can show (a heal needs missing hp)
+def effect_spawn(a, b):   # an area / item (gadget.c AREA, SKILL AREA, ITEM): not in NbeResp; its effects: `super_audit --gadget`
+    return True, "use spent (area / item: super_audit --gadget)"
+def effect_projectile(a, b):   # projectiles (gadget.c SHOT, REPEAT, SPIN): not in NbeResp; seen by `super_audit --gadget`
+    return True, "use spent (projectiles: super_audit --gadget)"
+def effect_super(a, b): return b["sc"] > a["sc"], "super %d -> %d of %d" % (a["sc"], b["sc"], b["sm"])
+EFFECT = {"DASH": effect_dash, "HEAL": effect_heal, "SPAWN": effect_spawn, "PROJECTILE": effect_projectile,
+          "SUPER": effect_super}   # by GAD_* name; add one with each kind gadget.c implements
+WANT = {"HEAL": lambda s: s["hp"] < 0.9 * s["max_hp"],   # judged only when the effect can show (a heal needs missing hp,
+        "SUPER": lambda s: s["sc"] < s["sm"]}             # a super charge a super that is not full)
 
 
 def judge(a, b):
@@ -67,7 +74,8 @@ def _load_proto():
 
 def _check():
     _load_proto()
-    base = dict(valid=1, card=23000001, kind=P.GAD_DASH, charges=3, cd=0, used=0, tick=100, x=0.0, y=0.0, hp=3000, max_hp=4000, alive=1, out=0)
+    base = dict(valid=1, card=23000001, kind=P.GAD_DASH, charges=3, cd=0, used=0, tick=100, x=0.0, y=0.0, hp=3000, max_hp=4000, alive=1, out=0,
+                sc=0, sm=3000)
     s = lambda **o: {**base, **o}
     assert ready(s()) and not ready(s(cd=4)) and not ready(s(charges=0)) and not ready(s(kind=P.GAD_NONE)) and not ready(s(valid=0)) and not ready(s(out=1))
     assert judge(s(), s(charges=2, used=1, cd=100)) == []
@@ -79,7 +87,10 @@ def _check():
     assert effect(s(kind=P.GAD_HEAL), s(hp=3500))[0] and not effect(s(kind=P.GAD_HEAL), s(hp=2900))[0]
     assert not WANT["HEAL"](s(hp=4000)) and WANT["HEAL"](s(hp=3000))                    # fired at full hp: nothing to show
     assert judge(s(kind=P.GAD_SPAWN), s(kind=P.GAD_SPAWN, charges=2, used=1, cd=9)) == []
-    assert judge(s(kind=P.GAD_PROJECTILE), s(kind=P.GAD_PROJECTILE, charges=2, used=1, cd=9))[0].startswith("no effect test")
+    assert judge(s(kind=P.GAD_SHIELD), s(kind=P.GAD_SHIELD, charges=2, used=1, cd=9))[0].startswith("no effect test")
+    assert judge(s(kind=P.GAD_PROJECTILE), s(kind=P.GAD_PROJECTILE, charges=2, used=1, cd=9)) == []
+    assert effect(s(kind=P.GAD_SUPER, sc=500), s(sc=3000))[0] and not effect(s(kind=P.GAD_SUPER, sc=500), s(sc=500))[0]
+    assert WANT["SUPER"](s(sc=0)) and not WANT["SUPER"](s(sc=3000))
     assert judge(s(cd=5), s(cd=4)) == [] and judge(s(cd=5), s(cd=4, used=1)) == ["not ready, yet a use was spent"]
     assert judge(s(kind=P.GAD_NONE, charges=0), s(kind=P.GAD_NONE, charges=0)) == []
     print("gadget_check self-check ok")
@@ -88,11 +99,12 @@ def _check():
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument("--minutes", type=float, default=4)
     ap.add_argument("--per-kind", type=int, default=6, help="activations to judge per implemented kind")
+    ap.add_argument("--roster", default="", help="comma-separated brawlers (characters.csv Name) to draw from (default: all)")
     ap.add_argument("--check", action="store_true", help="the judging rules on made-up responses (no game)")
     a = ap.parse_args()
     if a.check: return _check()
     _load_proto(); import env_v5 as E
-    env = E.Env(1, E.make_battle_fn(10, gadgets=True), ticks=2, fair=True, max_ticks=4000)
+    env = E.Env(1, E.make_battle_fn(10, roster=[x for x in a.roster.split(",") if x] or None, gadgets=True), ticks=2, fair=True, max_ticks=4000)
     rng = np.random.default_rng(0); pend = {}; fails = []; done = collections.Counter(); refused = collections.Counter()
     settle = {}; eff = collections.Counter(); eff_ok = collections.Counter(); eff_what = collections.defaultdict(list)
     seen = collections.Counter(); t0 = None; steps = 0
