@@ -38,6 +38,10 @@ in the BC labels (the controller records have no gadget calls).
 Hypercharge (obs v5.8, issue #4, off by default): make_battle_fn(hyper=True) / with_hyper (trainer --hyper 1) equip every
 player's hypercharge card (a brawler without one gets none); Env.hyper(ids) = whether the agent can activate it now, from
 the host's hypercharge state (NbeResp hyp_*, native/loader/hyper.c), for obs_v5's self 4 (ObsV5.build(..., hyper=)).
+Star powers (issue #20, off by default, no obs input): make_battle_fn(star_powers=True) / with_star_powers (trainer
+--star-powers 1) give every player one of its brawler's star power cards (star_cards), written into the player's config by
+the host (offline.c my_player_ctor; Instance.battle_info()["star_mask"] = which arrived). Whether the game then reads a
+given star power is star_probe's question: many of their effects are compiled out of the client build.
 """
 import argparse, functools, json, os, sys, time
 import numpy as np
@@ -106,6 +110,26 @@ def with_gadgets(cfg, rng):
     return {**cfg, "div": div}
 
 
+@functools.lru_cache(None)
+def star_cards():
+    """brawler (characters.csv Name, playable: heroes()) -> cards.csv data ids of its star power cards (MetaType 4, Target =
+    the brawler). The host checks each request (offline.c my_player_ctor) and flags a rejected one in div_err."""
+    hs, out, k = set(heroes()), {}, 0
+    for r in D._rows("cards.csv"):
+        if not r[next(iter(r))]: continue
+        if r.get("MetaType") == "4" and r.get("Target") in hs and r.get("Disabled", "").lower() != "true":
+            out.setdefault(r["Target"], []).append(T_CARD * 1000000 + k)
+        k += 1
+    return out
+
+
+def with_star_powers(cfg, rng):
+    """battle cfg -> the same cfg, every player (tag "chr") with a random star power card of its brawler (none if it has none)"""
+    sc = star_cards(); div = dict(cfg["div"])
+    div["star"] = [int(rng.choice(sc[b])) if sc.get(b) else 0 for b in cfg["tag"]["chr"]]
+    return {**cfg, "div": div}
+
+
 def with_hyper(cfg):
     """battle cfg -> the same cfg, every player (tag "chr") with its brawler's hypercharge card (the host looks the card up;
     a brawler without one gets none). No random draw."""
@@ -141,10 +165,11 @@ def use_genmaps(n_inst, dirs=None):
     return dict(NI.APK_BY_IDX)
 
 
-def make_battle_fn(agents=10, seed0=10_000_000, roster=None, locs=None, p_team=0.5, gen=None, p_gen=0.5, gadgets=False, hyper=False):
+def make_battle_fn(agents=10, seed0=10_000_000, roster=None, locs=None, p_team=0.5, gen=None, p_gen=0.5, gadgets=False, hyper=False,
+                   star_powers=False):
     """gen = use_genmaps()'s {instance: dir}: there a battle plays the generated layout with probability p_gen;
     gadgets: every player gets a random gadget card of its brawler (none if it has none); hyper: every player gets its
-    brawler's hypercharge card (with_hyper)"""
+    brawler's hypercharge card (with_hyper); star_powers: every player gets a random star power card of its brawler"""
     roster = roster or heroes(); locs = locs or locations(); gen = gen or {}
     seeds = iter(range(seed0, seed0 + 10 ** 9))
 
@@ -163,6 +188,7 @@ def make_battle_fn(agents=10, seed0=10_000_000, roster=None, locs=None, p_team=0
         cfg = {"seed": next(seeds), "ctl": ctl, "end": "agents", "div": div,
                "tag": {"loc": os.path.basename(os.path.dirname(g)) if g else loc, "chr": br, "team_size": size, "groups": groups}}
         cfg = with_gadgets(cfg, rng) if gadgets else cfg   # drawn last: the rest of the battle is the same without gadgets
+        cfg = with_star_powers(cfg, rng) if star_powers else cfg   # after the gadgets: their draws stay the same
         return with_hyper(cfg) if hyper else cfg            # no draw
     return battle_fn
 
@@ -983,7 +1009,8 @@ def _check():
     _check_gadgets(NS)
     _check_hyper(NS)
     _check_roster()
-    print("env_v5 sliders, aux labels, intents, planner hook, identity rows, gadget / hypercharge readiness, roster ok")
+    _check_star_powers()
+    print("env_v5 sliders, aux labels, intents, planner hook, identity rows, gadget / hypercharge readiness, roster, star power loadouts ok")
 
 
 def _check_roster():
@@ -1016,6 +1043,21 @@ def _check_gadgets(NS):
     r1, r2 = np.random.default_rng(4), np.random.default_rng(4)                              # gadgets drawn last: the battle
     c1, c2 = make_battle_fn(3, seed0=7)(r1, 0), make_battle_fn(3, seed0=7, gadgets=True)(r2, 0)   # is the same without them
     assert c1["tag"] == c2["tag"] and c1["ctl"] == c2["ctl"] and "gadget" not in c1["div"] and len(c2["div"]["gadget"]) == 10
+
+
+def _check_star_powers():
+    """the star power loadout request (the game's cards.csv): cards of the right brawler, gadget draws unchanged"""
+    sc = star_cards(); hs = heroes()
+    assert all(k // 1000000 == T_CARD for v in sc.values() for k in v) and set(sc) <= set(hs) and len(sc) > len(hs) * 0.9, len(sc)
+    assert sorted(sc.get("Sniper", [])) == [23000091, 23000152], sc.get("Sniper")     # Piper: ambush, reload_on_hit
+    cfg = with_star_powers({"div": {"chr": [0] * 16}, "tag": {"chr": hs[:10]}}, np.random.default_rng(0))
+    assert all((s in sc.get(b, [])) or (s == 0 and not sc.get(b)) for s, b in zip(cfg["div"]["star"], hs[:10]))
+    r1, r2 = np.random.default_rng(4), np.random.default_rng(4)                              # stars drawn after the gadgets
+    c1 = make_battle_fn(3, seed0=7, gadgets=True)(r1, 0)
+    c2 = make_battle_fn(3, seed0=7, gadgets=True, star_powers=True)(r2, 0)
+    assert c1["tag"] == c2["tag"] and c1["ctl"] == c2["ctl"] and c1["div"]["gadget"] == c2["div"]["gadget"]
+    assert "star" not in c1["div"] and len(c2["div"]["star"]) == 10
+    assert all((s in sc.get(b, [])) or (s == 0 and not sc.get(b)) for s, b in zip(c2["div"]["star"], c2["tag"]["chr"]))
 
 
 def _check_hyper(NS):

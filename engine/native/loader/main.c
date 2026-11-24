@@ -152,7 +152,7 @@ int main(int argc, char **argv) {
         LOG("[patch] applied %zu RET patches and 2 NOP runs from the phone\n", sizeof g_ret_patches / 4);
     }
     { extern int g_env_on, g_lockstep; if (g_env_on && !g_lockstep) g_lockstep = 1; }   /* env: every frame owes a tick */
-    if (strcmp(stage, "onload")) { extern void offline_install(const char *); offline_install(g_payloads); extern void trace_install(void) __attribute__((weak)); if (trace_install) trace_install(); extern void spawnfix_install(void) __attribute__((weak)); if (spawnfix_install) spawnfix_install(); extern void superfix_install(void) __attribute__((weak)); if (superfix_install) superfix_install(); }
+    if (strcmp(stage, "onload")) { extern void offline_install(const char *); offline_install(g_payloads); extern void trace_install(void) __attribute__((weak)); if (trace_install) trace_install(); extern void cardprobe_install(void) __attribute__((weak)); if (cardprobe_install) cardprobe_install(); extern void spawnfix_install(void) __attribute__((weak)); if (spawnfix_install) spawnfix_install(); extern void superfix_install(void) __attribute__((weak)); if (superfix_install) superfix_install(); }
     double t = now();
     run_initializers(cxx); run_initializers(scid); run_initializers(g_libg);
     LOG("[time] static constructors in %.3f s\n", now() - t);

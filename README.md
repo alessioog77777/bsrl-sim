@@ -90,7 +90,7 @@ Example reasons: `Undertaker (melee, range 3) 4 tiles E: keeping my distance W`,
 
 | File | What it does |
 |---|---|
-| `env_v5.py` | Randomised Showdown battles on top of nirkt's `MAEnv`: random map, brawlers, solo / duo / trio teams, policy-controlled slots vs the native AI, team placement reward, behaviour-slider reward terms (per-slider normalisation from native-AI battles: `--native 1 --episodes F`, then `--norm F`), gadget loadouts (`with_gadgets`, trainer `--gadgets 1`, default off) and gadget readiness from the host (`Env.gadget` = self 3), hypercharge cards (`with_hyper`, trainer `--hyper 1`, default off) and hypercharge readiness (`Env.hyper` = self 4). `python -m env_v5 --check` |
+| `env_v5.py` | Randomised Showdown battles on top of nirkt's `MAEnv`: random map, brawlers, solo / duo / trio teams, policy-controlled slots vs the native AI, team placement reward, behaviour-slider reward terms (per-slider normalisation from native-AI battles: `--native 1 --episodes F`, then `--norm F`), gadget loadouts (`with_gadgets`, trainer `--gadgets 1`, default off) and gadget readiness from the host (`Env.gadget` = self 3), hypercharge cards (`with_hyper`, trainer `--hyper 1`, default off) and hypercharge readiness (`Env.hyper` = self 4), star power loadouts (`with_star_powers`, trainer `--star-powers 1`, default off; no obs input). `python -m env_v5 --check` |
 | `obs_v5.py` | The observation: `self` (8; self 3 = gadget ready, v5.7; self 4 = hypercharge ready, v5.8), `ent` (39 x 36 entity slots; area effects with radius and harms / helps / slows me; enemy / teammate brawler and projectile-owner identity (brawler stats + known flag, per-battle identity noise); wall / water between me and each player), `grid` (25 x 25 tile classes), `cond` (30: brawler stats, 12 slider weights, team size, cubes, players left), the intent block (11: kind one-hot, target offset, radius, time left; all zeros = free play); named slider presets (play-style modes: bush camper, aggressive, cube farmer, ...). Per-episode detector noise, latency and HUD masking. `python -m obs_v5` |
 | `intent.py` | Intents (per-second goals: move to, avoid, hold, engage, farm, regroup, hide): kind specs and end rules, the block encoder, the intent-following reward (signed progress, capped per intent), the random-valid sampler. `env_v5.Env.intents` runs them in battles (trainer `--intent-scale`, default 0 = off). `python -m intent` |
 | `planner.py` | Rule planner: 12 priority rules (gas, low HP, thrower behind a wall, keep away from a short-range enemy, fight / third party, endgame, regroup, engage, farm, hide, explore, none) on what the policy sees, thresholds from the sliders, rules needing the enemy's brawler skip unknown ones; each pick has a readable reason (replay frames, viz). Training rollouts: trainer `--p-plan` (default 0 = off; design 0.5) with preemption of held planner intents; `--eval-plan 1` = eval kind `evalp_plan` (planner vs free play, same seeds). `python -m planner` |
@@ -106,6 +106,7 @@ Example reasons: `Undertaker (melee, range 3) 4 tiles E: keeping my distance W`,
 | `status_check.py` | One-boot check of status effects and movement (issue #19): walk speeds against the table, Max's super speeds him up, Spike's super slows its target, Frank's super stuns its target (no move, no attack, then free again), Draco's mount speeds him up and swaps his weapon, Leon's super hides him from a far enemy's observation (obs v5.9). `python -m status_check`, `--check` |
 | `gadget_check.py` | One-boot check of gadget activation: the loadout reaches the host, each implemented kind's effect, uses and cooldown spent, fire 3 while not ready spends nothing, `Env.gadget` agrees with the host. `python -m gadget_check`, `--check` |
 | `hyper_check.py` | One-boot check of hypercharge: the card reaches the host, charging from hits, fire 4 activates only at a full charge with the card, +speed / +damage / shield while active, the end after 5 s and normal speed after it, `Env.hyper` agrees with the host. `python -m hyper_check`, `--check` |
+| `star_probe.py` | One-boot probe of which star powers the game reads (issue #20): every playable brawler's star power cards in native-AI battles, the host's getter hooks (`NB_CARDPROBE=1`, `cardprobe.c`) log each type the game asks for; per card read / not seen / gated / not arrived. `python -m star_probe`, `--check` |
 | `live_check.py` | One-boot check of the host round: team reward, area effects (radius, kind), teammate respawn, HUD mask, live map tiles, cubes lost at a knock-out. |
 | `showdown_check.py` | Showdown rules (issue #21), played by the native AI in solo / duo / trio: the battle ends when one team is left, death cube drops, spawn protection after a respawn. `--check` without the host. |
 | `test_fast.py` | Equality and timing of the fast paths against the reference paths on real battles. |
@@ -116,7 +117,7 @@ Example reasons: `Undertaker (melee, range 3) 4 tiles E: keeping my distance W`,
 | `setup.sh` | One-command setup: host build, venv, game files (SETUP.md). Rebuilds the host when its sources changed. |
 | `update.sh` | Updates a checkout to the latest `main` (fast-forward, or a merge into your branch), then reruns `setup.sh`; `--check` runs the self-checks. |
 | `engine/` | nirkt's battle host and environment as one tree: `native/` (host sources, qemu patches), `py/` (`nbpc`, `models4.py`), `train/`, nirkt's vision-label tools; this project's changes applied. What came from where: `engine/NOTICE.md`. |
-| `engine/patches/` | Record of this project's changes to nirkt's host and camera rules (`training_round`, `fair_view`, `live_state`, `gadgets`, `charge`, `hypercharge`, `hypercharged_supers`, `area_gadgets`, `showdown`, `supers`, `status_movement`, `obs_invisibility`; already applied in `engine/`). |
+| `engine/patches/` | Record of this project's changes to nirkt's host and camera rules (`training_round`, `fair_view`, `live_state`, `gadgets`, `charge`, `hypercharge`, `hypercharged_supers`, `area_gadgets`, `showdown`, `supers`, `status_movement`, `obs_invisibility`, `star_powers`; already applied in `engine/`). |
 | `pro_strategies.md` | Community Showdown habits and what each means for the observation / reward. |
 
 ## Vision models
@@ -160,7 +161,7 @@ Before `update.sh` existed: `git pull` once, then `./update.sh`.
 Self-checks (no battle is booted; `obs_v5` / `env_v5` read the game's data tables, so they need the game files):
 
 ```bash
-python -m obs_v5 && python -m intent && python -m planner && python -m model && python -m fast_obs && python -m env_v5 --check && python -m train_ppo --check && python -m scenarios --check && python -m gadget_check --check && python -m hyper_check --check && python -m charge_check --check && python -m showdown_check --check && python -m status_check --check && python -m super_audit --check && python -m export_policy --check && python apply_noise.py --test
+python -m obs_v5 && python -m intent && python -m planner && python -m model && python -m fast_obs && python -m env_v5 --check && python -m train_ppo --check && python -m scenarios --check && python -m gadget_check --check && python -m hyper_check --check && python -m charge_check --check && python -m showdown_check --check && python -m status_check --check && python -m star_probe --check && python -m super_audit --check && python -m export_policy --check && python apply_noise.py --test
 ```
 
 Live checks (boot the host; each boot takes about 60-90 s):
@@ -172,6 +173,7 @@ python -m hyper_check                               # hypercharge activation, bu
 python -m charge_check                              # charge supers: walls, Damian's arena edge, Berry's paint
 python -m status_check                              # speed boosts, slows, stuns, Draco's mount, Leon unseen
 python -m showdown_check                            # team end, death cube drops, respawn protection
+python -m star_probe                                # which star powers the game reads (2 rounds of 22 battles, ~25 min)
 python -m env_v5 --n 4 --minutes 2 --agents 10      # random-action benchmark
 ```
 
@@ -198,7 +200,7 @@ cd $SIM_WORK/runs && python -m http.server 8766      # dashboard: http://localho
   it gives the brawler's speed, damage and shield buffs for 5 s, and its skills are the hypercharged ones: the game's own
   skill code runs the tables' `Overcharged*` columns (the client build's "is hypercharged" check always said no), and the
   seven brawlers with a separate hypercharged super (`characters.csv` `OverchargedUltimateSkill`: Chester, Mandy,
-  Larry & Lawrie, Ollie, Trunk, Mina, Meg's mech) cast that one. Training with gadget loadouts is `--gadgets 1`, with hypercharge `--hyper 1` (both off by default).
+  Larry & Lawrie, Ollie, Trunk, Mina, Meg's mech) cast that one. Training with gadget loadouts is `--gadgets 1`, with hypercharge `--hyper 1`, with star powers `--star-powers 1` (all off by default; star powers are a loadout only, `python -m star_probe` shows which ones the game reads).
 - Observation layout changes must be mirrored by anything that consumes exported policies. `obs_v5` carries the
   version (`obs_v5.OBS_VERSION`, now `v5.8`; saved in every checkpoint) that exported policies are checked against.
 

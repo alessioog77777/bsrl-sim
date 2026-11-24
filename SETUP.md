@@ -83,6 +83,10 @@ Changes made to nirkt's code, all recorded in `engine/patches/`:
   (`native/loader/encode.c`) leaves out an invisible enemy brawler farther than its reveal distance (1200; "full"
   invisibility: any distance) from the enemy rows and grid channel 5; `env.c` `invis_reach` reads the status
   aggregate and Leon's super (broken by his attack).
+- `star_powers.patch` (issue #20, a diff on top of the patches above): `native/loader/cardprobe.c`, test-only. With
+  `NB_CARDPROBE=1` it hooks libg's star power getters (0xc42838 / 0xc42874 / 0xc428b0 / 0xc428ec and the config-level
+  0xc34be0 / 0xc34c6c) and logs every ability type the game asks a player for, plus each player's star power card after the
+  build (`env.c` `div_publish`). Unset, nothing is hooked. `python -m star_probe` runs it.
 - `maenv.py` and `fair.py` copied from nbrl-env's `py/nbpc` into bulletlabels' `vendor/nbpc` (now `engine/py/nbpc`),
   so one `nbpc` package holds the host side and the environment side.
 - The game download link removed from bulletlabels' `setup.sh` (`engine/setup.sh`) (this repo's `setup.sh` downloads it instead).
@@ -106,6 +110,8 @@ downloaded game build, default `work/`), `SIM_VENV`.
 - **The fire head never uses most gadgets.** The game build compiles gadget activation out, and the
   host activates only the kinds `native/loader/gadget.c` implements (dash, heal over time, area at the brawler), so for every other
   gadget the class stays masked. `python -m gadget_check` shows which kinds the built host publishes.
+- **Star powers seem to do nothing.** `--star-powers 1` only equips the cards; most star power effects are compiled out of
+  the client build. `python -m star_probe` lists which ones the game reads.
 - **The fire head never uses hypercharge.** It needs `--hyper 1` (players get their card) and a host built with
   `native/loader/hyper.c`. `python -m hyper_check` checks the built host.
 - **Every boot crashes at "loading 45%".** A game file is a Git LFS pointer, not the file (seen with `assets/sc/ui.sc`

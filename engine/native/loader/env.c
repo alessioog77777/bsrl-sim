@@ -1439,6 +1439,7 @@ static int data_id(void *d) { return d ? I32(d, 0x20) : 0; }
 static int loc_variation(void *loc) { void *v = loc ? PTR(loc, 0x60) : NULL; return v ? I32(v, 0x54) : -1; }   /* 0xaeabc8 */
 static void div_reset(const NbeCmd *c) {   /* a RESET was accepted: set up the next build */
     uint8_t *G = B(LOC_GLOBAL);
+    { extern void cardprobe_reset(void) __attribute__((weak)); if (cardprobe_reset) cardprobe_reset(); }   /* NB_CARDPROBE (issue #20) */
     if (!g_play_loc) g_play_loc = PTR(G, 0);
     if (g_theme_loc) { PTR(g_theme_loc, 0x58) = g_theme_orig; g_theme_loc = NULL; }
     g_div_err = 0; void *loc = NULL;
@@ -1489,6 +1490,7 @@ static void div_publish(void *sim) {   /* RESET response: read the battle back f
         hyper_reset_player(i, ps[i]);                         /* hypercharge round */
         if (ld && ld[1] && PTR(ld[1], 0x08)) R->div_reserved[2] |= 1 << i;
     }
+    { extern void cardprobe_build(void *) __attribute__((weak)); if (cardprobe_build) cardprobe_build(sim); }   /* NB_CARDPROBE (issue #20) */
 }
 
 /* ------------------------------------------------------------------ the step loop */
