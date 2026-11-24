@@ -24,6 +24,7 @@ the workers (train_ppo.policy_s, after the observation build), so the block reac
 trainers share one implementation; the planner's reasons go into the worker's replay frames.
 Gadgets (--gadgets 1, train_ppo's flag): the workers' battle_fn adds the loadouts (env_v5.with_gadgets) and their
 observation build gets env_v5.Env.gadget (self 3).
+Star powers (--star-powers 1, train_ppo's flag): the workers' battle_fn adds env_v5.with_star_powers (not observed).
 Hypercharge (--hyper 1, train_ppo's flag): the same with env_v5.with_hyper and env_v5.Env.hyper (self 4).
 Hard scenarios (--eval-scenarios): every worker records its scenario episodes (scenarios.Recorder) and sends their
 index entries; the main process writes replays/scn/index.json and, at the eval's end, scenarios.jsonl.
@@ -84,6 +85,7 @@ def parse(argv=None):
     ap.add_argument("--eval-team", type=int, default=1, help="team size of the eval battles (1 = solo, as before)")
     ap.add_argument("--gen", type=int, default=0, help="1 = instances boot generated layouts (env_v5.use_genmaps), played with --p-gen")
     ap.add_argument("--p-gen", type=float, default=0.5)
+    ap.add_argument("--star-powers", type=int, default=0, help="1 = players carry a star power card the probe found read by this build (star_audit.LIVE; issue #20; not in the observation)")
     ap.add_argument("--gadgets", type=int, default=0, help="1 = players carry a gadget, the policy sees it ready (self 3) and may use it (obs v5.7, issue #3; needs a host that activates its kind)")
     ap.add_argument("--hyper", type=int, default=0, help="1 = players carry their hypercharge card, the policy sees it ready (self 4) and may activate it (obs v5.8, issue #4; needs a host with hyper.c)")
     a = ap.parse_args(argv)
@@ -124,6 +126,7 @@ def worker(w, lo, hi, a, loc, out, conn, shm, init, ashm=None):
         def battle_fn(rng, i):                          # --gadgets: MAEnv's rng, so rng_b's draws stay the same
             cfg = battle_cfg(rng, i)
             cfg = E.with_gadgets(cfg, rng) if a.gadgets and "scenario" not in cfg else cfg   # scenarios: as set up
+            cfg = E.with_star_powers(cfg, rng) if a.star_powers and "scenario" not in cfg else cfg   # after the gadgets' draws
             return E.with_hyper(cfg) if a.hyper and "scenario" not in cfg else cfg         # --hyper: no draw
 
         def battle_cfg(rng, i):                         # train_ppo.battle_fn; state from the main process
