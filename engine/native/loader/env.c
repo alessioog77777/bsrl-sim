@@ -963,6 +963,7 @@ static void respawn_tick(void *sim) {
         } else { I32(c, 0x38) = PARK_X; I32(c, 0x3c) = PARK_Y; I32(c, 0x3c4) = I32(c, 0x3c8); U8(c, 0x469) = 0; }
     }
 }
+void gadget_tick(void *sim, int tick);   /* gadget.c */
 static void pre_snapshot(void *sim) {   /* 0xb63b0c, once per tick: storm hits, leaps, tick jobs, local AI */
     if (g_setup_pending) { g_setup_pending = 0; apply_setup(sim); }
     if (E.resp_n) respawn_tick(sim);
@@ -970,6 +971,7 @@ static void pre_snapshot(void *sim) {   /* 0xb63b0c, once per tick: storm hits, 
     E.ngq = 0;
     if (E.njobs) sf_tick(sim);
     if (g_ncj) charge_contact_tick(sim);   /* diversity round: env charge contact (only after a native charge start) */
+    gadget_tick(sim, I32(sim, 0x10));      /* gadget round: heals over time */
     if (g_nzone) zone_tick(sim);
     int ntj = E.ntj; TickJob tj[64]; memcpy(tj, E.tj, ntj * sizeof *tj); E.ntj = 0;
     for (int i = 0; i < ntj; i++) {
@@ -1136,7 +1138,18 @@ static void fire_input(void *sim, int pidx, uint8_t *ch, int super, double deg, 
  * 1000 u (like a relative attack input). NOTE: 0xb27c58 is a bare ret in this libg: the input reaches the game, nothing happens.
  * gadget round: a gadget with a host implementation (gadget.c) is activated there instead. */
 int gadget_use(void *sim, int i, uint8_t *ch, double deg, int tick); void gadget_publish(NbeResp *r, int tick);
-void gadget_clear(void); void gadget_reset_player(int i, int has_object);
+void gadget_clear(void); void gadget_reset_player(int i, void *acc); void gadget_tick(void *sim, int tick);
+void *env_obj_by_id(void *sim, int id) { return obj_by_id(sim, id); }   /* for gadget.c */
+/* gadget.c's dash: the native charge mover (as native_charge_start) with charge type 1, but no active-skill slot (+0x6d8 = 0)
+ * and no env contact job, so a brawler whose super is a charge (Bull, El Primo) does not run that super's hits while it
+ * dashes. -> the path length (0 = no dash: the brawler is down or already in a charge / leap) */
+int env_dash_start(uint8_t *ch, int tx, int ty, int speed) {
+    if (!ch || I32(ch, 0x3c4) <= 0 || speed <= 0 || U8(ch, 0x490)) return 0;
+    ((void (*)(void *, int, int, uint64_t, unsigned, unsigned, int))B(0xb4790c))(ch, tx, ty, 1, (unsigned)speed, 0, 0);
+    if (I32(ch, 0x41c) <= 0) return 0;
+    U8(ch, 0x490) = 1; I32(ch, 0x508) = 1; I32(ch, 0x6d8) = 0;
+    return I32(ch, 0x41c);
+}
 static void gadget_input(void *sim, int pidx, uint8_t *ch, double deg) {
     if (gadget_use(sim, pidx, ch, deg, I32(sim, 0x10))) return;
     double r = deg * M_PI / 180; apply_input(sim, pidx, 8, jround(1000 * cos(r)), jround(1000 * sin(r)), NULL);
@@ -1392,7 +1405,7 @@ static void div_publish(void *sim) {   /* RESET response: read the battle back f
         void *skin = PTR(ps[i], 0x1d8); if (!skin && ld) skin = ld[4];
         R->pl_char[i] = ld ? data_id(ld[0]) : 0; R->pl_skin[i] = data_id(skin);
         if (PTR(ps[i], 0x190)) R->div_reserved[1] |= 1 << i;
-        gadget_reset_player(i, PTR(ps[i], 0x190) != NULL);   /* gadget round */
+        gadget_reset_player(i, PTR(ps[i], 0x190));   /* gadget round: the player's accessory object (NULL = no gadget) */
         hyper_reset_player(i, ps[i]);                         /* hypercharge round */
         if (ld && ld[1] && PTR(ld[1], 0x08)) R->div_reserved[2] |= 1 << i;
     }
