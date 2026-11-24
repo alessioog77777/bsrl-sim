@@ -95,7 +95,7 @@ class Resp(C.Structure):
         ("hyp_supers", C.c_int32 * MAXP), ("hyp_super_id", C.c_int32 * MAXP)]
 
 
-GAD_NONE, GAD_DASH, GAD_HEAL, GAD_SHIELD, GAD_SPAWN, GAD_PROJECTILE, GAD_STATUS = range(7)   # Resp.gad_kind (nbenv_proto.h NBE_GAD_*)
+GAD_NONE, GAD_DASH, GAD_HEAL, GAD_SHIELD, GAD_SPAWN, GAD_PROJECTILE, GAD_STATUS, GAD_SUPER = range(8)   # Resp.gad_kind (nbenv_proto.h NBE_GAD_*)
 
 
 class Hdr(C.Structure):

@@ -38,11 +38,12 @@ OverchargedUltimateSkill, else the UltimateSkill's OverchargedVersion, with the 
 (the host reports a super cast while hypercharged, NbeResp hyp_supers / hyp_super_id, with the OverchargedUltimateSkill's data
 where there is one) and hyper (a projectile / summon / area / item only the hypercharged super has, when it has one).
 Output: super_audit_hyper.json / .md.
---gadget (gadget round, issue #3): the brawlers with a gadget the host drops as an area at the brawler (nbhost gadget.c AREA:
-accessories.csv Type empty, an AreaEffect that is not a WallSpawn or HpBasedStun; `area_gadgets`). Each shooter gets that gadget card and
-fires it (fire 3, aimed at the target) in place of the super; consumed = the host counted a use (NbeResp gad_used). Expected
-effects come from the gadget's area_effects_logic row (`expected_gadget`): area, plus damage / push / heal as for a super's
-area. Output: super_audit_gadget.json / .md."""
+--gadget (gadget round, issue #3): the brawlers with a gadget the host implements and this audit can see (`audit_gadgets`,
+`gadget_kind` mirrors nbhost gadget.c's classify functions: area at the brawler, the gadget's own skill shot or area, repeat /
+spin volleys, items, instant heals; R-T's super charge is gadget_check's). Each shooter gets that gadget card and fires it
+(fire 3, aimed at the target) in place of the super; consumed = the host counted a use (NbeResp gad_used). Expected effects
+come from the tables (`expected_gadget`). --gadget-slot 1 audits each brawler's second such gadget. Output:
+super_audit_gadget.json / .md (slot 1: super_audit_gadget_2.*)."""
 import argparse, collections, functools, json, os, sys, threading, time
 import numpy as np
 
@@ -71,7 +72,7 @@ def _tables():
     rows = lambda f: [r for r in D._rows(f) if r[next(iter(r))]]
     return {"char": named("characters.csv"), "skill": named("skills.csv"), "plog": named("projectiles_logic.csv"),
             "pskin": named("projectiles_skin.csv"), "alog": named("area_effects_logic.csv"), "askin": named("area_effects_skin.csv"),
-            "rows": {6: rows("projectiles_skin.csv"), 16: rows("characters.csv"), 17: rows("area_effects_skin.csv"), 18: rows("items.csv")},
+            "item": named("items.csv"), "rows": {6: rows("projectiles_skin.csv"), 16: rows("characters.csv"), 17: rows("area_effects_skin.csv"), 18: rows("items.csv")},
             "skill_rows": rows("skills.csv")}
 
 
@@ -144,7 +145,19 @@ def expected(name, hyper=False):
     T = _tables(); ch = T["char"][name]; sk_name = ch.get("UltimateSkill", ""); s = T["skill"].get(sk_name, {})
     if hyper:
         base = expected(name); sk_name, s = hyper_skill(name)
-    bt = s.get("BehaviorType") or "?"; ex = []; notes = []
+    out = expected_skill(sk_name, s); ex, notes = out["expect"], out["notes"]
+    if hyper:
+        names = lambda i: set(i["projectiles"]) | set(i["summons"]) | set(i["areas"]) | set(i["items"])
+        out["hyper_names"] = sorted(names(out) - names(base)); out["own_skill"] = bool(ch.get("OverchargedUltimateSkill"))
+        ex.append("hyper_cast")
+        if out["hyper_names"]: ex.append("hyper")
+        else: notes.append("hypercharged super: no projectile / summon / area / item of its own (its difference is not visible here)")
+    return out
+
+
+def expected_skill(sk_name, s):
+    """a skills.csv row (name, row) -> expected()'s dict for that skill (a super's, or a gadget's own skill)"""
+    T = _tables(); bt = s.get("BehaviorType") or "?"; ex = []; notes = []
     projs = [p for p in (s.get("Projectiles") or "").split(";") if p]
     pl = [T["plog"].get(T["pskin"].get(p, {}).get("LogicProjectile") or p, {}) for p in projs]
     ps = [T["pskin"].get(p, {}) for p in projs]
@@ -188,51 +201,104 @@ def expected(name, hyper=False):
     out = {"skill": sk_name, "type": bt, "kind": kind, "range": cr if cr > 0 else 2600.0, "charge": charge, "ring": ring, "east": east,
            "steer": steer, "cast": _num(s, "CastingTime"), "expect": ex,
            "projectiles": projs, "summons": summons, "areas": areas, "items": items, "notes": notes}
-    if hyper:
-        names = lambda i: set(i["projectiles"]) | set(i["summons"]) | set(i["areas"]) | set(i["items"])
-        out["hyper_names"] = sorted(names(out) - names(base)); out["own_skill"] = bool(ch.get("OverchargedUltimateSkill"))
-        ex.append("hyper_cast")
-        if out["hyper_names"]: ex.append("hyper")
-        else: notes.append("hypercharged super: no projectile / summon / area / item of its own (its difference is not visible here)")
     return out
 
 
 HEAL_TYPES = ("Heal", "Hot", "HealRegen", "HealAndDamage", "HotAndDot")
 
 
+MASKED = {"BowDude_Totem", "Speedy_Rewind", "HammerDude_Pull", "HookDude_Homing", "AssaultShotgun_Bomb", "Ninja_InvisibleArea",
+          "Gladiator_Amp", "MagicalGirl_FlyArea"}   # gadget.c g_masked: classified, but no effect in this audit -> not usable
+GADGET_KINDS = ("area", "shot", "skill_area", "repeat", "spin", "item", "heal_now", "super")
+
+
+def gadget_kind(a):
+    """accessories.csv row -> the host's gadget.c implementation that handles it (GADGET_KINDS), None = not usable.
+    Mirrors gadget.c's classify functions (accessory Type, AreaEffect, the Skill's BehaviorType, CustomObject's table)."""
+    T = _tables(); t = a.get("Type") or ""; num = lambda k: _num(a, k)
+    if a.get("Name") in MASKED: return None
+    if not t and a.get("AreaEffect"):   # AREA: the area at the brawler, Rosa's WallSpawn and Meeple's HpBasedStun left out
+        return "area" if T["alog"].get(a["AreaEffect"], {}).get("Type") not in ("WallSpawn", "HpBasedStun") else None
+    if not t and a.get("Skill"):
+        sk = T["skill"].get(a["Skill"], {}); bt = sk.get("BehaviorType") or "Attack"   # an empty BehaviorType parses as Attack
+        if bt == "Attack" and sk.get("Projectiles"): return "shot"
+        if bt in ("Attack", "AimableArea") and not sk.get("Projectiles") and sk.get("AreaEffectObject"): return "skill_area"
+        return None
+    obj = (a.get("CustomObject") or "").split(";")[0]
+    is_proj = obj in T["pskin"] or obj in T["plog"]
+    if t == "repeat_shot" and is_proj and num("CustomValue1") > 0: return "repeat"
+    if t == "spin_shoot" and is_proj and num("CustomValue1") > 0 and num("ActiveTicks") > 0: return "spin"
+    if t == "spawn" and obj in T["item"]: return "item"
+    if t in ("heal_attached_and_self", "heal_damage_taken") and num("CustomValue1") > 0: return "heal_now"
+    if t == "charge_ulti" and num("CustomValue1") > 0: return "super"
+    return None
+
+
 @functools.lru_cache(None)
-def area_gadgets():
-    """brawler -> (cards.csv data id, accessories.csv row name) of its first gadget that the host drops as an area at the
-    brawler (gadget.c AREA: Type empty, AreaEffect set and not a WallSpawn or HpBasedStun). Card ids count the named cards.csv rows, as
-    env_v5.gadget_cards."""
+def all_gadgets():
+    """brawler -> [(cards.csv data id, accessories.csv row name, gadget_kind or None)] of its enabled gadget cards, in card
+    order. Card ids count the named cards.csv rows, as env_v5.gadget_cards."""
     from nbpc import diversity as D
-    T = _tables(); acc = {r["Name"]: r for r in D._rows("accessories.csv") if r.get("Name")}
+    acc = {r["Name"]: r for r in D._rows("accessories.csv") if r.get("Name")}
     out, k = {}, 0
     for r in D._rows("cards.csv"):
         if not r[next(iter(r))]: continue
         a = acc.get(r.get("Skill") or "")
-        if (r.get("MetaType") == "5" and r.get("Target") and (r.get("Disabled") or "").lower() != "true" and a and not a.get("Type")
-                and a.get("AreaEffect") and T["alog"].get(a["AreaEffect"], {}).get("Type") not in ("WallSpawn", "HpBasedStun")):
-            out.setdefault(r["Target"], (23 * 1000000 + k, a["Name"]))
+        if r.get("MetaType") == "5" and r.get("Target") and (r.get("Disabled") or "").lower() != "true":
+            out.setdefault(r["Target"], []).append((23 * 1000000 + k, a["Name"] if a else r.get("Skill"), gadget_kind(a) if a else None))
         k += 1
     return out
 
 
-def expected_gadget(name):
-    """--gadget: the brawler's area_gadgets() gadget -> the same dict as expected(): area always; damage, push, heal from
-    the area's area_effects_logic row (as for a super's area); range = the area's radius (the target stands inside it)"""
+AUDIT_KINDS = ("area", "shot", "skill_area", "repeat", "spin", "item", "heal_now")   # "super" (R-T): gadget_check checks it
+
+
+@functools.lru_cache(None)
+def audit_gadgets(slot=0):
+    """--gadget: brawler -> (card, accessories.csv row name, kind) of its slot-th gadget (0 = first) that the host implements
+    with an effect this audit can see (AUDIT_KINDS)"""
+    out = {}
+    for b, gs in all_gadgets().items():
+        ok = [g for g in gs if g[2] in AUDIT_KINDS]
+        if slot < len(ok): out[b] = ok[slot]
+    return out
+
+
+def area_gadgets():
+    """brawler -> (card, row name) of its first AREA gadget (gadget.c AREA)"""
+    return {b: next((c, n) for c, n, k in gs if k == "area") for b, gs in all_gadgets().items() if any(k == "area" for _, _, k in gs)}
+
+
+def expected_gadget(name, slot=0):
+    """--gadget: the brawler's audit_gadgets(slot) gadget -> the same dict as expected(). area: area always; damage, push,
+    heal from the area's area_effects_logic row, range = its radius (the target stands inside it). shot / skill_area: the
+    gadget's own skill as expected_skill() reads a super. repeat / spin: projectile + damage (the host gives them the main
+    attack's damage) at the main attack's range (spin: CustomValue4). item: an item. heal_now: a heal (the target hits the
+    shooter first)."""
     from nbpc import diversity as D
-    T = _tables(); card, acc = area_gadgets()[name]
+    T = _tables(); card, acc, kind = audit_gadgets(slot)[name]
     a = {r["Name"]: r for r in D._rows("accessories.csv") if r.get("Name")}[acc]
-    area = a["AreaEffect"]; al = T["alog"].get(T["askin"].get(area, {}).get("Logic") or area, {})
-    ex = ["area"]; notes = []
-    if _num(al, "Damage") > 0 and al.get("Type") == "Damage": ex.append("damage")
-    if _num(al, "PushbackStrength") > 0: ex.append("push")
-    if al.get("Type") in HEAL_TYPES: ex.append("heal")
-    if al.get("Type") in ("StatusEffect", "Cleanse", "HpBasedStun"): notes.append(f"{al['Type']}: its main effect is not visible here")
-    return {"skill": acc, "type": "Gadget", "kind": "Gadget: area " + (al.get("Type") or "?"), "range": _num(al, "Radius") or 1000.0,
-            "charge": False, "ring": 0.0, "east": False, "steer": False, "cast": 0.0, "expect": ex, "card": card,
-            "delay": _num(a, "ActivationDelay"), "projectiles": [], "summons": [], "areas": [area], "items": [], "notes": notes}
+    base = {"skill": acc, "type": "Gadget", "charge": False, "ring": 0.0, "east": False, "steer": False, "cast": 0.0, "card": card,
+            "delay": _num(a, "ActivationDelay"), "projectiles": [], "summons": [], "areas": [], "items": [], "notes": [], "gadget_kind": kind}
+    if kind == "area":
+        area = a["AreaEffect"]; al = T["alog"].get(T["askin"].get(area, {}).get("Logic") or area, {})
+        ex = ["area"]
+        if _num(al, "Damage") > 0 and al.get("Type") == "Damage": ex.append("damage")
+        if _num(al, "PushbackStrength") > 0: ex.append("push")
+        if al.get("Type") in HEAL_TYPES: ex.append("heal")
+        if al.get("Type") in ("StatusEffect", "Cleanse", "HpBasedStun"): base["notes"].append(f"{al['Type']}: its main effect is not visible here")
+        return {**base, "kind": "Gadget: area " + (al.get("Type") or "?"), "range": _num(al, "Radius") or 1000.0, "expect": ex, "areas": [area]}
+    if kind in ("shot", "skill_area"):
+        e = expected_skill(a["Skill"], T["skill"].get(a["Skill"], {}))
+        return {**e, "skill": acc, "type": "Gadget", "kind": "Gadget: " + kind, "card": card, "delay": 0.0, "gadget_kind": kind}
+    att = T["skill"].get(T["char"].get(name, {}).get("WeaponSkill", ""), {})
+    if kind in ("repeat", "spin"):
+        obj = a["CustomObject"].split(";")[0]
+        rng = _num(a, "CustomValue4") if kind == "spin" and _num(a, "CustomValue4") > 0 else _num(att, "CastingRange") * 100 or 2000.0
+        return {**base, "kind": "Gadget: " + kind, "range": rng, "expect": ["projectile", "damage"], "projectiles": [obj]}
+    if kind == "item":
+        return {**base, "kind": "Gadget: item", "range": 600.0, "expect": ["item"], "items": [a["CustomObject"].split(";")[0]]}
+    return {**base, "kind": "Gadget: heal_now", "range": 600.0, "expect": ["heal"]}
 
 
 # ------------------------------------------------------------------ classification
@@ -348,10 +414,10 @@ class Job:
 
 
 class Auditor:
-    def __init__(self, names, n=1, retry=True, log_dir=None, seed=0, host_args=(), verbose=True, hyper=False, gadget=False):
+    def __init__(self, names, n=1, retry=True, log_dir=None, seed=0, host_args=(), verbose=True, hyper=False, gadget=False, slot=0):
         from nbpc import diversity as D
         self.D = D; self.hyper = hyper; self.gadget = gadget; self.retry = retry; self.verbose = verbose
-        self.info = {b: expected_gadget(b) if gadget else expected(b, hyper) for b in names}
+        self.info = {b: expected_gadget(b, slot) if gadget else expected(b, hyper) for b in names}
         self.results = {b: [] for b in names}; self.lock = threading.Lock(); self.inflight = 0
         self.queue = collections.deque(Job(b) for b in names); self.seed = 93000000 + seed
         self.spots = find_spots(MAP)
@@ -703,6 +769,15 @@ def _check():
         tk = expected_gadget("ClusterBombDude")
         assert tk["skill"] == "ClusterBombDude_Explosion" and tk["expect"] == ["area", "damage", "push"] and tk["delay"] == 20, tk
         assert expected_gadget("DeadMariachi")["expect"] == ["area", "heal"] and expected_gadget("Ghost")["expect"] == ["area"]
+        kinds = collections.Counter(k for gs in all_gadgets().values() for _, _, k in gs)   # gadget.c's coverage of the enabled cards
+        assert sum(kinds.values()) == 213 and kinds["shot"] == 25 and kinds["repeat"] + kinds["spin"] == 8, kinds
+        assert kinds["item"] == 2 and kinds["heal_now"] == 2 and kinds["super"] == 1 and kinds["skill_area"] == 2, kinds
+        assert audit_gadgets(0)["Gunslinger"][1] == "Gunslinger_Reload" and audit_gadgets(1)["Gunslinger"][1] == "Gunslinger_BigBullet"
+        assert expected_gadget("Gunslinger")["expect"][:1] == ["projectile"] and expected_gadget("Gunslinger", 1)["gadget_kind"] == "shot"
+        assert not {"BowDude", "HookDude"} & set(audit_gadgets(0))
+        assert expected_gadget("Barkeep", 1)["expect"] == ["projectile", "damage"] and expected_gadget("ElectroSniper")["expect"] == ["item"]
+        assert expected_gadget("BullDude", 1)["gadget_kind"] == "skill_area" and "area" in expected_gadget("BullDude", 1)["expect"]
+        assert expected_gadget("Samurai")["expect"] == ["heal"] and "Splitter" not in audit_gadgets(0)
         sp = find_spots(MAP)
         assert len(sp) == 10 and all(len(d) >= 2 for _, _, d in sp), len(sp)
         assert min(max(abs(a[0] - c[0]), abs(a[1] - c[1])) for i, a in enumerate(sp) for c in sp[i + 1:]) >= SPACING * TILE
@@ -723,19 +798,22 @@ def main():
     ap.add_argument("--host-args", default="", help="extra game host arguments, e.g. '--native-charge 0'")
     ap.add_argument("--hyper", action="store_true", help="the hypercharged supers: hypercharge each shooter first (fire 4), expect "
                     "the hypercharged super's effects; writes super_audit_hyper.json / .md")
-    ap.add_argument("--gadget", action="store_true", help="the area-at-brawler gadgets (host gadget.c AREA): fire each brawler's "
-                    "area gadget (fire 3) in place of the super; writes super_audit_gadget.json / .md")
+    ap.add_argument("--gadget", action="store_true", help="the gadgets the host implements (gadget.c, audit_gadgets): fire each brawler's "
+                    "gadget (fire 3) in place of the super; writes super_audit_gadget.json / .md")
+    ap.add_argument("--gadget-slot", type=int, default=0, help="--gadget: which of a brawler's implemented gadgets (0 = first, 1 = "
+                    "second: Gene, Colt, ...); slot 1 writes super_audit_gadget_2.json / .md")
     a = ap.parse_args()
     if a.check: return _check()
     globals()["WATCH"] = a.watch; globals()["POST_HIT"] = a.post_hit
     import env_v5
     roster, forms = env_v5.heroes(), env_v5.forms()     # forms (Meg's mech, event transforms): never a pick, audited after
-    if a.gadget: roster, forms = sorted(b for b in area_gadgets() if b in roster), []
+    if a.gadget: roster, forms = sorted(b for b in audit_gadgets(a.gadget_slot) if b in roster), []
     names = [x for x in a.only.split(",") if x] or roster + forms
-    bad = [x for x in names if x not in _tables()["char"] or (a.gadget and x not in area_gadgets())]
-    if bad: sys.exit(f"unknown brawlers{' (or no area gadget)' if a.gadget else ''}: {bad}")
-    au = Auditor(names, n=a.n, retry=not a.no_retry, seed=a.seed, host_args=a.host_args.split(), hyper=a.hyper, gadget=a.gadget)
-    stem = "super_audit_gadget" if a.gadget else "super_audit_hyper" if a.hyper else "super_audit"
+    bad = [x for x in names if x not in _tables()["char"] or (a.gadget and x not in audit_gadgets(a.gadget_slot))]
+    if bad: sys.exit(f"unknown brawlers{' (or no implemented gadget in that slot)' if a.gadget else ''}: {bad}")
+    au = Auditor(names, n=a.n, retry=not a.no_retry, seed=a.seed, host_args=a.host_args.split(), hyper=a.hyper, gadget=a.gadget,
+                 slot=a.gadget_slot)
+    stem = ("super_audit_gadget" + ("_%d" % (a.gadget_slot + 1) if a.gadget_slot else "")) if a.gadget else "super_audit_hyper" if a.hyper else "super_audit"
     nf = sum(x in forms for x in names)
     au.log(f"{len(names) - nf} brawlers + {nf} forms, {a.n} instances, {au.npair} pairs per phase on {MAP}")
     res = au.run()
@@ -750,7 +828,7 @@ def main():
             "battle_s_per_brawler": round(float(np.mean(bt)), 3) if bt else None, "host_args": a.host_args, "time": time.strftime("%F %T")}
     json.dump({"meta": meta, "brawlers": rows}, open(jp, "w"), indent=1)
     md = markdown(rows, a.hyper)
-    if a.gadget: md = md.replace("# Super audit", "# Gadget audit (areas at the brawler, fire 3 in place of the super)", 1)
+    if a.gadget: md = md.replace("# Super audit", "# Gadget audit (gadget slot %d, fire 3 in place of the super)" % (a.gadget_slot + 1), 1)
     open(os.path.join(a.out, stem + ".md"), "w").write(md + "\n")
     print(md)
     au.log(f"wrote {jp} and {stem}.md; {meta['battles']} battles in {meta['battle_s']} s ({meta['battle_s_per_brawler']} s per brawler-attempt)")
