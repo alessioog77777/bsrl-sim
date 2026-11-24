@@ -168,6 +168,7 @@ typedef struct {
 #define NBE_GAD_SPAWN 4       /* spawns an object (summon, turret, item, area) */
 #define NBE_GAD_PROJECTILE 5  /* fires a projectile (along the aim) */
 #define NBE_GAD_STATUS 6      /* a timed status on self or others (speed, slow, stun, ...) */
+#define NBE_GAD_SUPER 7       /* charges the brawler's super */
 
 typedef struct {
     uint32_t magic, version, total_size, hdr_size;

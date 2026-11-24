@@ -108,7 +108,7 @@ Example reasons: `Undertaker (melee, range 3) 4 tiles E: keeping my distance W`,
 | `star_audit.py` | Star power probe (issue #20): one boot, native-AI battles where every player carries a star power card, the host counting which card types libg looks up (`star.c`, `NB_STAR_PROBE=1`), plus a static scan of libg's lookup call sites; classes per card and `LIVE` (the cards found read, what `--star-powers 1` hands out). Results in `notes/issue20.md`. `python -m star_audit [--rounds 3] [--cards A,B]`, `--check` |
 | `hyper_check.py` | One-boot check of hypercharge: the card reaches the host, charging from hits, fire 4 activates only at a full charge with the card, +speed / +damage / shield while active, the end after 5 s and normal speed after it, `Env.hyper` agrees with the host. `python -m hyper_check`, `--check` |
 | `live_check.py` | One-boot check of the host round: team reward, area effects (radius, kind), teammate respawn, HUD mask, live map tiles, cubes lost at a knock-out. |
-| `showdown_check.py` | Showdown rules (issue #21), played by the native AI in solo / duo / trio: the battle ends when one team is left, death cube drops, spawn protection after a respawn. `--check` without the host. |
+| `showdown_check.py` | Showdown rules (issue #21), played by the native AI in solo / duo / trio: the battle ends when one team is left, death cube drops, spawn protection after a respawn, the storm's ramp and gas heal cut, and with `--mods 3,5` meteors and healing mushrooms. `--check` without the host. |
 | `test_fast.py` | Equality and timing of the fast paths against the reference paths on real battles. |
 | `apply_noise.py` | Writes a measured detector-noise report into `obs_v5.NOISE` (with sanity limits). |
 | `viz.html` | Run dashboard: training / eval curves, action histograms, battle replay with the policy's view. |
@@ -117,7 +117,8 @@ Example reasons: `Undertaker (melee, range 3) 4 tiles E: keeping my distance W`,
 | `setup.sh` | One-command setup: host build, venv, game files (SETUP.md). Rebuilds the host when its sources changed. |
 | `update.sh` | Updates a checkout to the latest `main` (fast-forward, or a merge into your branch), then reruns `setup.sh`; `--check` runs the self-checks. |
 | `engine/` | nirkt's battle host and environment as one tree: `native/` (host sources, qemu patches), `py/` (`nbpc`, `models4.py`), `train/`, nirkt's vision-label tools; this project's changes applied. What came from where: `engine/NOTICE.md`. |
-| `engine/patches/` | Record of this project's changes to nirkt's host and camera rules (`training_round`, `fair_view`, `live_state`, `gadgets`, `charge`, `hypercharge`, `hypercharged_supers`, `area_gadgets`, `showdown`, `supers`, `status_movement`, `obs_invisibility`; already applied in `engine/`). |
+| `engine/patches/` | Record of this project's changes to nirkt's host and camera rules (`training_round`, `fair_view`, `live_state`, `gadgets`, `charge`, `hypercharge`, `hypercharged_supers`, `hyper_supers_fix`, `area_gadgets`, `gadgets_batch2`, `showdown`, `showdown_leftovers`, `star_probe`, `supers`, `status_movement`, `obs_invisibility`; already applied in `engine/`). |
+| `notes/` | Working notes from the sessions behind each host change (libg offsets, measurements, guesses); index and dates in `notes/README.md`. |
 | `pro_strategies.md` | Community Showdown habits and what each means for the observation / reward. |
 
 ## Vision models
@@ -172,7 +173,7 @@ python -m gadget_check                              # which gadget kinds the bui
 python -m hyper_check                               # hypercharge activation, buffs and their end
 python -m charge_check                              # charge supers: walls, Damian's arena edge, Berry's paint
 python -m status_check                              # speed boosts, slows, stuns, Draco's mount, Leon unseen
-python -m showdown_check                            # team end, death cube drops, respawn protection
+python -m showdown_check                            # team end, death cube drops, respawn protection, storm
 python -m star_audit                                # which star power cards libg still reads in battle
 python -m env_v5 --n 4 --minutes 2 --agents 10      # random-action benchmark
 ```
@@ -195,7 +196,7 @@ cd $SIM_WORK/runs && python -m http.server 8766      # dashboard: http://localho
 - Generated layouts (`--gen`) were made for the vision models' training data and are not used for RL; their
   generator is not in this repository.
 - The fire head is none / attack / super / gadget / hypercharge. The gadget class is masked unless the host activates
-  that gadget's kind (`gadget.c`: dash, heal over time and area at the brawler so far) and a use is left (`obs_v5` self 3). The hypercharge class is
+  that gadget's kind (`gadget.c`: dashes, heals, areas, the gadget's own skill shot, extra shots, items, R-T's super charge; 55 of the 213 gadgets) and a use is left (`obs_v5` self 3). The hypercharge class is
   masked unless the brawler has its card, the charge is full and it is not active (`hyper.c`, `obs_v5` self 4); active,
   it gives the brawler's speed, damage and shield buffs for 5 s, and its skills are the hypercharged ones: the game's own
   skill code runs the tables' `Overcharged*` columns (the client build's "is hypercharged" check always said no), and the

@@ -1,0 +1,332 @@
+# showdown leftovers (bsrl-sim issue #21): the storm's ramp starts after 1 s in Trio and healing in the gas is halved
+# (env.c gas_tick, NB_GAS_RULES=0 off); Meteors / HealingMushrooms event modifiers as env tick jobs (showdown_mods.c,
+# NB_SD_MODIFIERS=3,5, off by default); WallSpawn tiles closer than the area's Radius, bush-grow areas grow bushes (spawnfix.c).
+# Applies on top of every earlier patch; paths relative to engine/.
+diff --git a/native/loader/build.sh b/native/loader/build.sh
+index cde0b74..0af31d7 100755
+--- a/native/loader/build.sh
++++ b/native/loader/build.sh
+@@ -10,5 +10,5 @@
+ set -e
+ cd "$(dirname "$0")"
+ aarch64-linux-gnu-gcc -O2 -g -ffp-contract=off -fno-omit-frame-pointer -static -D_GNU_SOURCE -Wall -Wno-unused-function -Wno-incompatible-pointer-types \
+-  -Wno-int-conversion -fno-strict-aliasing -Iinc -o nbhost_spawnfix2.tmp main.c elfload.c bionic_shim.c android_shim.c jni_fake.c boot.c hook.c offline.c battle_fix.c env.c prof.c encode.c heapcheck.c bar_fix.c gl_client.c gl_client_gen.c spawnfix.c superfix.c superfix_items.c superfix_moves.c superfix_status.c superfix_cc.c gadget.c hyper.c trace.c thunk.S -lm -lpthread
++  -Wno-int-conversion -fno-strict-aliasing -Iinc -o nbhost_spawnfix2.tmp main.c elfload.c bionic_shim.c android_shim.c jni_fake.c boot.c hook.c offline.c battle_fix.c env.c prof.c encode.c heapcheck.c bar_fix.c gl_client.c gl_client_gen.c spawnfix.c superfix.c superfix_items.c superfix_moves.c superfix_status.c superfix_cc.c gadget.c hyper.c showdown_mods.c trace.c thunk.S -lm -lpthread
+ mv -f nbhost_spawnfix2.tmp nbhost_spawnfix2 && echo "built native/loader/nbhost_spawnfix2"
+diff --git a/native/loader/env.c b/native/loader/env.c
+index c952043..bc335d5 100644
+--- a/native/loader/env.c
++++ b/native/loader/env.c
+@@ -115,7 +115,8 @@ static struct {
+     int gas_count, gas_since_valid[NBE_MAXP], gas_since[NBE_MAXP]; GasHit gq[NBE_MAXP]; int ngq;
+     int gas_lethal_id[NBE_MAXP], gas_lethal_tick[NBE_MAXP];
+     int gas_args_ok, ga4, ga5, ga7, gs0;   /* renderer's 0xc69094 arguments (constant per frame except the step) */
+-    long gas_native_checks, gas_formula_mismatch;
++    long gas_native_checks, gas_formula_mismatch, gas_heal_cut;
++    int gas_hp[NBE_MAXP], gas_mx[NBE_MAXP], gas_hp_valid[NBE_MAXP];   /* last tick's hp / max hp (half healing in the gas) */
+     /* leap (SF) */
+     Leap jobs[NBE_MAXP]; int njobs; int sf_started, sf_landed, sf_blocked, sf_ignored, sf_boxes, sf_pops;
+     int sf_owner_id[NBE_MAXP], sf_owner_dmg[NBE_MAXP];
+@@ -985,26 +986,58 @@ static void cube_counter_install(void) {
+     hook_bl(g_libg, 0xb36924, cube84_a); hook_bl(g_libg, 0xb36904, cube84_b);
+     LOG("[env] cube counter: snapshot tag 0x84 = env's power cubes (0xb36904, 0xb36924)\n");
+ }
++/* issue #21: the game's storm rules on top of the phone agent's (NB_GAS_RULES=0 turns them off): Trio's ramp after 1 s, and
++ * healing inside the gas halved, all sources (since 04/09/24, #22 comment). The cut is on the hp gained since the last tick
++ * while in the gas both ticks with the same max hp (a cube pickup or a respawn is not a heal); a heal and a hit in the same
++ * tick are cut on the net gain. Not modelled: the extra damage deeper in the gas (since 22/04/26, amount not published). */
++int g_gas_rules = 1;
+ static void gas_tick(void *sim) {   /* the storm schedule (check every 20 ticks) + regen block + per-tick gas flags */
+     int tick = I32(sim, 0x10), np; void **ps = players(sim, &np);
+     E.gas_count++;
+     for (int i = 0; i < np && i < NBE_MAXP; i++) {
+         if (!ps[i]) continue; uint8_t *c = obj_by_id(sim, player_char_id(ps[i]));
+         int alive = c && VTOF(c) == VT_CHAR && I32(c, 0x3c4) > 0;
+-        if (!alive || waiting(i)) { E.ingas[i] = 0; continue; }
++        if (!alive || waiting(i)) { E.ingas[i] = 0; E.gas_hp_valid[i] = 0; continue; }
+         int g = in_gas_tile(sim, (int)floor(I32(c, 0x38) / 300.0), (int)floor(I32(c, 0x3c) / 300.0));
++        if (g && E.gas_on && g_gas_rules && E.gas_hp_valid[i] && E.ingas[i] && I32(c, 0x3c8) == E.gas_mx[i]) {
++            int hp = I32(c, 0x3c4), up = hp - E.gas_hp[i];
++            if (up > 1) {   /* half healing in the gas */
++                I32(c, 0x3c4) = hp - up / 2; E.gas_heal_cut += up / 2;
++                extern int g_sd_dbg; if (g_sd_dbg) LOG("[gas] heal cut player %d tick %d hp %d -> %d (gain %d)\n", i, tick, E.gas_hp[i], hp - up / 2, up);
++            }
++        }
+         E.ingas[i] = g; if (g) E.gast[i]++;
++        E.gas_hp[i] = I32(c, 0x3c4); E.gas_mx[i] = I32(c, 0x3c8); E.gas_hp_valid[i] = 1;
+         if (g && E.gas_on) I32(c, 0x7d8) = tick;        /* gasBlockRegen */
+         if (E.gas_on && E.gas_count % 20 == 0) {
+             if (!g) { E.gas_since_valid[i] = 0; continue; }
+             if (!E.gas_since_valid[i]) { E.gas_since_valid[i] = 1; E.gas_since[i] = tick; }
+-            double secs = (tick - E.gas_since[i]) / 20.0, pct = 20;
+-            if (secs > 5) pct += (secs - 5) * 5;
++            /* the ramp starts after 5 s in Solo / Duo and after 1 s in Trio (#22 comment: wiki + patch notes); the
++             * phone agent's storm (g_gas_rules 0) used 5 s everywhere */
++            double secs = (tick - E.gas_since[i]) / 20.0, pct = 20, ramp = g_gas_rules && sd_group_size(i) >= 3 ? 1 : 5;
++            if (secs > ramp) pct += (secs - ramp) * 5;
+             int mx = I32(c, 0x3c8), dmg = jround(mx * pct / 100); if (dmg < 1) dmg = 1;
+             if (E.ngq < NBE_MAXP) E.gq[E.ngq++] = (GasHit){I32(c, 8), dmg, (int)pct, (int)(secs * 10), mx, 0, 0};
++            { extern int g_sd_dbg; if (g_sd_dbg) LOG("[gas] hit player %d group %d tick %d secs %.2f pct %.1f max %d dmg %d\n", i, sd_group_size(i), tick, secs, pct, mx, dmg); }
+         }
+     }
+ }
++/* issue #21: what showdown_mods.c (event modifiers) needs from env: the living, placed player brawlers, storm flags, the
++ * battle's seed, the game's knockback and circle tile destroy */
++int env_sd_chars(void *sim, uint8_t **out, int *pidx, int max) {
++    int np, n = 0; void **ps = players(sim, &np);
++    for (int i = 0; i < np && i < NBE_MAXP && n < max; i++) {
++        if (!ps[i] || waiting(i)) continue; uint8_t *c = obj_by_id(sim, player_char_id(ps[i]));
++        if (c && VTOF(c) == VT_CHAR && I32(c, 0x3c4) > 0) { out[n] = c; pidx[n++] = i; }
++    }
++    return n;
++}
++int env_sd_in_gas_xy(void *sim, int x, int y) { return E.gas_on && in_gas_tile(sim, (int)floor(x / 300.0), (int)floor(y / 300.0)); }
++int env_sd_seed(void) { return E.reset_seed; }
++void env_sd_knockback(uint8_t *v, int sx, int sy, int strength) { KNOCKBACK(v, sx, sy, strength, -1); }
++void env_sd_break(void *sim, int x, int y, int r) {   /* as charge_break, with no owner (team -1) */
++    void *m = PTR(sim, 0x68); if (m) ((fn_circ)B(0xa53b60))(m, x, y, r, 0, -1, -1, 0, 0, PTR(sim, 0));
++}
+ static void apply_setup(void *sim) {   /* the phone test's debug_js_tick: park/freeze/teleport inside a tick */
+     int np; void **ps = players(sim, &np);
+     for (int i = 0; i < np && i < NBE_MAXP; i++) {
+@@ -1112,6 +1145,8 @@ void env_tick_leave(void *sim) {   /* after a completed outer tick: showdownTick
+     if (I32(sim, 0x104) != 6) return;
+     item_tick(sim);
+     elimination_tick(sim);
++    { extern void sd_mods_tick(void *); sd_mods_tick(sim); }   /* issue #21: event modifiers (showdown_mods.c), before the
++                                                                  * storm's heal cut sees their heals */
+     gas_tick(sim);
+     sf_bomb_state(sim);
+ }
+@@ -2301,6 +2336,7 @@ void hits_dump(const char *why) {
+ void env_install(void) {
+     if (!g_env_on) return;
+     KIND_BY_TYPE = B(0x185710);
++    { const char *e = getenv("NB_GAS_RULES"); if (e) g_gas_rules = atoi(e); extern void sd_mods_install(void); sd_mods_install(); }
+     /* B3 determinism patch: 0x9bb864 cbnz w8,#0x9bb890 -> b #0x9bb890 (keep the seed; no srand(time)/rand reseed) */
+     if (*(uint32_t *)B(0x9bb864) != 0x35000168) { LOG("[env] seed patch: unexpected bytes %08x\n", *(uint32_t *)B(0x9bb864)); exit(1); }
+     patch_u32(g_libg, 0x9bb864, 0x1400000b);
+diff --git a/native/loader/showdown_mods.c b/native/loader/showdown_mods.c
+new file mode 100644
+index 0000000..91bd0a2
+--- /dev/null
++++ b/native/loader/showdown_mods.c
+@@ -0,0 +1,153 @@
++/* showdown_mods (issue #21): two Showdown event modifiers as env tick jobs. The client libg passes the StartLoading
++ * modifier list through and never acts on it (the server spawns the events), so nothing happens without this file.
++ *
++ * NB_SD_MODIFIERS="3,5" turns them on (event_modifiers.csv Id: 3 Meteors, 5 HealingMushrooms); unset = off, the battle
++ * is unchanged. NB_SD_DBG=1 logs every event. Effects are applied by env (damage root / hp), not by a native area: an area
++ * needs an owner and then only hits that owner's enemies or heals its team, while the events hit / heal everyone. So the
++ * observation does not show the warning circle or the mushroom (no contract change).
++ *
++ * Meteors: one at a time. A red circle at the spot of the brawler with the most others within the blast radius ("meteors
++ * prioritize Brawlers that are closer together"), impact 3 s later: 2000 damage to every brawler within 1200 u, knockback,
++ * and the obstacles in that circle break. Healing mushrooms: next to the most isolated brawler ("spawn on players who are by
++ * themselves"); after growing, a ring of 1000 u heals every brawler in it by 1000 per second for 5 s; rings may overlap.
++ * Sources: area_effects_logic.csv EventExplosion (Damage 2000, Radius 1200, PushbackStrength 150, DestroysEnvironment)
++ * and EventHealing (Hot, Damage -1000, Radius 1000, TimeMs 5000); the fandom wiki's Modifiers page (2000 damage, knockback,
++ * breaks obstacles, 3 s circle, one meteor at a time, 1000 heal per second, both more frequent as the match goes on).
++ * [?] guessed (no source found): every first-spawn tick, interval and its shrink, the mushroom's grow time, and the spot
++ * offset. Event damage is a flat 2000 (the data's value, not level-scaled: env's x2 applies to character attackers only). */
++#include "nbhost.h"
++#include <stdlib.h>
++#include <string.h>
++#include <math.h>
++extern Module *g_libg;
++#define B(off) ((uint8_t *)g_libg->base + (off))
++#define I32(p, o) (*(int32_t *)((uint8_t *)(p) + (o)))
++
++int env_sd_chars(void *sim, uint8_t **out, int *pidx, int max);
++int env_sd_in_gas_xy(void *sim, int x, int y);
++int env_sd_seed(void);
++void env_sd_knockback(uint8_t *v, int sx, int sy, int strength);
++void env_sd_break(void *sim, int x, int y, int r);
++
++#define MOD_METEORS 3            /* event_modifiers.csv Id */
++#define MOD_MUSHROOMS 5
++#define MET_DMG 2000             /* EventExplosion Damage */
++#define MET_R 1200               /* EventExplosion Radius */
++#define MET_PUSH 150             /* EventExplosion PushbackStrength */
++#define MET_WARN 60              /* the red circle, 3 s before impact (wiki) */
++#define MET_FIRST 600            /* [?] first circle at 30 s (the intro is 182 ticks) */
++#define MET_GAP0 200             /* [?] 10 s from one impact to the next circle, */
++#define MET_GAP_STEP 10          /* [?] 0.5 s shorter after every meteor ("increasing frequency"), */
++#define MET_GAP_MIN 60           /* [?] down to 3 s */
++#define MUSH_HEAL 1000           /* EventHealing Damage -1000, per second (wiki: 1000 per second) */
++#define MUSH_R 1000              /* EventHealing Radius */
++#define MUSH_TICKS 100           /* EventHealing TimeMs 5000 */
++#define MUSH_GROW 60             /* [?] 3 s from sprouting to the first heal */
++#define MUSH_FIRST 400           /* [?] first mushroom at 20 s */
++#define MUSH_GAP0 300            /* [?] 15 s between mushrooms, */
++#define MUSH_GAP_STEP 20         /* [?] 1 s shorter after each, */
++#define MUSH_GAP_MIN 120         /* [?] down to 6 s */
++#define MUSH_OFF 400             /* [?] sprouts up to this far from the lone brawler */
++#define MUSH_MAX 4
++
++int g_sd_mods, g_sd_dbg;         /* bit k = modifier Id k on */
++static void *g_last_sim; static int g_last_tick;
++static uint32_t g_rng;
++static struct { int at, x, y, n, gap; } g_met;                    /* at: impact tick (0 = no circle up) */
++static struct { int start, x, y; } g_mush[MUSH_MAX]; static int g_mush_next, g_mush_gap;
++long g_sd_meteors, g_sd_met_hits, g_sd_mush, g_sd_mush_heal;
++
++static uint32_t rnd(void) { g_rng = g_rng * 1664525u + 1013904223u; return g_rng >> 8; }
++static long d2(uint8_t *c, int x, int y) { long dx = I32(c, 0x38) - x, dy = I32(c, 0x3c) - y; return dx * dx + dy * dy; }
++
++typedef uint64_t (*root_t)(void *, int, int, int, int, void *, void *, int, int, int, void *, int, int, int, int, int, int, int);
++static void event_hit(uint8_t *v, int dmg) {   /* no attacker: no damage model, no kill credit (as the storm's gas_hit) */
++    if (dmg >= I32(v, 0x3c4) && I32(v, 0xaa0) != -1) I32(v, 0xaa0) = -1;
++    ((root_t)B(0xb422d0))(v, -1, dmg, 0, 0, NULL, NULL, 1, I32(v, 0x38), I32(v, 0x3c), NULL, 0, 0, 0, 1, 0, 0, 0);
++}
++
++static void battle_reset(int tick) {
++    g_rng = (uint32_t)env_sd_seed() * 2654435761u + 17;
++    memset(&g_met, 0, sizeof g_met); memset(g_mush, 0, sizeof g_mush);
++    g_mush_next = MUSH_FIRST; g_mush_gap = MUSH_GAP0;
++    if (g_sd_dbg) LOG("[sdmod] battle start tick %d: modifiers %#x\n", tick, g_sd_mods);
++}
++
++static void meteors(void *sim, int tick, uint8_t **ch, int n) {
++    if (!g_met.at) {
++        int start = g_met.n ? g_met.gap : MET_FIRST;   /* g_met.gap: tick of the next circle after an impact */
++        if (tick < start || n < 1) return;
++        int best = -1, bk = -1;
++        for (int i = 0; i < n; i++) {
++            int k = 0; for (int j = 0; j < n; j++) k += j != i && d2(ch[j], I32(ch[i], 0x38), I32(ch[i], 0x3c)) <= (long)MET_R * MET_R;
++            if (k > bk || (k == bk && (rnd() & 1))) { bk = k; best = i; }
++        }
++        g_met.x = I32(ch[best], 0x38); g_met.y = I32(ch[best], 0x3c); g_met.at = tick + MET_WARN;
++        if (g_sd_dbg) LOG("[sdmod] meteor circle tick %d at %d,%d (%d others near), impact %d\n", tick, g_met.x, g_met.y, bk, g_met.at);
++        return;
++    }
++    if (tick < g_met.at) return;
++    int hits = 0;
++    for (int i = 0; i < n; i++) {
++        if (d2(ch[i], g_met.x, g_met.y) > (long)MET_R * MET_R) continue;
++        int hp0 = I32(ch[i], 0x3c4); event_hit(ch[i], MET_DMG);
++        if (I32(ch[i], 0x3c4) > 0) env_sd_knockback(ch[i], g_met.x, g_met.y, MET_PUSH);
++        hits++; if (g_sd_dbg) LOG("[sdmod] meteor hit ch %d hp %d -> %d\n", I32(ch[i], 8), hp0, I32(ch[i], 0x3c4));
++    }
++    env_sd_break(sim, g_met.x, g_met.y, MET_R);
++    g_sd_meteors++; g_sd_met_hits += hits; g_met.n++;
++    int gap = MET_GAP0 - MET_GAP_STEP * (g_met.n - 1); if (gap < MET_GAP_MIN) gap = MET_GAP_MIN;
++    if (g_sd_dbg) LOG("[sdmod] meteor impact tick %d at %d,%d: %d hit, next circle in %d\n", tick, g_met.x, g_met.y, hits, gap);
++    g_met.at = 0; g_met.gap = tick + gap;
++}
++
++static void mushrooms(void *sim, int tick, uint8_t **ch, int n) {
++    if (tick >= g_mush_next && n > 0) {
++        int best = -1; long bd = -1;
++        for (int i = 0; i < n; i++) {
++            long m = 1L << 40; for (int j = 0; j < n; j++) if (j != i) { long d = d2(ch[j], I32(ch[i], 0x38), I32(ch[i], 0x3c)); if (d < m) m = d; }
++            if (m > bd) { bd = m; best = i; }
++        }
++        int k; for (k = 0; k < MUSH_MAX && g_mush[k].start; k++) {}
++        if (k < MUSH_MAX) {
++            double a = (rnd() % 3600) * M_PI / 1800; int r = rnd() % (MUSH_OFF + 1);
++            int x = I32(ch[best], 0x38) + (int)(r * cos(a)), y = I32(ch[best], 0x3c) + (int)(r * sin(a));
++            if (env_sd_in_gas_xy(sim, x, y)) { x = I32(ch[best], 0x38); y = I32(ch[best], 0x3c); }
++            g_mush[k].start = tick + MUSH_GROW; g_mush[k].x = x; g_mush[k].y = y; g_sd_mush++;
++            if (g_sd_dbg) LOG("[sdmod] mushroom tick %d at %d,%d (next to ch %d), heals from %d\n", tick, x, y, I32(ch[best], 8), g_mush[k].start);
++        }
++        g_mush_next = tick + g_mush_gap; g_mush_gap -= MUSH_GAP_STEP; if (g_mush_gap < MUSH_GAP_MIN) g_mush_gap = MUSH_GAP_MIN;
++    }
++    for (int k = 0; k < MUSH_MAX; k++) {
++        if (!g_mush[k].start || tick < g_mush[k].start) continue;
++        int age = tick - g_mush[k].start;
++        if (age >= MUSH_TICKS) { g_mush[k].start = 0; continue; }
++        if (age % 20) continue;                       /* one heal per second */
++        for (int i = 0; i < n; i++) {
++            if (d2(ch[i], g_mush[k].x, g_mush[k].y) > (long)MUSH_R * MUSH_R) continue;
++            int hp = I32(ch[i], 0x3c4), mx = I32(ch[i], 0x3c8), nh = hp + MUSH_HEAL > mx ? mx : hp + MUSH_HEAL;
++            if (nh > hp) { I32(ch[i], 0x3c4) = nh; g_sd_mush_heal += nh - hp; }
++            if (g_sd_dbg) LOG("[sdmod] mushroom heal ch %d hp %d -> %d\n", I32(ch[i], 8), hp, nh);
++        }
++    }
++}
++
++void sd_mods_tick(void *sim) {
++    if (!g_sd_mods || !sim || I32(g_libg->base, 0x12eefb4) != 3) return;   /* battle running */
++    int tick = I32(sim, 0x10);
++    if (sim != g_last_sim || tick < g_last_tick) battle_reset(tick);
++    g_last_sim = sim; g_last_tick = tick;
++    uint8_t *ch[64]; int pi[64], n = env_sd_chars(sim, ch, pi, 64);
++    if (g_sd_mods >> MOD_METEORS & 1) meteors(sim, tick, ch, n);
++    if (g_sd_mods >> MOD_MUSHROOMS & 1) mushrooms(sim, tick, ch, n);
++}
++
++void sd_mods_install(void) {
++    const char *e = getenv("NB_SD_MODIFIERS"); g_sd_dbg = getenv("NB_SD_DBG") != NULL;
++    for (const char *p = e; p && *p; ) {
++        int id = atoi(p); if (id == MOD_METEORS || id == MOD_MUSHROOMS) g_sd_mods |= 1 << id;
++        while (*p && *p != ',') p++;
++        if (*p) p++;
++    }
++    if (g_sd_mods) LOG("[sdmod] event modifiers on: %#x (meteors %d, healing mushrooms %d)\n", g_sd_mods, g_sd_mods >> MOD_METEORS & 1, g_sd_mods >> MOD_MUSHROOMS & 1);
++}
+diff --git a/native/loader/spawnfix.c b/native/loader/spawnfix.c
+index 4d4fed9..508906f 100644
+--- a/native/loader/spawnfix.c
++++ b/native/loader/spawnfix.c
+@@ -48,7 +48,7 @@ static void *g_mapview;
+ static void on_mapview(uint64_t *c) { g_mapview = (void *)c[0]; }
+ static long g_nwall_areas, g_nwall_tiles; static int g_last_ring[2] = {-1, -1};
+ static int cell_id(uint8_t *tm, int x, int y) { if (!tm) return -1; uint8_t **c = (uint8_t **)PTR(tm, 0x20); uint8_t *ce = c ? c[y * I32(tm, 0xc4) + x] : NULL; return ce ? tile_id(PTR(ce, 0)) : -2; }
+-void spawnfix_walldiag(const char *why) { if (g_last_ring[0] < 0 || !g_spawn_dbg) return; uint8_t *ts = g_sim ? PTR(g_sim, 0x68) : NULL, *tc = g_client_obj ? PTR(g_client_obj, 0xf8) : NULL; LOG("[spawnfix] walldiag %s tick %d: ring tile (%d,%d) sim %d client %d; (%d,%d) sim %d client %d dynlist sim %d client %d\\n", why, g_sim ? I32(g_sim, 0x10) : -1, g_last_ring[0] + 2, g_last_ring[1], cell_id(ts, g_last_ring[0] + 2, g_last_ring[1]), cell_id(tc, g_last_ring[0] + 2, g_last_ring[1]), g_last_ring[0] + 2, g_last_ring[1] + 1, cell_id(ts, g_last_ring[0] + 2, g_last_ring[1] + 1), cell_id(tc, g_last_ring[0] + 2, g_last_ring[1] + 1), ts ? I32(ts, 0x34) : -1, tc ? I32(tc, 0x34) : -1); }
++void spawnfix_walldiag(const char *why) { if (g_last_ring[0] < 0 || !g_spawn_dbg) return; uint8_t *ts = g_sim ? PTR(g_sim, 0x68) : NULL, *tc = g_client_obj ? PTR(g_client_obj, 0xf8) : NULL; LOG("[spawnfix] walldiag %s tick %d: shape tile (%d,%d) sim %d client %d; (%d,%d) sim %d client %d dynlist sim %d client %d\\n", why, g_sim ? I32(g_sim, 0x10) : -1, g_last_ring[0] + 1, g_last_ring[1], cell_id(ts, g_last_ring[0] + 1, g_last_ring[1]), cell_id(tc, g_last_ring[0] + 1, g_last_ring[1]), g_last_ring[0] + 1, g_last_ring[1] + 1, cell_id(ts, g_last_ring[0] + 1, g_last_ring[1] + 1), cell_id(tc, g_last_ring[0] + 1, g_last_ring[1] + 1), ts ? I32(ts, 0x34) : -1, tc ? I32(tc, 0x34) : -1); }
+ static void *tile_by_code(int code) { return ((void *(*)(int))B(0xa50dec))(code); }
+ static int tile_id(void *d) { return d ? I32(d, 0x20) : 0; }
+ static int place_one(uint8_t *tm, void *data, int x, int y) {
+@@ -74,19 +74,33 @@ static int wall_code_for(uint8_t *pr) {
+ }
+ /* The walls go again by themselves: the setter puts them on the tile map's dynamic list, and the game removes them after
+  * the tile's Lifetime (tiles.csv: 200 ticks for every Wally* wall). Sprout audit, issue #21: 13 of 13 ring tiles open
+- * again between placed + 199 and + 220. */
++ * again between placed + 199 and + 220.
++ * Shape (issue #21): every tile whose centre is closer than the area's Radius (+0x12c) to the centre of the area's tile.
++ * The one size with a published shape agrees: Rosa's Grow Light (BushGrowArea, Radius 600) grows a 3x3 of bushes (wiki).
++ * Sprout's WallyUltiArea (Radius 400) gives a plus of 5 tiles. [?] the server's rule is not in the client; the earlier
++ * ring 2 tiles out was a guess too. Tiles with all 4 neighbours in the shape get the Filler wall (code + 1), the rest the
++ * wall (both block alike; [?] which one the game draws where is a guess).
++ * Bush-grow areas (BushGrowArea, MutantBushGrowArea, TankBushGrowArea(Large): area_effects_skin rows 314, 692, 1024, 1025,
++ * the only skin rows whose Logic is one of them) grow ExtraBush (DynamicCode 3, no Lifetime: Rosa's bushes stay until
++ * destroyed) instead of the default wall code 1. */
++#define AREA_BUSH_CODE 3
++static int bush_area(uint8_t *d) {
++    int id = I32(d, 0x20);   /* the area's data id = its area_effects_skin row (17000292 logged for Sprout's WallyUltiArea) */
++    return id == 17000314 || id == 17000692 || id == 17001024 || id == 17001025;
++}
++static int in_shape(int dx, int dy, int r) { return 300L * 300 * (dx * dx + dy * dy) < (long)r * r; }
+ static void wall_ring(uint8_t *a, uint8_t *d) {
+     uint8_t *pr = (g_cur_proj && g_cur_tick == (g_sim ? I32(g_sim, 0x10) : -1)) ? (uint8_t *)g_cur_proj : NULL;
+-    int code = wall_code_for(pr);
+-    void *wall = tile_by_code(code), *fill = tile_by_code(code + 1);
+-    int cx = I32(a, 0x38) / 300, cy = I32(a, 0x3c) / 300, n = 0;
++    int bush = bush_area(d), code = bush ? AREA_BUSH_CODE : wall_code_for(pr), r = I32(d, 0x12c);
++    if (r <= 0 || r > 3000) r = 400;    /* WallyUltiArea's Radius */
++    void *wall = tile_by_code(code), *fill = bush ? wall : tile_by_code(code + 1);
++    int cx = I32(a, 0x38) / 300, cy = I32(a, 0x3c) / 300, n = 0, k = r / 300 + 1;
+     uint8_t *tm_sim = g_sim ? PTR(g_sim, 0x68) : NULL, *tm_cl = g_client_obj ? PTR(g_client_obj, 0xf8) : NULL;
+     g_nwall_areas++;
+-    for (int dy = -2; dy <= 2; dy++) for (int dx = -2; dx <= 2; dx++) {
+-        int ring = (dx < 0 ? -dx : dx) > (dy < 0 ? -dy : dy) ? (dx < 0 ? -dx : dx) : (dy < 0 ? -dy : dy);
+-        if (ring != 2) continue;
+-        int corner = (dx == 2 || dx == -2) && (dy == 2 || dy == -2);
+-        void *td = corner ? fill : wall;
++    for (int dy = -k; dy <= k; dy++) for (int dx = -k; dx <= k; dx++) {
++        if (!in_shape(dx, dy, r)) continue;
++        int inner = in_shape(dx + 1, dy, r) && in_shape(dx - 1, dy, r) && in_shape(dx, dy + 1, r) && in_shape(dx, dy - 1, r);
++        void *td = inner ? fill : wall;
+         if (!td) continue;
+         int ok = place_one(tm_sim, td, cx + dx, cy + dy);
+         if (ok && tm_cl && tm_cl != tm_sim) place_one_force(tm_cl, td, cx + dx, cy + dy);
+@@ -95,7 +109,7 @@ static void wall_ring(uint8_t *a, uint8_t *d) {
+     }
+     g_nwall_tiles += n; g_last_ring[0] = cx; g_last_ring[1] = cy;
+     spawnfix_walldiag("placed");
+-    if (g_spawn_dbg) LOG("[spawnfix] wall ring at tile %d,%d code %d: %d tiles (sim tm %p, client tm %p, mapview %p)\n", cx, cy, code, n, tm_sim, tm_cl, g_mapview);
++    if (g_spawn_dbg) LOG("[spawnfix] wall shape at tile %d,%d area %d radius %d code %d: %d tiles (sim tm %p, client tm %p, mapview %p)\n", cx, cy, I32(d, 0x20), r, code, n, tm_sim, tm_cl, g_mapview);
+ }
+ 
+ /* ---- items (BulletExplosionItem +0x80 / SpawnItem +0x110 of the area data): the item factory 0xb55684 is the one the

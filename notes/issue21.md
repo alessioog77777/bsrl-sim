@@ -36,5 +36,5 @@ Setup: pytorch.org and the qemu source download are blocked by the proxy here: t
 - Without the mirror (main), every death should drop exactly 1 cube (+0x874 = 0; from the static read, not measured on main).
 
 ## State
-- PR #26 open (not merged), commit pushed on claude/project-thread-a2aisf, subscribed to its activity.
+- Merged in #26.
 - Not done from #21: storm numbers, event modifiers, WallSpawn shape from Radius, bush-grow mapping.
