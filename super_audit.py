@@ -118,7 +118,7 @@ def expected(name):
     if items: ex.append("item")
     leap_bombs = charge and bool(items)          # Piper: the damage is the bombs left at the start point, not on the target
     heals_only = any(_num(r, "HealOwnPercent") > 0 for r in pl)   # Poco: the skill Damage is the heal, enemies are not hit
-    if ((_num(s, "Damage") > 0 or any(_num(r, "Damage") > 0 for r in alog)) and not leap_bombs and not heals_only
+    if ((_num(s, "Damage") > 0 or any(_num(r, "Damage") > 0 and r.get("Type") != "WallSpawn" for r in alog)) and not leap_bombs and not heals_only
             and bt not in ("ChangeCharacter", "ProjectileShield")): ex.append("damage")
     if _num(s, "ChargePushback") > 0 or any(_num(r, "PushbackStrength") > 0 for r in pl + alog): ex.append("push")
     if (_num(s, "HealSelfOnActivationPower") > 0 or any(_num(r, "HealOwnPercent") > 0 for r in pl)
