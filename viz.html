@@ -110,7 +110,7 @@ function draw(){
   chart('beh','c_storm','Storm','share of deaths by storm · storm ticks per episode / 100',[S('storm_death','storm deaths',0),{name:'storm ticks / 100',c:1,pts:P.filter(r=>r.t_gas!=null).map(r=>[r.update,r.t_gas/100])}],{...o,zero:1});
   chart('beh','c_att','Attack fraction','share of decisions that fire an attack',[S('attack_frac','attack',0)],{...o,zero:1});
   bars('beh','c_move','Move directions (latest update)','stop, then 16 directions clockwise from right',l.move_hist,['stop','→','','','','↓','','','','←','','','','↑','','','']);
-  bars('beh','c_fire','Fire choice (latest update)','',l.fire_hist,['none','attack','super']);
+  bars('beh','c_fire','Fire choice (latest update)','',l.fire_hist,['none','attack','super','gadget','hypercharge'].slice(0,l.fire_hist.length));
   bars('beh','c_aim','Aim angle when firing (latest update)','15° bins, 0° = right, clockwise',l.aim_hist,l.aim_hist.map((_,i)=>i*15+'°'));
   chart('opt','c_ent','Policy entropy','falling = more decided; a collapse to 0 is bad',[S('entropy','entropy',0)],o);
   chart('opt','c_loss','Policy loss','BC: cross-entropy to the native AI · PPO: clipped surrogate',[S('loss_pi','loss',0)],o);

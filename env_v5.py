@@ -31,8 +31,12 @@ or of the planner's none (replay frames).
 Identity (obs v5.6): every poll sets `Env.last_who` = who(ids, vec), the owner player / brawler / side of each fair
 observation row, read from the host's snap2 dump of that response (F_STATE; no host change) and matched to the rows by
 position; obs_v5.ObsV5.build(..., who=env.last_who) turns it into the identity columns (with the identity noise).
+Gadgets (obs v5.7, issue #3, off by default): make_battle_fn(gadgets=True) / with_gadgets (trainer --gadgets 1) give
+every player one of its brawler's gadget cards; Env.gadget(ids) = whether the agent's gadget can be used now, from the
+host's gadget state (NbeResp gad_*), for obs_v5's self 3 (ObsV5.build(..., gadget=)). The native AI's gadget use is not
+in the BC labels (the controller records have no gadget calls).
 """
-import argparse, json, os, sys, time
+import argparse, functools, json, os, sys, time
 import numpy as np
 from nbpc import diversity as D, proto as P, fair as FAIR
 from nbpc.maenv import MAEnv
@@ -57,6 +61,29 @@ def heroes():
     return [n for n in O.hero_names() if n not in bad]
 
 
+T_CARD = 23   # cards.csv data type (gadget cards are 23xxxxxx; ids count the named rows, as nbpc.diversity.table)
+
+
+@functools.lru_cache(None)
+def gadget_cards():
+    """brawler (characters.csv Name) -> cards.csv data ids of its gadget cards (MetaType 5, Target = the brawler). The host
+    checks each request (offline.c my_player_ctor) and flags a rejected one in div_err."""
+    out, k = {}, 0
+    for r in D._rows("cards.csv"):
+        if not r[next(iter(r))]: continue
+        if r.get("MetaType") == "5" and r.get("Target") and r.get("Disabled") != "true":
+            out.setdefault(r["Target"], []).append(T_CARD * 1000000 + k)
+        k += 1
+    return out
+
+
+def with_gadgets(cfg, rng):
+    """battle cfg -> the same cfg, every player (tag "chr") with a random gadget card of its brawler (none if it has none)"""
+    gc = gadget_cards(); div = dict(cfg["div"])
+    div["gadget"] = [int(rng.choice(gc[b])) if gc.get(b) else 0 for b in cfg["tag"]["chr"]]
+    return {**cfg, "div": div}
+
+
 def locations():
     bad = set(_skip().get("locations", []))
     return [n for n, (_, r) in D.table("locations.csv").items()
@@ -79,8 +106,9 @@ def use_genmaps(n_inst, dirs=None):
     return dict(NI.APK_BY_IDX)
 
 
-def make_battle_fn(agents=10, seed0=10_000_000, roster=None, locs=None, p_team=0.5, gen=None, p_gen=0.5):
-    """gen = use_genmaps()'s {instance: dir}: there a battle plays the generated layout with probability p_gen"""
+def make_battle_fn(agents=10, seed0=10_000_000, roster=None, locs=None, p_team=0.5, gen=None, p_gen=0.5, gadgets=False):
+    """gen = use_genmaps()'s {instance: dir}: there a battle plays the generated layout with probability p_gen;
+    gadgets: every player gets a random gadget card of its brawler (none if it has none)"""
     roster = roster or heroes(); locs = locs or locations(); gen = gen or {}
     seeds = iter(range(seed0, seed0 + 10 ** 9))
 
@@ -96,8 +124,9 @@ def make_battle_fn(agents=10, seed0=10_000_000, roster=None, locs=None, p_team=0
             for k, p in enumerate(rng.permutation(10)[:10 // size * size]): groups[int(p)] = k // size + 1
             div["team_groups"] = groups
         ctl = sorted(int(p) for p in rng.choice(10, size=agents, replace=False))
-        return {"seed": next(seeds), "ctl": ctl, "end": "agents", "div": div,
-                "tag": {"loc": os.path.basename(os.path.dirname(g)) if g else loc, "chr": br, "team_size": size, "groups": groups}}
+        cfg = {"seed": next(seeds), "ctl": ctl, "end": "agents", "div": div,
+               "tag": {"loc": os.path.basename(os.path.dirname(g)) if g else loc, "chr": br, "team_size": size, "groups": groups}}
+        return with_gadgets(cfg, rng) if gadgets else cfg   # drawn last: the rest of the battle is the same without gadgets
     return battle_fn
 
 
@@ -276,6 +305,13 @@ BUSH_NEAR = 1500.0
 def aux_split(A):
     """(B, AUX_W) aux_now rows -> {name: (B, ...) array} (AUX layout)"""
     return {k: A[:, o:o + int(np.prod(sh, dtype=int))].reshape((len(A),) + sh) for k, (o, sh) in AUX.items()}
+
+
+def gadget_ready(r, p):
+    """host response r, player p -> the gadget can be used now (Env.gadget's rule)"""
+    pl = r.pl[p]
+    return bool(getattr(r, "gad_valid", 0) and r.gad_kind[p] != P.GAD_NONE and r.gad_charges[p] > 0 and r.gad_cd[p] <= 0
+                and pl.alive and not pl.eliminated and pl.reserved[3] <= 0)
 
 
 def player_ranks(r):
@@ -731,6 +767,16 @@ class Env(MAEnv):
                 t = np.deg2rad((int(act[0]) - 1) * 22.5); out[k] = sp * np.cos(t), sp * np.sin(t)
         return out
 
+    def gadget(self, ids):
+        """(B,) float32: 1 = the agent's gadget can be used now (obs_v5 self 3): the host publishes gadget state (gad_valid),
+        activates this gadget's kind (gad_kind != NONE), a use is left and no cooldown runs, and the brawler is in play.
+        All 0 with a host without gadget activation."""
+        by = {s.battle: s for s in self.I}; out = np.zeros(len(ids), np.float32)
+        for k, a in enumerate(ids):
+            s = by.get(int(a) >> 4)
+            if s is not None: out[k] = gadget_ready(s.inst.resp, int(a) & 15)
+        return out
+
     def cond(self, ids):
         """(B, N_COND) conditioning vectors (obs_v5.cond) of the agents of the last poll()"""
         by = {s.battle: s for s in self.I}
@@ -878,7 +924,27 @@ def _check():
     _check_intents(players, tiles, NS)
     _check_planner(players, tiles, NS)
     _check_who(NS)
-    print("env_v5 sliders, aux labels, intents, planner hook, identity rows ok")
+    _check_gadgets(NS)
+    print("env_v5 sliders, aux labels, intents, planner hook, identity rows, gadget readiness ok")
+
+
+def _check_gadgets(NS):
+    """gadget readiness from the host's gad_* fields (fake responses) and the loadout request (the game's cards.csv)"""
+    pl = lambda **o: NS(**{"alive": 1, "eliminated": 0, "reserved": [0, 0, 0, 0], **o})
+    def resp(valid=1, kind=P.GAD_DASH, charges=3, cd=0, **o):
+        return NS(gad_valid=valid, gad_kind=[kind] * 16, gad_charges=[charges] * 16, gad_cd=[cd] * 16, pl=[pl(**o)] * 16)
+    assert gadget_ready(resp(), 0) and not gadget_ready(NS(pl=[pl()] * 16), 0)          # a host without gad_*: never
+    for bad in (dict(valid=0), dict(kind=P.GAD_NONE), dict(charges=0), dict(cd=5), dict(alive=0), dict(eliminated=1), dict(reserved=[0, 0, 0, 40])):
+        assert not gadget_ready(resp(**bad), 0), bad
+    env = Env.__new__(Env); env.I = [NS(battle=3, inst=NS(resp=resp())), NS(battle=4, inst=NS(resp=resp(cd=2)))]
+    assert env.gadget(np.array([3 << 4 | 2, 4 << 4 | 2, 9 << 4])).tolist() == [1, 0, 0]       # unknown battle: 0
+    gc = gadget_cards(); hs = heroes()
+    assert gc and all(k // 1000000 == T_CARD for v in gc.values() for k in v) and sum(b in gc for b in hs) > len(hs) // 2, len(gc)
+    cfg = with_gadgets({"div": {"chr": [0] * 16}, "tag": {"chr": hs[:10]}}, np.random.default_rng(0))
+    assert all((g in gc.get(b, [])) or (g == 0 and not gc.get(b)) for g, b in zip(cfg["div"]["gadget"], hs[:10]))
+    r1, r2 = np.random.default_rng(4), np.random.default_rng(4)                              # gadgets drawn last: the battle
+    c1, c2 = make_battle_fn(3, seed0=7)(r1, 0), make_battle_fn(3, seed0=7, gadgets=True)(r2, 0)   # is the same without them
+    assert c1["tag"] == c2["tag"] and c1["ctl"] == c2["ctl"] and "gadget" not in c1["div"] and len(c2["div"]["gadget"]) == 10
 
 
 def _check_aux(players, tiles, bush, NS):

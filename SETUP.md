@@ -33,6 +33,9 @@ Changes made to nirkt's code, all recorded in `host/`:
 - `host/fair_view.patch`: camera view window (measured trapezoid, per-episode zoom, teammates never bush-hidden).
 - `host/live_state.patch`: live map tiles in `F_MAP` and the observation grid (a destroyed wall / bush reads as open),
   area effects' data id in item feature 5 (obs_v5 looks up radius and kind), power cubes lost at a team knock-out.
+- `host/gadgets.patch` (issue #3, a diff on top of the three above): per-player gadget state in the response (`NbeResp`
+  `gad_*`, mirrored in `nbpc/proto.py`) and the host's own gadget activation in `native/loader/gadget.c`, which
+  `env.c` `gadget_input` tries first. No gadget kind is implemented yet, so every gadget still reads as not usable.
 - `maenv.py` and `fair.py` copied from `deps/nbrl-env/py/nbpc` into `deps/bulletlabels/vendor/nbpc`, so one `nbpc`
   package holds the host side and the environment side.
 - The game download link removed from `deps/bulletlabels/setup.sh` (this repo's `setup.sh` downloads it instead).
@@ -52,5 +55,9 @@ downloaded game build, default `work/`), `SIM_VENV`.
 - **Variables come out empty.** `env.sh` must have LF line endings (CRLF breaks every variable). From Windows, pass
   scripts to `wsl.exe ... bash -s` on stdin.
 - **Slow start.** One boot takes 60-90 s. Batch your checks into one run.
-- **The fire head never uses gadgets or hypercharge.** The host cannot trigger them, so actions are none / attack /
-  super.
+- **The fire head never uses gadgets or hypercharge.** The game build compiles gadget activation out, and the host
+  activates only the kinds `native/loader/gadget.c` implements (none yet), so the gadget class stays masked. Hypercharge
+  has no fire class yet (issue #4). `python -m gadget_check` shows which kinds the built host publishes.
+- **`gadget_check` says the host publishes no gadget state.** `setup.sh` builds the host only when
+  `native/loader/nbhost_rl` is missing: after a change in `deps/bulletlabels/native/loader`, delete it and rerun
+  `./setup.sh --no-apt --no-python`.

@@ -19,9 +19,9 @@ intent (or none = free play), with a readable reason. The intent goes into the o
 ```mermaid
 flowchart LR
     H["Game host<br/>nirkt's sim, many instances"] -->|"observation vec + state dump"| O
-    subgraph O["Observation (OBS v5.6)"]
+    subgraph O["Observation (OBS v5.7)"]
         direction TB
-        S["self · 8<br/>hp, ammo, super ready, bush, velocity"]
+        S["self · 8<br/>hp, ammo, super / gadget ready, bush, velocity"]
         C["cond · 30<br/>my brawler's stats + 12 play-style sliders"]
         I["intent · 11<br/>kind, target, radius, time left"]
         E["entity rows · 64 × 36<br/>class, position, hp, velocity, area radius / kind,<br/>enemy brawler stats + known, wall / water between"]
@@ -29,7 +29,7 @@ flowchart LR
     end
     O -->|"about 1 per second"| PL["Rule planner<br/>12 rules, first match wins<br/>intent + reason"]
     PL -->|"intent"| I
-    O -->|"10 per second"| P["Policy<br/>encoders → GRU<br/>move · aim · attack · super"]
+    O -->|"10 per second"| P["Policy<br/>encoders → GRU<br/>move · aim · attack · super · gadget"]
     P --> A["Actions"] -->|"next step"| H
     P -.->|"training only"| X["critic (true state)<br/>live value head<br/>aux: enemy position in 1 s, hit, gas, bush"]
 ```
@@ -111,22 +111,24 @@ xychart-beta
 | v5.4 | sliders: aggressive replaces push; leash and gas_safe added (cond 28 → 30) | zero-padded, act the same |
 | v5.5 | intent block (11) at the tail of self | zero-padded, act the same |
 | v5.6 | enemy brawler identity and line of sight (entity rows 20 → 36) | zero-padded, act the same |
+| v5.7 | fire head: 4th class gadget (zero-initialised `fire_x` head), allowed only while self 3 (gadget ready) is set | `fire_x` zeros, act the same while self 3 is 0 |
 
 ## What is here
 
 | File | What it does |
 |---|---|
-| `env_v5.py` | Randomised Showdown battles on top of nirkt's `MAEnv`: random map, brawlers, solo / duo / trio teams, policy-controlled slots vs the native AI, team placement reward, behaviour-slider reward terms (per-slider normalisation from native-AI battles: `--native 1 --episodes F`, then `--norm F`). `python -m env_v5 --check` |
-| `obs_v5.py` | The observation: `self` (8), `ent` (39 x 36 entity slots; area effects with radius and harms / helps / slows me; enemy / teammate brawler and projectile-owner identity (brawler stats + known flag, per-battle identity noise); wall / water between me and each player), `grid` (25 x 25 tile classes), `cond` (30: brawler stats, 12 slider weights, team size, cubes, players left), the intent block (11: kind one-hot, target offset, radius, time left; all zeros = free play); named slider presets (play-style modes: bush camper, aggressive, cube farmer, ...). Per-episode detector noise, latency and HUD masking. `python -m obs_v5` |
+| `env_v5.py` | Randomised Showdown battles on top of nirkt's `MAEnv`: random map, brawlers, solo / duo / trio teams, policy-controlled slots vs the native AI, team placement reward, behaviour-slider reward terms (per-slider normalisation from native-AI battles: `--native 1 --episodes F`, then `--norm F`), gadget loadouts (`with_gadgets`, trainer `--gadgets 1`, default off) and gadget readiness from the host (`Env.gadget` = self 3). `python -m env_v5 --check` |
+| `obs_v5.py` | The observation: `self` (8; self 3 = gadget ready, v5.7), `ent` (39 x 36 entity slots; area effects with radius and harms / helps / slows me; enemy / teammate brawler and projectile-owner identity (brawler stats + known flag, per-battle identity noise); wall / water between me and each player), `grid` (25 x 25 tile classes), `cond` (30: brawler stats, 12 slider weights, team size, cubes, players left), the intent block (11: kind one-hot, target offset, radius, time left; all zeros = free play); named slider presets (play-style modes: bush camper, aggressive, cube farmer, ...). Per-episode detector noise, latency and HUD masking. `python -m obs_v5` |
 | `intent.py` | Intents (per-second goals: move to, avoid, hold, engage, farm, regroup, hide): kind specs and end rules, the block encoder, the intent-following reward (signed progress, capped per intent), the random-valid sampler. `env_v5.Env.intents` runs them in battles (trainer `--intent-scale`, default 0 = off). `python -m intent` |
 | `planner.py` | Rule planner: 12 priority rules (gas, low HP, thrower behind a wall, keep away from a short-range enemy, fight / third party, endgame, regroup, engage, farm, hide, explore, none) on what the policy sees, thresholds from the sliders, rules needing the enemy's brawler skip unknown ones; each pick has a readable reason (replay frames, viz). Training rollouts: trainer `--p-plan` (default 0 = off; design 0.5) with preemption of held planner intents; `--eval-plan 1` = eval kind `evalp_plan` (planner vs free play, same seeds). `python -m planner` |
 | `fast_obs.py`, `fast_act.py` | Batched, vectorised versions of the observation builder and the actor for the multi-process trainer (bit-equal to the reference paths). |
-| `model.py` | Policy: entity set + tile grid + conditioning -> GRU -> move (17) / fire (3) / aim (360, pointer over targets) / distance heads, critic with a privileged branch; heads that never act: a live value without the privileged input (`--vlive`) and aux predictions of the true state (enemy positions in 1 s, being hit, gas, hidden bush enemies; `--aux-w`). `python -m model` |
+| `model.py` | Policy: entity set + tile grid + conditioning -> GRU -> move (17) / fire (4: none, attack, super, gadget; super / gadget masked until ready) / aim (360, pointer over targets) / distance heads, critic with a privileged branch; heads that never act: a live value without the privileged input (`--vlive`) and aux predictions of the true state (enemy positions in 1 s, being hit, gas, hidden bush enemies; `--aux-w`). `python -m model` |
 | `train_ppo.py` | Behaviour cloning from the native AI, then PPO with a KL anchor, league / self-play, evals, replays; live value / aux head targets and readouts. `python -m train_ppo --check` |
 | `train_fast.py` | Same trainer with environment collection split over worker processes (shared memory). |
 | `scorecard.py` | Skill metrics of a run from its logs: placement, win rate, trade, hit rate, aim lead, cube and gas stats; behaviour per slider preset (pass rules vs balanced) and per-slider effect slopes. `python scorecard.py --check` |
 | `super_audit.py` | Per-brawler super audit: fires every brawler's super at a target and records what happened (works / partial / unverified / no effect / not fired / crash); checklist in issue #6. `python -m super_audit [--n 2] [--only A,B]`, `--check` |
 | `scenarios.py` | Hard-scenario eval set: 7 seeded situations (gas endgame, third party, assassin rush, low HP with an enemy close, cube-rich enemy at low HP, teammate under fire, bush memory) x 2 maps x 2 brawler picks x 4 layouts, set up by teleports and a forced storm, each with episode scores and a pass rule. Trainer `--eval-scenarios 1` (every `--scenario-every`-th eval) -> `scenarios.jsonl`, replays in `replays/scn/` (viz: failures first). `python -m scenarios --check`, `python -m scenarios --ckpt X --n 2` |
+| `gadget_check.py` | One-boot check of gadget activation: the loadout reaches the host, each implemented kind's effect, uses and cooldown spent, fire 3 while not ready spends nothing, `Env.gadget` agrees with the host. `python -m gadget_check`, `--check` |
 | `live_check.py` | One-boot check of the host round: team reward, area effects (radius, kind), teammate respawn, HUD mask, live map tiles, cubes lost at a knock-out. |
 | `test_fast.py` | Equality and timing of the fast paths against the reference paths on real battles. |
 | `apply_noise.py` | Writes a measured detector-noise report into `obs_v5.NOISE` (with sanity limits). |
@@ -135,7 +137,7 @@ xychart-beta
 | `env.sh` | Environment variables for the host, nirkt's packages and the work folder. |
 | `setup.sh` | One-command setup: host build, venv, game files (SETUP.md). |
 | `deps/` | nirkt's `bulletlabels` and the `py/` + `train/` parts of `nbrl-env`, with this project's changes applied. |
-| `host/training_round.patch`, `host/fair_view.patch`, `host/live_state.patch` | Record of this project's changes to nirkt's host and camera rules (already applied in `deps/`). |
+| `host/training_round.patch`, `host/fair_view.patch`, `host/live_state.patch`, `host/gadgets.patch` | Record of this project's changes to nirkt's host and camera rules (already applied in `deps/`). |
 | `pro_strategies.md` | Community Showdown habits and what each means for the observation / reward. |
 
 ## Vision models
@@ -165,13 +167,14 @@ What `setup.sh` does, the pinned versions and troubleshooting: **[SETUP.md](SETU
 Self-checks (no battle is booted; `obs_v5` / `env_v5` read the game's data tables, so they need the game files):
 
 ```bash
-python -m obs_v5 && python -m intent && python -m planner && python -m model && python -m fast_obs && python -m env_v5 --check && python -m train_ppo --check && python -m scenarios --check && python apply_noise.py --test
+python -m obs_v5 && python -m intent && python -m planner && python -m model && python -m fast_obs && python -m env_v5 --check && python -m train_ppo --check && python -m scenarios --check && python -m gadget_check --check && python apply_noise.py --test
 ```
 
 Live checks (boot the host; each boot takes about 60-90 s):
 
 ```bash
 python -m live_check --n 2 --minutes 8
+python -m gadget_check                              # which gadget kinds the built host activates
 python -m env_v5 --n 4 --minutes 2 --agents 10      # random-action benchmark
 ```
 
@@ -192,9 +195,11 @@ cd $SIM_WORK/runs && python -m http.server 8766      # dashboard: http://localho
   what it is; the log itself is not published.
 - Generated layouts (`--gen`) were made for the vision models' training data and are not used for RL; their
   generator is not in this repository.
-- The fire head is none / attack / super: gadgets and hypercharge cannot be triggered on this host.
+- The fire head is none / attack / super / gadget. The gadget class is masked unless the host activates that gadget's
+  kind (`gadget.c`, none implemented yet) and a use is left (`obs_v5` self 3). Hypercharge cannot be triggered yet.
+  Training with gadget loadouts is `--gadgets 1` (off by default).
 - Observation layout changes must be mirrored by anything that consumes exported policies. `obs_v5` carries the
-  version (`obs_v5.OBS_VERSION`, now `v5.6`; saved in every checkpoint) that exported policies are checked against.
+  version (`obs_v5.OBS_VERSION`, now `v5.7`; saved in every checkpoint) that exported policies are checked against.
 
 ## Licence
 
