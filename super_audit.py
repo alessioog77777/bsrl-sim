@@ -3,6 +3,7 @@ some of it re-implemented in nirkt's env.c / spawnfix.c). Output is a per-brawle
 
     python -m super_audit [--n 2] [--only BullDude,Sniper]     # live: boots --n hosts (60-90 s each)
     python -m super_audit --check                              # classification self-check, no host
+    python -m super_audit --hyper --only Jester,Twins          # the hypercharged supers (hypercharge first, host hyper.c)
 
 Setup (one battle per 10 brawlers, map MAP = the most open Showdown map, storm off, every player's native AI off):
 players 0-4 shoot in phase A, players 5-9 in phase B; in each phase every shooter stands on its own clear spot (a 3-tile
@@ -29,7 +30,13 @@ Every non-works brawler is retried once (other corridor direction, d from a smal
 attempt counts. A host crash requeues that phase's shooters one at a time (a reboot each) to find the brawler.
 Output: $SIM_WORK/super_audit.json (per brawler: name, super, type, class, attempts with measurements) and
 $SIM_WORK/super_audit.md (also stdout): a checklist grouped by class then super type. With --only the brawlers are
-merged into an existing super_audit.json."""
+merged into an existing super_audit.json.
+--hyper (hypercharge round): every player gets its hypercharge card; each shooter's hypercharge is filled with its super and
+activated (fire 4) one tick before the super. The expected effects are the hypercharged super's (`hyper_skill`: characters.csv
+OverchargedUltimateSkill, else the UltimateSkill's OverchargedVersion, with the row's Overcharged* columns), plus hyper_cast
+(the host reports a super cast while hypercharged, NbeResp hyp_supers / hyp_super_id, with the OverchargedUltimateSkill's data
+where there is one) and hyper (a projectile / summon / area / item only the hypercharged super has, when it has one).
+Output: super_audit_hyper.json / .md."""
 import argparse, collections, functools, json, os, sys, threading, time
 import numpy as np
 
@@ -58,7 +65,33 @@ def _tables():
     rows = lambda f: [r for r in D._rows(f) if r[next(iter(r))]]
     return {"char": named("characters.csv"), "skill": named("skills.csv"), "plog": named("projectiles_logic.csv"),
             "pskin": named("projectiles_skin.csv"), "alog": named("area_effects_logic.csv"), "askin": named("area_effects_skin.csv"),
-            "rows": {6: rows("projectiles_skin.csv"), 16: rows("characters.csv"), 17: rows("area_effects_skin.csv"), 18: rows("items.csv")}}
+            "rows": {6: rows("projectiles_skin.csv"), 16: rows("characters.csv"), 17: rows("area_effects_skin.csv"), 18: rows("items.csv")},
+            "skill_rows": rows("skills.csv")}
+
+
+def skill_name(did):
+    """a SkillData's global data id (NbeResp.hyp_super_id) -> skills.csv row name"""
+    r = _tables()["skill_rows"]; i = int(did) % 1000000
+    return r[i][next(iter(r[i]))] if did and 0 <= i < len(r) else str(did)
+
+
+# hypercharged super (--hyper): the skills.csv columns the game's own code reads while isOvercharged (host hyper.c)
+OC_COLS = (("Projectiles", "OverchargedProjectiles"), ("AreaEffectObject", "OverchargedAreaEffectObject"),
+           ("AreaEffectObject2", "OverchargedAreaEffectObject2"), ("SummonedCharacters", "OverchargedSummonedCharacters"),
+           ("SpawnedItem", "OverchargedSpawnedItem"))
+
+
+def hyper_skill(name):
+    """the super a hypercharged brawler casts: (skills.csv row name, row): its OverchargedUltimateSkill (characters.csv; 7
+    brawlers) or its UltimateSkill, then that row's OverchargedVersion if it has one, with its Overcharged* columns in
+    place of the normal ones"""
+    T = _tables(); ch = T["char"][name]; n = ch.get("OverchargedUltimateSkill") or ch.get("UltimateSkill", "")
+    s = T["skill"].get(n, {})
+    if s.get("OverchargedVersion") in T["skill"]: n = s["OverchargedVersion"]; s = T["skill"][n]
+    s = dict(s)
+    for k, ko in OC_COLS:
+        if s.get(ko): s[k] = s[ko]
+    return n, s
 
 
 def data_name(did):
@@ -96,10 +129,15 @@ def _num(r, k):
     except ValueError: return 0.0
 
 
-def expected(name):
+def expected(name, hyper=False):
     """the brawler's super from the tables -> dict(skill, type (BehaviorType), kind (finer group label), range (units),
-    charge (bool), expect (effects that must be seen), notes)"""
+    charge (bool), expect (effects that must be seen), notes). hyper: its hypercharged super (hyper_skill); expect adds
+    hyper_cast (the host cast it while hypercharged, with this skill's data where characters.csv names an
+    OverchargedUltimateSkill) and hyper (one of the projectiles / summons / areas / items only the hypercharged super has,
+    `hyper_names`, when it has any)"""
     T = _tables(); ch = T["char"][name]; sk_name = ch.get("UltimateSkill", ""); s = T["skill"].get(sk_name, {})
+    if hyper:
+        base = expected(name); sk_name, s = hyper_skill(name)
     bt = s.get("BehaviorType") or "?"; ex = []; notes = []
     projs = [p for p in (s.get("Projectiles") or "").split(";") if p]
     pl = [T["plog"].get(T["pskin"].get(p, {}).get("LogicProjectile") or p, {}) for p in projs]
@@ -141,9 +179,16 @@ def expected(name):
     # parent projectile): the target stands on angle 0, not between two children
     east = not projs and any(r.get("Type") == "BulletExplosion" for r in alog)
     steer = bt in ("FlyJump", "Ww")   # the brawler moves under its player's control while the super runs: walk it to the target
-    return {"skill": sk_name, "type": bt, "kind": kind, "range": cr if cr > 0 else 2600.0, "charge": charge, "ring": ring, "east": east,
-            "steer": steer, "cast": _num(s, "CastingTime"), "expect": ex,
-            "projectiles": projs, "summons": summons, "areas": areas, "items": items, "notes": notes}
+    out = {"skill": sk_name, "type": bt, "kind": kind, "range": cr if cr > 0 else 2600.0, "charge": charge, "ring": ring, "east": east,
+           "steer": steer, "cast": _num(s, "CastingTime"), "expect": ex,
+           "projectiles": projs, "summons": summons, "areas": areas, "items": items, "notes": notes}
+    if hyper:
+        names = lambda i: set(i["projectiles"]) | set(i["summons"]) | set(i["areas"]) | set(i["items"])
+        out["hyper_names"] = sorted(names(out) - names(base)); out["own_skill"] = bool(ch.get("OverchargedUltimateSkill"))
+        ex.append("hyper_cast")
+        if out["hyper_names"]: ex.append("hyper")
+        else: notes.append("hypercharged super: no projectile / summon / area / item of its own (its difference is not visible here)")
+    return out
 
 
 # ------------------------------------------------------------------ classification
@@ -157,6 +202,8 @@ def observed(m):
     for k, e in (("projectiles", "projectile"), ("summons", "summon"), ("areas", "area"), ("items", "item")):
         if m.get(k): o.add(e)
     if m.get("changed"): o.add("change")
+    if m.get("hyper_cast"): o.add("hyper_cast")
+    if m.get("hyper_seen"): o.add("hyper")
     return o
 
 
@@ -188,6 +235,9 @@ def describe(m, missing=()):
     if m.get("areas"): p.append("areas: " + cnt("%s r%d" % (a["name"], a["radius"]) for a in m["areas"]))
     if m.get("items"): p.append("items: " + cnt(m["items"]))
     if m.get("changed"): p.append("character changed")
+    if "hyper_on" in m:
+        p.append(("hypercharged super cast (%s)" % m.get("hyper_skill", "?")) if m.get("hyper_cast") else
+                 "hypercharge %s, super cast %s" % ("on" if m["hyper_on"] else "OFF", m.get("hyper_skill") or "not hypercharged"))
     s = "; ".join(p) if p else "nothing seen"
     if missing: s += "; missing: " + ", ".join(missing)
     if "heal" in m.get("expect", []) and not m.get("pre_damaged"): s += "; heal not testable (pre-damage missed)"
@@ -254,9 +304,9 @@ class Job:
 
 
 class Auditor:
-    def __init__(self, names, n=1, retry=True, log_dir=None, seed=0, host_args=(), verbose=True):
+    def __init__(self, names, n=1, retry=True, log_dir=None, seed=0, host_args=(), verbose=True, hyper=False):
         from nbpc import diversity as D
-        self.D = D; self.info = {b: expected(b) for b in names}; self.retry = retry; self.verbose = verbose
+        self.D = D; self.hyper = hyper; self.info = {b: expected(b, hyper) for b in names}; self.retry = retry; self.verbose = verbose
         self.results = {b: [] for b in names}; self.lock = threading.Lock(); self.inflight = 0
         self.queue = collections.deque(Job(b) for b in names); self.seed = 93000000 + seed
         self.spots = find_spots(MAP)
@@ -339,7 +389,9 @@ class Auditor:
         names = [j.name for j in A] + [FILLER] * (self.npair - len(A)) + [j.name for j in B]
         names += [FILLER] * (10 - len(names))
         self.seed += 1
-        inst.reset(self.seed, gas=0, flags=P.F_STATE, native_mask=0, obs_mask=0, div=self.D.make_div(location=MAP, chr=names))
+        div = self.D.make_div(location=MAP, chr=names)
+        if self.hyper: div["hyper"] = list(range(10))   # every player's hypercharge card (only the shooters activate)
+        inst.reset(self.seed, gas=0, flags=P.F_STATE, native_mask=0, obs_mask=0, div=div)
         info = inst.battle_info(); got = info["chr"][:10] if info else None
         want = [self.D.cid(x) for x in names]
         inst.step(ticks=10, flags=0, native_mask=0)
@@ -385,7 +437,13 @@ class Auditor:
         for j, s, t in run: acts[t] = (-1, 1, (geo[j]["aim"] + 180.0) % 360, 0.0)   # pre-damage: the target shoots the shooter once
         stp(acts, 1)
         for _ in range(12): stp()
-        inst.setup(super_fill=[s for _, s, _ in run]); r = stp(ticks=1)
+        sh = [s for _, s, _ in run]
+        inst.setup(super_fill=sh, hyper_fill=sh if self.hyper else ()); r = stp(ticks=1)
+        if self.hyper:   # --hyper: activate (fire 4), then the super below is the hypercharged one
+            acts = dict(idle)
+            for s in sh: acts[s] = (-1, 4, 0.0, 0.0)
+            r = stp(acts, 1)
+            hy0 = {s: (int(r.hyp_left[s]), int(r.hyp_supers[s])) for s in sh}
         st = parse_state(inst.state_bytes())
         if st is None: raise RuntimeError("no state2 dump in the response (host without F_STATE?)")
         ids0 = set(st["pj"][:, 0].tolist()) | set(st["it"][:, 0].tolist()) | set(st["ch"][:, 0].tolist())
@@ -402,6 +460,8 @@ class Auditor:
         acts = dict(idle)
         for j, s, t in run: acts[s] = (-1, 2, geo[j]["aim"], geo[j]["super_dist"])
         r = stp(acts, 1); n = 1
+        if self.hyper:
+            for j, s, t in run: M[j]["hyper_on"] = hy0[s][0] > 0
         while True:
             st = parse_state(inst.state_bytes()); bid = brawler_ids(st) if st is not None else {}
             for j, s, t in run:
@@ -455,6 +515,12 @@ class Auditor:
             if "ph_hp0" in m: m["post_hit"] = m["ph_hp0"] - m["ph_hp_min"]   # its shot POST_HIT ticks after the fire
             for k in ("projectiles", "summons", "items"): m[k] = sorted(m[k].values())
             m["areas"] = sorted(m["areas"].values(), key=lambda a: a["name"])
+            if self.hyper:   # the fire reaches the game one step later (env.c g_fire_delay): counted after the watch
+                m.update(hyper_supers=int(r.hyp_supers[s]) - hy0[s][1], hyper_id=int(r.hyp_super_id[s]))
+                inf = self.info[j.name]; seen = set(m["projectiles"]) | set(m["summons"]) | set(m["items"]) | {a["name"] for a in m["areas"]}
+                m["hyper_skill"] = skill_name(m["hyper_id"]) if m["hyper_supers"] > 0 else ""
+                m["hyper_cast"] = bool(m["hyper_on"] and m["hyper_supers"] > 0 and (not inf["own_skill"] or m["hyper_skill"] == inf["skill"]))
+                m["hyper_seen"] = sorted(seen & set(inf["hyper_names"]))
             out.append((j, m))
         return out
 
@@ -484,12 +550,16 @@ def summary(names, results, info):
     return out
 
 
-def markdown(rows):
-    L = ["# Super audit", "", "One battle per 10 brawlers on %s, native AI off: each brawler fires its super at one enemy %s-%d units "
+def markdown(rows, hyper=False):
+    L = ["# Super audit" + (" (hypercharged)" if hyper else ""), "", "One battle per 10 brawlers on %s, native AI off: each brawler fires its super at one enemy %s-%d units "
          "away and is watched for %.1f s (`python -m super_audit`). Expected effects come from the game's tables (skills.csv "
          "UltimateSkill + its projectile / area rows). Classes: works (every expected effect seen), partial (some), unverified "
          "(effect not visible to the audit), no_effect, not_fired (charge not consumed), crash. Not visible: stuns, slows, "
          "shields, buffs, wall breaking, ally effects." % (MAP, DIST_MIN, DIST_MAX, WATCH / 20.0), ""]
+    if hyper: L[2:2] = ["--hyper: every shooter activates its hypercharge first; expected: the hypercharged super (characters.csv "
+                        "OverchargedUltimateSkill, else the UltimateSkill's OverchargedVersion and Overcharged* columns), cast by the "
+                        "host while hypercharged (hyper_cast), and one of its own projectiles / summons / areas / items (hyper) where "
+                        "it has any.", ""]
     cnt = collections.Counter(r["class"] for r in rows)
     L += ["Totals: " + ", ".join("%s %d" % (c, cnt[c]) for c in CLASSES + ("not_run",) if cnt[c]), ""]
     for c in CLASSES + ("not_run",):
@@ -536,6 +606,12 @@ def _check():
     assert classify(m(pre_damaged=False), ["heal"])[0] == "unverified"
     # damage next to a foreign summon is not counted
     assert classify(m(damage=800, foreign_near=True), ["damage"])[0] == "no_effect"
+    # --hyper: the host's hypercharged cast and a hypercharged-only effect
+    assert classify(m(projectiles=["P"], hyper_cast=True, hyper_seen=["P"]), ["projectile", "hyper_cast", "hyper"])[0] == "works"
+    c, miss, _ = classify(m(projectiles=["P"]), ["projectile", "hyper_cast", "hyper"])
+    assert c == "partial" and miss == ["hyper_cast", "hyper"]
+    assert "hypercharged super cast (S)" in describe(m(hyper_on=True, hyper_cast=True, hyper_skill="S"))
+    assert "hypercharge OFF" in describe(m(hyper_on=False, hyper_skill=""))
     # best attempt, descriptions, checklist
     at = [{"class": "no_effect"}, {"class": "works"}]
     assert best(at)["class"] == "works" and best([{"class": "crash"}, {"class": "not_fired"}])["class"] == "not_fired"
@@ -564,6 +640,14 @@ def _check():
         assert "heal" in inf["DeadMariachi"]["expect"] and inf["Rosa"]["expect"] == [] and "change" in inf["MechaDude"]["expect"]
         assert all(i["range"] > 0 and i["skill"] for i in inf.values())
         assert display("BullDude") == "Bull" and data_name(16000000 + list(_tables()["char"]).index("BullDude")) == "BullDude"
+        hy = {h: expected(h, hyper=True) for h in ("Jester", "Beamer", "Twins", "Skater", "Domain", "Dancer", "MechaDudeBig", "ShotgunGirl", "PowerLeveler")}
+        assert hy["Jester"]["skill"] == "JesterOverchargedUlti" and "ChesterOverchargedUltiProjectile" in hy["Jester"]["hyper_names"]
+        assert {"TwinsHCUltiProjectile", "TwinsPetHyper"} <= set(hy["Twins"]["hyper_names"]) and hy["Twins"]["own_skill"]
+        assert hy["Skater"]["hyper_names"] == ["SkaterUltiLandingOvercharged"] and "hyper" in hy["Skater"]["expect"]
+        assert hy["Domain"]["hyper_names"] == [] and "hyper" not in hy["Domain"]["expect"] and "hyper_cast" in hy["Domain"]["expect"]
+        assert hy["PowerLeveler"]["skill"] == "PowerLevelerUltiOvercharged" and not hy["PowerLeveler"]["own_skill"]
+        assert hy["ShotgunGirl"]["skill"] == "ShotgunGirlUlti" and "hyper_cast" in hy["ShotgunGirl"]["expect"]
+        assert "hyper_cast" not in inf["Jester"]["expect"]
         sp = find_spots(MAP)
         assert len(sp) == 10 and all(len(d) >= 2 for _, _, d in sp), len(sp)
         assert min(max(abs(a[0] - c[0]), abs(a[1] - c[1])) for i, a in enumerate(sp) for c in sp[i + 1:]) >= SPACING * TILE
@@ -582,6 +666,8 @@ def main():
     ap.add_argument("--post-hit", type=int, default=0, help="the target shoots the shooter again this many ticks after the fire "
                     "(pre_hit / post_hit HP in the json: shields, damage reduction); 0 = off")
     ap.add_argument("--host-args", default="", help="extra game host arguments, e.g. '--native-charge 0'")
+    ap.add_argument("--hyper", action="store_true", help="the hypercharged supers: hypercharge each shooter first (fire 4), expect "
+                    "the hypercharged super's effects; writes super_audit_hyper.json / .md")
     a = ap.parse_args()
     if a.check: return _check()
     globals()["WATCH"] = a.watch; globals()["POST_HIT"] = a.post_hit
@@ -590,22 +676,23 @@ def main():
     names = [x for x in a.only.split(",") if x] or roster
     bad = [x for x in names if x not in _tables()["char"]]
     if bad: sys.exit(f"unknown brawlers: {bad}")
-    au = Auditor(names, n=a.n, retry=not a.no_retry, seed=a.seed, host_args=a.host_args.split())
+    au = Auditor(names, n=a.n, retry=not a.no_retry, seed=a.seed, host_args=a.host_args.split(), hyper=a.hyper)
+    stem = "super_audit_hyper" if a.hyper else "super_audit"
     au.log(f"{len(names)} brawlers, {a.n} instances, {au.npair} pairs per phase on {MAP}")
     res = au.run()
     rows = summary(names, res, au.info)
-    os.makedirs(a.out, exist_ok=True); jp = os.path.join(a.out, "super_audit.json")
+    os.makedirs(a.out, exist_ok=True); jp = os.path.join(a.out, stem + ".json")
     if a.only and os.path.exists(jp):
         old = {r["name"]: r for r in json.load(open(jp)).get("brawlers", [])}
         old.update({r["name"]: r for r in rows}); rows = [old[k] for k in sorted(old)]
     bt = [t / max(k, 1) for k, t in au.timing]
-    meta = {"map": MAP, "watch_ticks": WATCH, "instances": a.n, "seconds": round(time.time() - au.t0),
+    meta = {"map": MAP, "hyper": a.hyper, "watch_ticks": WATCH, "instances": a.n, "seconds": round(time.time() - au.t0),
             "battles": len(au.timing), "battle_s": round(float(sum(t for _, t in au.timing)), 2),
             "battle_s_per_brawler": round(float(np.mean(bt)), 3) if bt else None, "host_args": a.host_args, "time": time.strftime("%F %T")}
     json.dump({"meta": meta, "brawlers": rows}, open(jp, "w"), indent=1)
-    md = markdown(rows); open(os.path.join(a.out, "super_audit.md"), "w").write(md + "\n")
+    md = markdown(rows, a.hyper); open(os.path.join(a.out, stem + ".md"), "w").write(md + "\n")
     print(md)
-    au.log(f"wrote {jp} and super_audit.md; {meta['battles']} battles in {meta['battle_s']} s ({meta['battle_s_per_brawler']} s per brawler-attempt)")
+    au.log(f"wrote {jp} and {stem}.md; {meta['battles']} battles in {meta['battle_s']} s ({meta['battle_s_per_brawler']} s per brawler-attempt)")
 
 
 if __name__ == "__main__":

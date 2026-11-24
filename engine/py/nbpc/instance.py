@@ -25,7 +25,8 @@ class InstanceDead(RuntimeError):
 
 
 def set_div(d, div):
-    """fill a proto.Div from {"location", "theme", "chr", "skin"} (chr / skin: {player index: id} or a list by index)"""
+    """fill a proto.Div from {"location", "theme", "chr", "skin", "gadget", "star", "hyper", ...} (chr / skin / gadget / star:
+    {player index: id} or a list by index; hyper: player indices, or a bit mask)"""
     div = div or {}
     d.location = int(div.get("location") or 0); d.theme = int(div.get("theme") or 0)
     for f in ("chr", "skin", "gadget", "star"):
@@ -42,6 +43,8 @@ def set_div(d, div):
     g = div.get("team_groups")   # rl round: group id 0-7 per player (0 = alone); players of one group share a team
     if g: d.reserved[0] = ((1 << 31) | sum((int(x) & 7) << (3 * i) for i, x in enumerate(list(g)[:10]))) - (1 << 32)
     d.reserved[1] = int(div.get("map_location") or 0)   # RESET: a location (any mode) whose map layout is used (needs native/loader/nbhost_maps)
+    hm = div.get("hyper") or ()   # hypercharge round: player indices whose brawler gets its hypercharge card (needs native/loader/hyper.c)
+    d.hyper_mask = int(hm) & 0xffffffff if isinstance(hm, int) else sum(1 << int(i) for i in hm if 0 <= int(i) < P.MAXP)
 
 
 QEMU_NB = os.path.join(NATIVE, "qemu", "bin", "qemu-aarch64-nb")

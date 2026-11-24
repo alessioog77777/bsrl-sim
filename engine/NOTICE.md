@@ -24,6 +24,7 @@ other nbrl-env scripts are vision-data and earlier training tools, kept as they 
 - `training_round.patch`, `fair_view.patch`, `live_state.patch`, `gadgets.patch`: in that order, on top of
   bulletlabels @ `52184b2` (SETUP.md lists what each does). Their paths are bulletlabels' (`vendor/nbpc/...` is
   `py/nbpc/...` here).
+- `charge.patch`: on top of those, with paths relative to `engine/` (SETUP.md lists what it does).
 - `maenv.py` and `fair.py` copied from nbrl-env's `py/nbpc` into bulletlabels' `vendor/nbpc`.
 - The game download link removed from bulletlabels' `setup.sh` (the top-level `setup.sh` downloads it instead).
 - The merge into this tree: files moved as listed above, path names updated in comments, `labeller/rc.py` (`py/` on
