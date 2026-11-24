@@ -41,6 +41,13 @@ Changes made to nirkt's code, all recorded in `engine/patches/`:
 - `gadgets.patch` (issue #3, a diff on top of the three above): per-player gadget state in the response (`NbeResp`
   `gad_*`, mirrored in `nbpc/proto.py`) and the host's own gadget activation in `native/loader/gadget.c`, which
   `env.c` `gadget_input` tries first. No gadget kind is implemented yet, so every gadget still reads as not usable.
+- `charge.patch` (issue #5, a diff on top of the four above): the charge supers in `native/loader/env.c`. The skill's
+  ChargePushback after each contact hit (the game's knockback 0xb49834), Bull's straight lane that breaks walls and bushes
+  up to the first unbreakable tile, El Primo breaking the tiles around his landing, trail areas (Stu, Berry, Trunk)
+  through the game's own per-tick spawn, Crow's knives at take-off and landing, the end-of-charge area (Bull, Nori,
+  Ollie, Damian), and env zones for the two area types the client never applies: Berry's paint (damage to enemies,
+  heal to allies) and Damian's arena edge (knockback toward the side an enemy started on). `--native-charge 2` keeps
+  only the movement.
 - `hypercharge.patch` (issue #4, a diff on top of `gadgets.patch`): the hypercharge card on request (`NbeDiv.hyper_mask`,
   put in the player config by `offline.c`), activation by `NbeAction.fire` 4 through libg's own activation, and in
   `native/loader/hyper.c` the parts the client build lacks: the drain to 0 over 5 s, the end, and the speed / damage /
