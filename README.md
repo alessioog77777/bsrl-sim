@@ -138,6 +138,13 @@ xychart-beta
 | `host/training_round.patch`, `host/fair_view.patch`, `host/live_state.patch` | Record of this project's changes to nirkt's host and camera rules (already applied in `deps/`). |
 | `pro_strategies.md` | Community Showdown habits and what each means for the observation / reward. |
 
+## Vision models
+
+The detector and segmentation models this observation is built around are in
+**[showdown-vision](https://github.com/mlgdoggynoob/showdown-vision)**. Each model version is a release there with its
+model files (ONNX and PyTorch), class lists, val numbers and validation set; the README gives the exact
+pre / post-processing.
+
 ## Requirements
 
 - Linux or WSL2 (developed on Ubuntu 24.04), Python 3.11+, PyTorch (CUDA or ROCm for real runs; CPU is fine for the
