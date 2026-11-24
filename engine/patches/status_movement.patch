@@ -1,0 +1,509 @@
+# status_movement (bsrl-sim issue #19): status effects the client libg reads nowhere, in the host: speed boosts and
+# slows (StatusEffectData +0xf8..+0x104) in the mover, damage boost / reduce in my_root, stuns (projectile
+# StunLengthMS, stun / silence areas, Bo's stun trap 0xb47358) through libg's own stun counter char +0xe1c, silence,
+# CcImmunity, and Draco's weapon swap on mount / dismount (change-skill 0xb35c3c). NB_SUPERFIX_CC=0 turns the stuns,
+# silence and swap off. Applies on top of supers.patch (paths relative to engine/).
+diff --git a/native/loader/build.sh b/native/loader/build.sh
+index 7fd55b9..cde0b74 100755
+--- a/native/loader/build.sh
++++ b/native/loader/build.sh
+@@ -10,5 +10,5 @@
+ set -e
+ cd "$(dirname "$0")"
+ aarch64-linux-gnu-gcc -O2 -g -ffp-contract=off -fno-omit-frame-pointer -static -D_GNU_SOURCE -Wall -Wno-unused-function -Wno-incompatible-pointer-types \
+-  -Wno-int-conversion -fno-strict-aliasing -Iinc -o nbhost_spawnfix2.tmp main.c elfload.c bionic_shim.c android_shim.c jni_fake.c boot.c hook.c offline.c battle_fix.c env.c prof.c encode.c heapcheck.c bar_fix.c gl_client.c gl_client_gen.c spawnfix.c superfix.c superfix_items.c superfix_moves.c superfix_status.c gadget.c hyper.c trace.c thunk.S -lm -lpthread
++  -Wno-int-conversion -fno-strict-aliasing -Iinc -o nbhost_spawnfix2.tmp main.c elfload.c bionic_shim.c android_shim.c jni_fake.c boot.c hook.c offline.c battle_fix.c env.c prof.c encode.c heapcheck.c bar_fix.c gl_client.c gl_client_gen.c spawnfix.c superfix.c superfix_items.c superfix_moves.c superfix_status.c superfix_cc.c gadget.c hyper.c trace.c thunk.S -lm -lpthread
+ mv -f nbhost_spawnfix2.tmp nbhost_spawnfix2 && echo "built native/loader/nbhost_spawnfix2"
+diff --git a/native/loader/env.c b/native/loader/env.c
+index 1c7dd3c..be864a1 100644
+--- a/native/loader/env.c
++++ b/native/loader/env.c
+@@ -126,6 +126,9 @@ static struct {
+     int charge_level;   /* >0 while a root call with a level-scaled character attacker is in progress */
+     long dm_applied, charge_fixes, guard_hits, alive_forced, root_calls, events;
+     long hyper_dmg, hyper_moves;   /* hypercharge round: damage hits scaled, moves sped up */
++    long st_moves, st_roots, st_dmg, st_blocked, st_resend;   /* issue #19: moves re-timed / rooted by statuses, hits scaled,
++                                                               * inputs refused (stun / silence), moves re-sent on a change */
++    int st_key[NBE_MAXP];          /* issue #19: last status speed / stun state per player (a change re-sends the move) */
+     int in_own_call;    /* 1 = gas, 2 = bomb (our own calls to the damage root) */
+     int seed_applied;
+ } E;
+@@ -171,6 +174,13 @@ static int brawler_owner(void *sim, uint8_t *c) {   /* player index whose curren
+ void hyper_clear(void); void hyper_reset_player(int i, void *p); int hyper_active(void *p); int hyper_use(int i, void *p, uint8_t *ch);
+ int hyper_tick_player(int i, void *p, uint8_t *ch, int alive); int hyper_damage(void *pa, int ai, void *pv, int vi, int d);
+ int hyper_speed(int i, void *p, uint8_t *ch); void hyper_publish(NbeResp *r, void **ps, int np);
++/* issue #19: status effects (superfix_status.c, mirrors its StMods) */
++typedef struct { int spd_bp, spd_ba, spd_rp, spd_ra, dmg_bp, dmg_rp, recv_bp, recv_ba; } StMods;
++int superfix_status_speed(uint8_t *ch, int base) __attribute__((weak));
++int superfix_status_mods(uint8_t *ch, StMods *m) __attribute__((weak));
++int superfix_status_blocked(uint8_t *ch) __attribute__((weak));
++int superfix_status_silenced(uint8_t *ch) __attribute__((weak));
++void superfix_cc_hit(uint8_t *victim, void *attacker, void *src, uint64_t lr) __attribute__((weak));   /* superfix_cc.c: projectile stuns */
+ void hyper_install(void); void *hyper_super_data(int i, uint8_t *ch, void *sd); void hyper_unswap(int i, uint8_t *ch);
+ static void *owner_player(void *sim, void *c, int *idx) {   /* the player whose current brawler c is (NULL: none) */
+     *idx = -1; if (!sim || !c || VTOF(c) != VT_CHAR) return NULL;
+@@ -342,6 +352,7 @@ static uint64_t my_root(void *victim, int a1, int dmg, int a3, int a4, void *att
+                         int s0, int s1, void *s2, int s3, int s4, int s5, int s6, int s7, int s8, int s9) {
+     int mode3 = I32(g_libg->base, 0x12eefb4) == 3;
+     E.root_calls++;
++    if (superfix_cc_hit) superfix_cc_hit(victim, attacker, src, (uint64_t)__builtin_return_address(0));
+     int saved_level = E.charge_level; E.charge_level = 0;
+     if (mode3 && !E.in_own_call && attacker) {   /* agent: entryScale (attackerArg 5) + dmgModelApply */
+         int raw = dmg, d = raw, aid = I32(attacker, 8), cubes = cubes_of(aid), lvl = 0;
+@@ -365,6 +376,15 @@ static uint64_t my_root(void *victim, int a1, int dmg, int a3, int a4, void *att
+             if (nd != dmg) { if (a3 == dmg) a3 = nd; dmg = nd; E.hyper_dmg++; }
+         }
+     }
++    if (dmg > 0 && superfix_status_mods && E.sim && victim) {   /* issue #19: damage boost / reduce of the attacker's statuses,
++                                                               * damage received boost of the victim's (superfix_status_mods) */
++        StMods ma, mv; int am = attacker && VTOF(attacker) == VT_CHAR && superfix_status_mods(attacker, &ma);
++        int vm = VTOF(victim) == VT_CHAR && superfix_status_mods(victim, &mv);
++        long nd = dmg;
++        if (am && (ma.dmg_bp || ma.dmg_rp)) { int pct = 100 + ma.dmg_bp - ma.dmg_rp; nd = nd * (pct > 0 ? pct : 0) / 100; }
++        if (vm && (mv.recv_bp || mv.recv_ba)) nd = nd * (100 + mv.recv_bp) / 100 + mv.recv_ba;
++        if (nd != dmg) { if (a3 == dmg) a3 = (int)nd; dmg = (int)nd; E.st_dmg++; }
++    }
+     int vchar = victim && VTOF(victim) == VT_CHAR, before = vchar ? I32(victim, 0x3c4) : 0;
+     int ow = vchar && mode3 && resp_on() && E.sim ? brawler_owner(E.sim, victim) : -1;
+     uint64_t r = o_root(victim, a1, dmg, a3, a4, attacker, src, a7, s0, s1, s2, s3, s4, s5, s6, s7, s8, s9);
+@@ -767,11 +787,24 @@ static void rec_put(int kind, uint8_t *ch, int a, int b, int c, int d) {
+ }
+ /* mover 0xb4790c(char, x, y, useSpeed, speed, ..): with useSpeed 0 it moves at the CharacterData speed (0xab31e0); hypercharge
+  * round: a hypercharged brawler's move gets the +OverchargeSpeedPercent speed instead (moves with their own speed are left) */
++/* issue #19: and the brawler's statuses (slows, speed boosts, roots, Draco's mount speed: superfix_status_speed) on top of the
++ * hypercharged or the CharacterData speed; a root (speed 0) turns the move into a stop where the character stands (the mover
++ * would divide by 0). A stunned character's moves are refused by the mover itself (0xb38b54). */
++void env_status_counts(long o[5]) { o[0] = E.st_moves; o[1] = E.st_roots; o[2] = E.st_dmg; o[3] = E.st_blocked; o[4] = E.st_resend; }
++static int base_speed(uint8_t *ch) {   /* the CharacterData speed the mover uses with useSpeed 0 (0xab31e0) */
++    void *cd = ((void *(*)(void *))B(0xb6a384))(ch); return cd ? ((int (*)(void *))B(0xab31e0))(cd) : 0;
++}
+ static void rec_move(uint64_t *ctx) {
+     rec_put(0, (uint8_t *)ctx[0], (int)ctx[1], (int)ctx[2], (int)ctx[6], 0);
+     if ((int)ctx[3] == 0 && E.sim) {
+-        int i; void *p = owner_player(E.sim, (void *)ctx[0], &i); int sp = p ? hyper_speed(i, p, (uint8_t *)ctx[0]) : 0;
++        uint8_t *ch = (uint8_t *)ctx[0];
++        int i; void *p = owner_player(E.sim, ch, &i); int sp = p ? hyper_speed(i, p, ch) : 0;
+         if (sp > 0) { ctx[3] = 1; ctx[4] = (uint64_t)(uint32_t)sp; E.hyper_moves++; }
++        if (superfix_status_speed && VTOF(ch) == VT_CHAR) {
++            int base = sp > 0 ? sp : base_speed(ch), ss = superfix_status_speed(ch, base);
++            if (ss == 0) { ctx[1] = (uint64_t)(uint32_t)I32(ch, 0x38); ctx[2] = (uint64_t)(uint32_t)I32(ch, 0x3c); E.st_roots++; }
++            else if (ss > 0 && ss != base) { ctx[3] = 1; ctx[4] = (uint64_t)(uint32_t)ss; E.st_moves++; }
++        }
+     }
+ }
+ static void rec_stop(uint64_t *ctx) { rec_put(2, (uint8_t *)ctx[0], 0, 0, 0, 0); }
+@@ -1217,6 +1250,15 @@ static void apply_actions(void *sim, const NbeCmd *c) {
+         uint8_t *ch = obj_by_id(sim, player_char_id(ps[i]));
+         if (!ch || VTOF(ch) != VT_CHAR || I32(ch, 0x3c4) <= 0 || waiting(i)) { E.moving[i] = 0; E.sent_valid[i] = 0; continue; }
+         const NbeAction *a = &c->act[i];
++        /* issue #19: a stunned brawler (the game's own 0xb38b54 refuses its moves and attacks; host-side gadgets would not ask)
++         * sends nothing; a silenced one no super, gadget or hypercharge. A change of its status speed or stun state re-sends
++         * its move (the mover times a path once, at the move). */
++        int blk = superfix_status_blocked && superfix_status_blocked(ch), sil = superfix_status_silenced && superfix_status_silenced(ch);
++        {   int key = blk ? -2 : superfix_status_speed ? superfix_status_speed(ch, 1000) : -1;
++            if (key != E.st_key[i]) { if (E.sent_valid[i]) E.st_resend++; E.sent_valid[i] = 0; E.st_key[i] = key; } }
++        if (blk) { E.st_blocked += a->fire != 0; E.pf[i].n = 0; continue; }
++        NbeAction q;
++        if (sil && (a->fire == 2 || a->fire == 3 || a->fire == 4)) { E.st_blocked++; q = *a; q.fire = 0; a = &q; }
+         if (client_intents(sim, i, ch, a)) continue;
+         if (a->move_dir >= 0 && a->move_dir < 16) {
+             double r = a->move_dir * M_PI / 8; int tx, ty, cx, cy; client_pos(i, ch, &cx, &cy);
+diff --git a/native/loader/superfix.c b/native/loader/superfix.c
+index a5c7215..890eb22 100644
+--- a/native/loader/superfix.c
++++ b/native/loader/superfix.c
+@@ -114,9 +114,11 @@ void superfix_install(void) {
+     extern void superfix_items_install(void) __attribute__((weak)); if (superfix_items_install) superfix_items_install();
+     extern void superfix_moves_install(void) __attribute__((weak)); if (superfix_moves_install) superfix_moves_install();
+     extern void superfix_status_install(void) __attribute__((weak)); if (superfix_status_install) superfix_status_install();
++    extern void superfix_cc_install(void) __attribute__((weak)); if (superfix_cc_install) superfix_cc_install();   /* issue #19 */
+ }
+ void superfix_status(void) { LOG("[superfix] areas spawned %ld, skipped %ld; delayed damage %ld; heal own %ld projectiles, %ld owners\n",
+                                  g_narea, g_narea_skip, g_ndelayed, g_nheal, g_nheal_self);
+     extern void superfix_items_status(void) __attribute__((weak)); if (superfix_items_status) superfix_items_status();
+     extern void superfix_moves_status(void) __attribute__((weak)); if (superfix_moves_status) superfix_moves_status();
+-    extern void superfix_status_status(void) __attribute__((weak)); if (superfix_status_status) superfix_status_status(); }
++    extern void superfix_status_status(void) __attribute__((weak)); if (superfix_status_status) superfix_status_status();
++    extern void superfix_cc_status(void) __attribute__((weak)); if (superfix_cc_status) superfix_cc_status(); }
+diff --git a/native/loader/superfix_cc.c b/native/loader/superfix_cc.c
+new file mode 100644
+index 0000000..5f3f74b
+--- /dev/null
++++ b/native/loader/superfix_cc.c
+@@ -0,0 +1,206 @@
++/* superfix_cc.c (bsrl-sim issue #19, see superfix.c / superfix_status.c): stuns, silences and Draco's weapon swap, which the
++ * shipped client libg compiles out. The game's own checks are already in the client: 0xb38b54 ("cannot act": the mover
++ * 0xb4790c and the fire code return early on it) reads the stun ticks char +0xe1c (counted down by the character update at
++ * 0xb39a5c), LosePlayerControl +0x984 and Stasis +0x987; the silence getter 0xb38dec (+0x988) blocks the super. What is
++ * missing is every writer, so this file writes them:
++ *   - Bo's stun trap (card type 46 stun_trap): the area apply 0xb29d80 and the projectile hit 0xb78054 call 0xb47358(victim,
++ *     ticks 40, 0, 0, 0, 0) (`mov w0, wzr; ret`, return unused) and skip their knockback for that victim: replaced, it stuns;
++ *   - projectile StunLengthMS (ProjectileData +0x1d0 = ms / 50, no reader in the client: Frank's super, its hypercharged
++ *     version, Jester's stunning super, boss Frank): env.c's damage root hook (0xb422d0) calls superfix_cc_hit with the
++ *     damage source, and a projectile source with a stun length stuns the victim; an enter hook in one projectile hit path
++ *     at 0xb73eb8 (after the hit's status adds and knockback; x27 = the hit character, [sp + 296] = the ProjectileData)
++ *     covers hits that path reaches (Frank's super does not reach it in live runs);
++ *   - projectile SilenceDurationMS: the hit calls 0xb59038(target, ticks) (a bare `ret`): replaced, it silences;
++ *   - Stun (16) and Silence (24) areas (Maisie's dash, Frank-style slams, Sandy's hypercharged silence ...): their StunTicks
++ *     column is empty in the tables and the client reads it only for the UI; the duration is CustomValue +0x13c (ticks).
++ *     At the area's first tick (superfix_status_area), every enemy character in libg's range test 0xb2b298 gets it;
++ *   - a new stun or loss of control stops the character's current path (stop 0xb4103c), because the mover only refuses new
++ *     moves (superfix_cc_tick from the character update hook);
++ *   - CcImmunity statuses (superfix_status.c aggregate +0x982) keep stuns and silences off.
++ *   - Draco (DragonRider): change-skill 0xb35c3c(ch, slot, SkillData, w3, w4, w5) is a bare `ret` (24 callers). The MountUp
++ *     component's mount (call at 0xba02e0) passes his dragon weapon (weapon SkillData +0x158 = DragonRiderDragonWeapon), its
++ *     dismount (0xba0178) CharacterData +0x260 (DragonRiderWeapon). Only those two call sites (by return address) swap the
++ *     skill instance in slot 0 (char +0x458[0]) for one built with libg's own constructor 0xb7aa98 (new 0x58 at 0x11a4d90),
++ *     kept per character and swapped back at the dismount; a swap waits while the old instance is running (+0x30). The other
++ *     22 callers stay a no-op as before.
++ * NB_SUPERFIX=0 turns this off with the rest, NB_SUPERFIX_CC=0 this part alone; NB_SUPERFIX_DBG=1 logs every stun / silence / swap. */
++#include "nbhost.h"
++#include <stdlib.h>
++#include <string.h>
++extern Module *g_libg;
++extern int g_superfix, g_superfix_dbg;
++void *hook_replace(Module *m, uint64_t off, void *repl);
++void hook_enter(Module *m, uint64_t off, void (*fn)(uint64_t *ctx));
++#define B(off) ((uint8_t *)g_libg->base + (off))
++#define I32(p, o) (*(int32_t *)((uint8_t *)(p) + (o)))
++#define U8(p, o) (*(uint8_t *)((uint8_t *)(p) + (o)))
++#define PTR(p, o) (*(void **)((uint8_t *)(p) + (o)))
++#define VT_CHAR 0x1209020
++enum { CH_CCIMM = 0x982, CH_LOSECTL = 0x984, CH_STASIS = 0x987, CH_STUN_TICKS = 0xe1c };
++static int g_cc_on;
++static int mode(void) { return I32(g_libg->base, 0x12eefb4) == 3; }
++static int now_tick(void *obj) { uint8_t *sim = ((void *(*)(void *))B(0xb6a378))(obj); return sim ? I32(sim, 0x10) : -1; }
++static int is_char(void *o) { return o && (int)((uint8_t *)PTR(o, 0) - g_libg->base) == VT_CHAR; }
++static int on(void) { return g_cc_on && g_superfix && mode(); }
++static long g_nstun_trap, g_nstun_proj, g_nstun_area, g_nsil, g_nsil_area, g_nimm, g_nstop, g_nswap, g_nswap_wait;
++
++/* ------------------------------------------------------------------ stun / silence */
++static void stun(uint8_t *ch, int ticks, const char *why) {
++    if (!is_char(ch) || ticks <= 0 || I32(ch, 0x3c4) <= 0) return;
++    if (U8(ch, CH_CCIMM)) { g_nimm++; return; }
++    if (I32(ch, CH_STUN_TICKS) < ticks) I32(ch, CH_STUN_TICKS) = ticks;   /* the longer stun wins (no stacking) */
++    if (g_superfix_dbg) LOG("[superfix] cc: stun ch %d for %d ticks (%s), tick %d\n", I32(ch, 8), ticks, why, now_tick(ch));
++}
++typedef struct { uint8_t *ch; int id, until; } Sil;
++#define SIL_MAX 64
++static Sil g_sil[SIL_MAX]; static int g_nsilrec;
++static void silence(uint8_t *ch, int ticks, const char *why) {
++    if (!is_char(ch) || ticks <= 0 || I32(ch, 0x3c4) <= 0) return;
++    if (U8(ch, CH_CCIMM)) { g_nimm++; return; }
++    int t = now_tick(ch), k; if (t < 0) return;
++    for (k = 0; k < g_nsilrec && !(g_sil[k].ch == ch && g_sil[k].id == I32(ch, 8)); k++) {}
++    if (k == g_nsilrec) {
++        for (int i = g_nsilrec - 1; i >= 0; i--) if (g_sil[i].until <= t) g_sil[i] = g_sil[--g_nsilrec];
++        if (g_nsilrec >= SIL_MAX) return;
++        k = g_nsilrec++; g_sil[k] = (Sil){ch, I32(ch, 8), t};
++    }
++    if (g_sil[k].until < t + ticks) g_sil[k].until = t + ticks;
++    if (g_superfix_dbg) LOG("[superfix] cc: silence ch %d for %d ticks (%s), tick %d\n", I32(ch, 8), ticks, why, t);
++}
++/* superfix_status.c's aggregate asks every tick */
++int superfix_cc_silenced(uint8_t *ch, int t) {
++    if (!g_cc_on) return 0;
++    for (int i = 0; i < g_nsilrec; i++) if (g_sil[i].ch == ch && g_sil[i].id == I32(ch, 8)) return t < g_sil[i].until;
++    return 0;
++}
++/* 0xb47358(victim, ticks, 0, 0, 0, 0): Bo's stun trap */
++static int my_trap_stun(uint8_t *ch, int ticks) { if (on()) { stun(ch, ticks, "stun trap"); g_nstun_trap++; } return 0; }
++/* 0xb59038(target, ticks): a projectile's SilenceDurationMS */
++static void my_silence(uint8_t *ch, int ticks) { if (on()) { silence(ch, ticks, "projectile"); g_nsil++; } }
++/* enter hook in the projectile hit at 0xb73eb8 (ldr w0, [x25, #1300]): x27 = the hit character, [sp + 296] = ProjectileData.
++ * x27 is callee-saved and untouched by the enter stub, so it still holds the hit code's value when this function starts.
++ * Live runs reach it for some hits only (not for Frank's super), so the damage root below covers the rest; a stun taken
++ * twice for one hit keeps the longer one. */
++static void on_proj_hit(uint64_t *ctx) {
++    uint64_t x27; __asm__ volatile("mov %0, x27" : "=r"(x27));
++    if (!on()) return;
++    uint8_t *pd = *(uint8_t **)((uint8_t *)ctx + 160 + 296), *ch = (uint8_t *)x27;
++    if (!pd || !is_char(ch)) return;
++    int ticks = I32(pd, 0x1d0);
++    if (ticks > 0) { stun(ch, ticks, "projectile"); g_nstun_proj++; }
++}
++/* From env.c's damage root hook (0xb422d0, x6 = the damage source): a projectile source with a stun length stuns the
++ * victim. The hit code's own path (0xb73eb8 above) does not run for these projectiles' hits in this build. */
++#define VT_PROJ 0x1209318
++void superfix_cc_hit(uint8_t *victim, void *attacker, void *src, uint64_t lr) {
++    (void)lr;
++    if (!on() || !src || !is_char(victim)) return;
++    int vt = (int)((uint8_t *)PTR(src, 0) - g_libg->base);
++    uint8_t *pd = vt == VT_PROJ ? ((uint8_t *(*)(void *))B(0xb6a384))(src) : NULL;
++    (void)attacker;
++    if (!pd) return;
++    int ticks = I32(pd, 0x1d0);
++    if (ticks > 0) { stun(victim, ticks, "projectile hit"); g_nstun_proj++; }
++}
++/* Stun (16) / Silence (24) areas, from superfix_status_area at every tick of an area: once per area, at its first tick */
++typedef struct { void *a; int start; } CcArea;
++#define CA_MAX 64
++static CcArea g_ca[CA_MAX]; static int g_nca;
++void superfix_cc_area(uint8_t *a, uint8_t *d) {
++    if (!on() || !a || !d) return;
++    int type = I32(d, 0x118), ticks = I32(d, 0x13c); uint8_t *owner = PTR(a, 0x108);
++    if ((type != 16 && type != 24) || ticks <= 0 || !owner) return;
++    for (int i = 0; i < g_nca; i++) if (g_ca[i].a == a && g_ca[i].start == I32(a, 0xd0)) return;
++    if (g_nca >= CA_MAX) g_nca = 0;
++    g_ca[g_nca++] = (CcArea){a, I32(a, 0xd0)};
++    uint8_t *mgr = PTR(owner, 0x20); if (!mgr) return;
++    int n = I32(mgr, 0x34); void **v = PTR(mgr, 0x28); if (!v || n < 0 || n > 4096) return;
++    int team = ((int (*)(void *))B(0xb6a820))(a), ax = I32(a, 0x38), ay = I32(a, 0x3c);
++    for (int i = 0; i < n; i++) {
++        uint8_t *o = v[i];
++        if (!is_char(o) || I32(o, 0x3c4) <= 0 || ((int (*)(void *))B(0xb6a820))(o) == team) continue;
++        long dx = I32(o, 0x38) - ax, dy = I32(o, 0x3c) - ay, r = ((int (*)(void *, void *))B(0xb2b298))(d, o);
++        if (dx * dx + dy * dy > r * r) continue;
++        if (type == 16) { stun(o, ticks, "area"); g_nstun_area++; } else { silence(o, ticks, "area"); g_nsil_area++; }
++    }
++}
++
++/* ------------------------------------------------------------------ Draco's weapon swap */
++/* spare: the instance slot 0 had before the mount (the character's own weapon instance); want: pending data; mount: 1 at the
++ * mount (a new instance for the dragon weapon, the old one kept as spare), 0 at the dismount (the spare back). A mount always
++ * replaces the spare, so a record left from an earlier battle (same address and id) never hands out a freed instance. The
++ * dragon weapon's instance is dropped at the dismount (0x58 bytes per mount, not freed: libg may still point at it). */
++typedef struct { uint8_t *ch; int id; void *spare; void *want; int mount; } Swap;
++#define SW_MAX 16
++static Swap g_sw[SW_MAX]; static int g_nsw;
++static Swap *swap_rec(uint8_t *ch) {
++    for (int i = 0; i < g_nsw; i++) if (g_sw[i].ch == ch) { if (g_sw[i].id != I32(ch, 8)) g_sw[i] = (Swap){ch, I32(ch, 8)}; return &g_sw[i]; }
++    if (g_nsw >= SW_MAX) return NULL;
++    g_sw[g_nsw] = (Swap){ch, I32(ch, 8)}; return &g_sw[g_nsw++];
++}
++static void do_swap(uint8_t *ch, Swap *w) {
++    uint8_t **sk = PTR(ch, 0x458); int n = I32(ch, 0x464);
++    if (!sk || n < 1 || n > 16 || !sk[0] || !w->want || PTR(sk[0], 0) == w->want) { w->want = NULL; return; }
++    if (I32(sk[0], 0x30)) { g_nswap_wait++; return; }   /* the old weapon is still running: next tick */
++    void *inst;
++    if (!w->mount && w->spare && PTR(w->spare, 0) == w->want) inst = w->spare;
++    else {
++        inst = ((void *(*)(size_t))B(0x11a4d90))(0x58);   /* libg's operator new, as the skill-instance builder 0xb34560 */
++        if (!inst) { w->want = NULL; return; }
++        ((void (*)(void *, void *))B(0xb7aa98))(inst, w->want);
++    }
++    w->spare = w->mount ? sk[0] : NULL; sk[0] = inst; g_nswap++;
++    if (g_superfix_dbg) LOG("[superfix] cc: weapon %s ch %d -> skill %d, tick %d\n", w->mount ? "mount" : "dismount", I32(ch, 8),
++                            I32(w->want, 0x20), now_tick(ch));
++    w->want = NULL;
++}
++/* 0xb35c3c(ch, slot, SkillData, w3, w4, w5) */
++static void my_change_skill(uint8_t *ch, int slot, void *data) {
++    void *ret = __builtin_return_address(0);
++    if (!on() || slot != 0 || !data || !is_char(ch)) return;
++    int mount = ret == (void *)B(0xba02e4);
++    if (!mount && ret != (void *)B(0xba017c)) return;   /* MountUp mount / dismount only */
++    Swap *w = swap_rec(ch); if (!w) return;
++    if (mount) w->spare = NULL;
++    w->want = data; w->mount = mount; do_swap(ch, w);
++}
++
++/* ------------------------------------------------------------------ per character tick (superfix_status.c's update hook) */
++typedef struct { uint8_t *ch; int id; } Blk;
++#define BLK_MAX 64
++static Blk g_blk[BLK_MAX]; static int g_nblk;
++void superfix_cc_tick(uint8_t *ch) {
++    if (!on() || !is_char(ch)) return;
++    for (int i = 0; i < g_nsw; i++) if (g_sw[i].ch == ch && g_sw[i].want) do_swap(ch, &g_sw[i]);
++    int blocked = I32(ch, 0x3c4) > 0 && (U8(ch, CH_LOSECTL) || U8(ch, CH_STASIS) || I32(ch, CH_STUN_TICKS) > 0), k;
++    for (k = 0; k < g_nblk && !(g_blk[k].ch == ch && g_blk[k].id == I32(ch, 8)); k++) {}
++    if (blocked && k == g_nblk) {   /* a new stun: stop the path the character is on (the mover only refuses new moves) */
++        if (g_nblk < BLK_MAX) g_blk[g_nblk++] = (Blk){ch, I32(ch, 8)};
++        if (!U8(ch, 0x490)) { ((void (*)(void *))B(0xb4103c))(ch); g_nstop++; }   /* not in a charge / dash (+0x490) */
++    } else if (!blocked && k < g_nblk) g_blk[k] = g_blk[--g_nblk];
++}
++
++void superfix_cc_install(void) {
++    const char *e = getenv("NB_SUPERFIX_CC");
++    if (e && !atoi(e)) { LOG("[superfix] stuns / silences / weapon swap off (NB_SUPERFIX_CC=0)\n"); return; }
++    if (*(uint32_t *)B(0xb47358) != 0x2a1f03e0 || *(uint32_t *)B(0xb4735c) != 0xd65f03c0 ||   /* mov w0, wzr; ret */
++        *(uint32_t *)B(0xb59038) != 0xd65f03c0 || *(uint32_t *)B(0xb35c3c) != 0xd65f03c0 ||   /* ret; ret */
++        *(uint32_t *)B(0xb73eb8) != 0xb9451720 ||                                              /* ldr w0, [x25, #1300] */
++        *(uint32_t *)B(0xb38b54) == 0xd65f03c0) {
++        LOG("[superfix] cc: libg bytes differ from v68.279, stuns / silences / weapon swap left out\n"); return;
++    }
++    hook_replace(g_libg, 0xb47358, (void *)my_trap_stun);
++    hook_replace(g_libg, 0xb59038, (void *)my_silence);
++    hook_replace(g_libg, 0xb35c3c, (void *)my_change_skill);
++    hook_enter(g_libg, 0xb73eb8, on_proj_hit);
++    g_cc_on = 1;
++    LOG("[superfix] stuns, silences and Draco's weapon swap installed\n");
++}
++void env_status_counts(long o[5]) __attribute__((weak));
++void superfix_cc_status(void) {
++    if (env_status_counts) { long o[5]; env_status_counts(o);
++        LOG("[superfix] env (this battle): moves re-timed by statuses %ld, rooted %ld; hits scaled %ld; inputs refused %ld; "
++            "moves re-sent %ld\n", o[0], o[1], o[2], o[3], o[4]); }
++    LOG("[superfix] cc: stuns trap %ld, projectile %ld, area %ld; silences projectile %ld, area %ld; immune %ld; paths stopped %ld; "
++        "weapon swaps %ld (waited %ld)\n", g_nstun_trap, g_nstun_proj, g_nstun_area, g_nsil, g_nsil_area, g_nimm, g_nstop, g_nswap, g_nswap_wait);
++}
+diff --git a/native/loader/superfix_status.c b/native/loader/superfix_status.c
+index 215bee3..0e6d4c7 100644
+--- a/native/loader/superfix_status.c
++++ b/native/loader/superfix_status.c
+@@ -17,11 +17,18 @@
+  *   pct = max(skill shield, +0x954), damage * (100 - pct) / 100), char +0x97c = max Invisibility +0x12c (0 none ..
+  *   3 full; libg's reader 0xb3931c and the char update). Pulsating effects (+0xb0 on / +0xb4 off ticks) count only in
+  *   their on phases. Nothing else in this libg writes those two words.
+- * Not modelled (no client reader found): speed (SpeedBoostPercent +0xf8 / Absolute +0xfc / reduces +0x100 / +0x104: the
+- *   move start 0xb4790c times a path with the CharacterData speed 0xab31e0 only), damage boosts (+0x108, +0x114: the damage
+- *   percent 0xb4b660 reads char +0x968 / +0x970, whose status mapping is not proven), stuns, silences, boolean attributes
+- *   (Kaze's HasStormVision), CancelOn* conditions. Those statuses are stored (so their duration and target are right)
+- *   but change nothing. 0xba3274 (called at stop / charge end / respawn) and the other manager stubs are left alone.
++ *   The modifiers no client code reads are read from the store by other host code (issue #19): superfix_status_speed
++ *   (SpeedBoostPercent +0xf8 / Absolute +0xfc, SpeedReducePercent +0x100 / Absolute +0x104) for env.c's mover hook,
++ *   superfix_status_mods (DamageBoostPercent +0x108, DamageReducePercent +0x118, DamageReceivedBoost +0x11c / +0x120) for
++ *   env.c's damage root, and the crowd-control bytes, written here each tick: char +0x984 LosePlayerControl +0x131,
++ *   +0x987 Stasis +0x137, +0x988 Silence +0x138, +0x989 FullStun +0x139, +0x982 CcImmunity +0x12a (immunity clears the
++ *   others and the stun counter +0xe1c). libg's own "can't act" 0xb38b54 (mover and fire abort) reads +0x984, +0x987 and
++ *   +0xe1c; the silence getter 0xb38dec reads +0x988. Stuns from projectiles, areas and Bo's trap: superfix_cc.c.
++ *   Stacking statuses sum once per source (DragonRiderUltiSpeed is re-added every tick), others take the max.
++ * Not modelled: DamageBoostTargetCurrentHealthPercent +0x114, LifeSteal +0x10c, DecreaseReloadTimePercent +0x124,
++ *   Taunt / Fear, boolean attributes (Kaze's HasStormVision), CancelOn* conditions. Those statuses are stored (so their
++ *   duration and target are right) but change nothing. 0xba3274 (called at stop / charge end / respawn) and the other
++ *   manager stubs are left alone.
+  *
+  * StatusEffect areas (AreaEffectData +0x118 == 36: Max, Jae-Yong, Najia's jars, Kaze's storm, slows ...): the area apply
+  * 0xb29494 returns before its status code for type 36 (its type gate) and libg reads StatusEffectSelf +0x88 / Ally +0x90
+@@ -50,9 +57,20 @@ typedef int (*geti_t)(void *);
+ 
+ /* StatusEffectData fields (loader 0xba3814) */
+ enum { SE_DUR = 0x98, SE_RATE = 0xa0, SE_SRCDEATH = 0xa8, SE_FIRST = 0xab, SE_STACK = 0xac, SE_REFRESH = 0xad,
+-       SE_PON = 0xb0, SE_POFF = 0xb4, SE_DMG = 0xb8, SE_HEAL = 0xf0, SE_SHIELD = 0xf4, SE_INVIS = 0x12c };
+-/* character aggregates (manager +0xc4 / +0xec) */
+-enum { CH_SHIELD = 0x954, CH_INVIS = 0x97c };
++       SE_PON = 0xb0, SE_POFF = 0xb4, SE_DMG = 0xb8, SE_HEAL = 0xf0, SE_SHIELD = 0xf4, SE_INVIS = 0x12c,
++       /* issue #19 (loader 0xba3814, from the column-name strings): ints */
++       SE_SPD_BP = 0xf8, SE_SPD_BA = 0xfc, SE_SPD_RP = 0x100, SE_SPD_RA = 0x104, SE_DMG_BP = 0x108, SE_DMG_RP = 0x118,
++       SE_RECV_BP = 0x11c, SE_RECV_BA = 0x120,
++       /* bytes */
++       SE_CCIMM = 0x12a, SE_LOSECTL = 0x131, SE_STASIS = 0x137, SE_SILENCE = 0x138, SE_FULLSTUN = 0x139 };
++/* character aggregates (manager +0xc4 / +0xec); issue #19: the bytes libg's own checks read. 0xb38b54 ("cannot act": the
++ * mover 0xb4790c and the fire code 0xb48bf4 / 0xb48c9c return early on it) = LosePlayerControl +0x984 || Stasis +0x987 ||
++ * stun ticks +0xe1c > 0 (the character update counts +0xe1c down at 0xb39a5c); the silence getter 0xb38dec (+0x988) blocks
++ * the super at 0xb48bf8; FullStun +0x989 is read at 0xb3b5b8; CcImmunity +0x982. Nothing in the client writes them. The
++ * int aggregates +0x958..+0x978 (speed, damage) have no reader that matters here (the mover never reads speed from them),
++ * so speed and damage are applied by env.c from superfix_status_mods() instead and those ints are left alone. */
++enum { CH_SHIELD = 0x954, CH_INVIS = 0x97c, CH_CCIMM = 0x982, CH_LOSECTL = 0x984, CH_STASIS = 0x987, CH_SILENCE = 0x988,
++       CH_FULLSTUN = 0x989, CH_STUN_TICKS = 0xe1c };
+ #define VT_CHAR 0x1209020
+ 
+ typedef struct {
+@@ -60,7 +78,7 @@ typedef struct {
+ } St;
+ #define ST_MAX 512            /* 10 brawlers + summons x a few effects; Draco re-adds a 2-tick status every tick */
+ static St g_st[ST_MAX]; static int g_nst;
+-static long g_nmount, g_nadd, g_nrefresh, g_nfull, g_nexpire, g_nremove, g_ndmg, g_nheal, g_narea_hits, g_narea_apply;
++static long g_nstun, g_nmount, g_nadd, g_nrefresh, g_nfull, g_nexpire, g_nremove, g_ndmg, g_nheal, g_narea_hits, g_narea_apply;
+ 
+ static int now_tick(void *obj) { uint8_t *sim = ((getp_t)B(0xb6a378))(obj); return sim ? I32(sim, 0x10) : -1; }
+ static int data_id(void *d) { return d ? I32(d, 0x20) : -1; }            /* LogicData global id (table * 1e6 + row) */
+@@ -156,7 +174,7 @@ static void on_char_update(uint64_t *ctx) {
+             if (c[i] && I32(c[i], 0x10) == 21 && I32(c[i], 0x38) > 0 && PTR(c[i], 8) == ch &&
+                 (*(void ***)c[i])[0x40 / 8] == (void *)B(0xba0048)) { ((void (*)(void *))B(0xba0048))(c[i]); g_nmount++; }
+     }
+-    int shield = 0, invis = 0, any = 0;
++    int shield = 0, invis = 0, any = 0, cc = 0, lose = 0, stasis = 0, silence = 0, full = 0;
+     for (int i = 0; i < g_nst; i++) {
+         St *s = &g_st[i];
+         if (s->ch != ch || s->ch_id != I32(ch, 8)) continue;
+@@ -177,10 +195,23 @@ static void on_char_update(uint64_t *ctx) {
+         int sp = I32(s->data, SE_SHIELD), iv = I32(s->data, SE_INVIS);
+         if (sp > shield) shield = sp;
+         if (iv > invis) invis = iv;
++        cc |= U8(s->data, SE_CCIMM); lose |= U8(s->data, SE_LOSECTL); stasis |= U8(s->data, SE_STASIS);
++        silence |= U8(s->data, SE_SILENCE); full |= U8(s->data, SE_FULLSTUN);
+     }
+     (void)any;
+-    I32(ch, CH_SHIELD) = shield;   /* nothing in this libg writes these two: ours */
++    I32(ch, CH_SHIELD) = shield;   /* nothing in this libg writes these: ours */
+     I32(ch, CH_INVIS) = invis;
++    {   /* issue #19: crowd control. A CcImmunity status keeps LosePlayerControl / FullStun / Silence off and clears the stun
++         * ticks (Mortis's bats, Kenji's hide, Rico's star power ...); Stasis is not crowd control there (it freezes the
++         * character itself). Host-side silences (projectile SilenceDurationMS, Silence areas: superfix_cc.c) add theirs. */
++        extern int superfix_cc_silenced(uint8_t *, int) __attribute__((weak));
++        if (superfix_cc_silenced && superfix_cc_silenced(ch, t)) silence = 1;
++        if (cc) { lose = full = silence = 0; I32(ch, CH_STUN_TICKS) = 0; }
++        if (lose && !U8(ch, CH_LOSECTL) && !stasis && !U8(ch, CH_STASIS) && I32(ch, CH_STUN_TICKS) <= 0) g_nstun++;
++        U8(ch, CH_CCIMM) = cc; U8(ch, CH_LOSECTL) = lose; U8(ch, CH_STASIS) = stasis; U8(ch, CH_SILENCE) = silence;
++        U8(ch, CH_FULLSTUN) = full;
++        extern void superfix_cc_tick(uint8_t *) __attribute__((weak)); if (superfix_cc_tick) superfix_cc_tick(ch);
++    }
+     if (g_superfix_dbg) {   /* MountUp (component type 21, char +0xa60 / count +0xa6c): its mount ticks +0x38 (0xb50be8) */
+         int nc = I32(ch, 0xa6c); void **c = PTR(ch, 0xa60);
+         for (int i = 0; c && i < nc && i < 64; i++) if (c[i] && I32(c[i], 0x10) == 21) {
+@@ -202,6 +233,54 @@ static void on_char_update(uint64_t *ctx) {
+     }
+ }
+ 
++/* issue #19: speed and damage modifiers of a character's live statuses (in their on phases), for env.c's mover hook
++ * (rec_move) and damage root (my_root). Combined per field like the client's own aggregator 0xba7060 / 0xba78d0 (which the
++ * client only runs on network-decoded statuses): Stacking statuses add up (one per source: the same data re-added by the same
++ * source counts once), the others count with their largest value, and the field is the larger of the two. Returns 0 if the character has no speed or damage modifier. */
++typedef struct { int spd_bp, spd_ba, spd_rp, spd_ra, dmg_bp, dmg_rp, recv_bp, recv_ba; } StMods;
++int superfix_status_mods(uint8_t *ch, StMods *m) {
++    memset(m, 0, sizeof *m);
++    if (!g_superfix || !mode() || !ch || !g_nst) return 0;
++    int t = now_tick(ch); if (t < 0) return 0;
++    static const int off[8] = {SE_SPD_BP, SE_SPD_BA, SE_SPD_RP, SE_SPD_RA, SE_DMG_BP, SE_DMG_RP, SE_RECV_BP, SE_RECV_BA};
++    int sum[8] = {0}, mx[8] = {0}, any = 0, id = I32(ch, 8);
++    for (int i = 0; i < g_nst; i++) {
++        const St *s = &g_st[i];
++        if (s->ch != ch || s->ch_id != id || t >= s->until || !pulse_on(s, t)) continue;
++        int dup = 0;   /* a Stacking status re-added by the same source counts once (Draco's 2-tick mount speed, re-added each tick) */
++        if (U8(s->data, SE_STACK))
++            for (int j = 0; j < i && !dup; j++) dup = g_st[j].ch == ch && g_st[j].ch_id == id && g_st[j].data == s->data &&
++                                                   g_st[j].src_obj == s->src_obj && g_st[j].src_id == s->src_id && t < g_st[j].until;
++        if (dup) continue;
++        for (int k = 0; k < 8; k++) {
++            int v = I32(s->data, off[k]); if (v <= 0) continue;
++            any = 1;
++            if (U8(s->data, SE_STACK)) sum[k] += v; else if (v > mx[k]) mx[k] = v;
++        }
++    }
++    if (!any) return 0;
++    int *o = (int *)m; for (int k = 0; k < 8; k++) o[k] = sum[k] > mx[k] ? sum[k] : mx[k];
++    return 1;
++}
++/* the move speed (units/s) a character with base speed `base` moves at under its statuses, -1 = no speed modifier.
++ * Boosts first (base * (100 + percent) / 100 + absolute), then slows ((...) * (100 - percent) / 100 - absolute), floored at
++ * 0 (SpeedReducePercent 100 = a root: Kenji's hide, Morningstar's root). The order and the floor are this host's choice:
++ * the server code that does it is not in the client build. */
++int superfix_status_speed(uint8_t *ch, int base) {
++    StMods m; if (base <= 0 || !superfix_status_mods(ch, &m)) return -1;
++    if (!m.spd_bp && !m.spd_ba && !m.spd_rp && !m.spd_ra) return -1;
++    long v = (long)base * (100 + m.spd_bp) / 100 + m.spd_ba;
++    int rp = m.spd_rp > 100 ? 100 : m.spd_rp;
++    v = v * (100 - rp) / 100 - m.spd_ra;
++    return v > 0 ? (int)v : 0;
++}
++/* 1 if the character cannot move or attack now (the game's own 0xb38b54 test: lose control, stasis, stun ticks) */
++int superfix_status_blocked(uint8_t *ch) {
++    return ch && (U8(ch, CH_LOSECTL) || U8(ch, CH_STASIS) || I32(ch, CH_STUN_TICKS) > 0);
++}
++int superfix_status_silenced(uint8_t *ch) { return ch && U8(ch, CH_SILENCE); }
++int superfix_status_cc_immune(uint8_t *ch) { return ch && U8(ch, CH_CCIMM); }
++
+ /* StatusEffect (type 36) areas, from superfix.c's area tick hook (0xb28c0c) */
+ typedef struct { void *a, *d; int start, end, next; } AreaRec;
+ #define AR_MAX 128
+@@ -210,6 +289,10 @@ typedef void (*apply_t)(void *, void *, int, int, void *, void *, int, int, int,
+ void superfix_status_area(uint8_t *a) {
+     if (!g_superfix || !mode() || !a) return;
+     uint8_t *d = ((getp_t)B(0xb6a384))(a);
++    if (d && (I32(d, 0x118) == 16 || I32(d, 0x118) == 24)) {   /* issue #19: Stun / Silence areas (superfix_cc.c) */
++        extern void superfix_cc_area(uint8_t *, uint8_t *) __attribute__((weak)); if (superfix_cc_area) superfix_cc_area(a, d);
++        return;
++    }
+     if (!d || I32(d, 0x118) != 36) return;
+     void *self = PTR(d, 0x88), *ally = PTR(d, 0x90), *enemy = PTR(d, 0x98);
+     uint8_t *owner = PTR(a, 0x108);
+@@ -266,6 +349,6 @@ void superfix_status_install(void) {
+ }
+ void superfix_status_status(void) {
+     LOG("[superfix] status: added %ld, refreshed %ld, full %ld, ended %ld, removed %ld, live %d; damage %ld, heal %ld; "
+-        "type-36 area applies %ld, characters hit %ld; MountUp ticks %ld\n", g_nadd, g_nrefresh, g_nfull, g_nexpire, g_nremove, g_nst, g_ndmg, g_nheal,
+-        g_narea_apply, g_narea_hits, g_nmount);
++        "type-36 area applies %ld, characters hit %ld; MountUp ticks %ld; lose-control starts %ld\n", g_nadd, g_nrefresh, g_nfull, g_nexpire, g_nremove, g_nst, g_ndmg, g_nheal,
++        g_narea_apply, g_narea_hits, g_nmount, g_nstun);
+ }

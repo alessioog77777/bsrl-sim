@@ -65,6 +65,16 @@ Changes made to nirkt's code, all recorded in `engine/patches/`:
   `env.c` mirrors each brawler's power cubes into character `+0x874`, so libg's own death drop (inside the damage root)
   drops min(cubes / 3 + 1, 5) cubes, 2 at most for a trio group, as Trio Showdown does; a respawned teammate comes back
   after 17 s (`RespawnSeconds`) with 3 s of spawn protection. `python -m showdown_check` checks it live.
+- `supers.patch` (issue #6, a diff on top of `gadgets.patch`): supers whose effect the client libg compiles out, in
+  `native/loader/superfix*.c` (status-effect store, areas, summons; `NB_SUPERFIX=0` turns it off).
+- `status_movement.patch` (issue #19, a diff on top of `supers.patch`): speed boosts and slows from statuses in the mover
+  (`env.c` `rec_move`), damage boost / reduce in `my_root`, stuns (projectile `StunLengthMS`, stun and silence areas,
+  Bo's stun trap) through libg's stun counter, silence, `CcImmunity`, and Draco's weapon swap on mount
+  (`native/loader/superfix_cc.c`; `NB_SUPERFIX_CC=0` turns the stuns, silence and swap off). `python -m status_check`.
+- `obs_invisibility.patch` (issue #19, obs v5.9, a diff on top of `status_movement.patch`): the observation encoder
+  (`native/loader/encode.c`) leaves out an invisible enemy brawler farther than its reveal distance (1200; "full"
+  invisibility: any distance) from the enemy rows and grid channel 5; `env.c` `invis_reach` reads the status
+  aggregate and Leon's super (broken by his attack).
 - `maenv.py` and `fair.py` copied from nbrl-env's `py/nbpc` into bulletlabels' `vendor/nbpc` (now `engine/py/nbpc`),
   so one `nbpc` package holds the host side and the environment side.
 - The game download link removed from bulletlabels' `setup.sh` (`engine/setup.sh`) (this repo's `setup.sh` downloads it instead).
