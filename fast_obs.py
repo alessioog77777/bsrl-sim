@@ -2,7 +2,7 @@
 same RNG state: the random draws are obs_v5.ObsV5.build's code unchanged, in the same order.
 
     ob = FastObsV5(noise=O.NOISE, seed=0)          # drop-in for obs_v5.ObsV5
-    o = ob.build(vec, grid, meta, ids)
+    o = ob.build(vec, grid, meta, ids, who=who, gadget=gadget)   # who / gadget as ObsV5.build's
     pv = priv_fast(env, ids)                         # == train_ppo.priv(env, ids)
 
 * velocity matching: one (B, N_ENT, N_ENT) distance block instead of a loop over agents;
@@ -42,8 +42,8 @@ class FastObsV5(O.ObsV5):
                 for k in list(self.ep)[:2048]: self.unfree.append(self.ep.pop(k)[10])
         return e
 
-    def build(self, vec, grid, meta, ids, cmd=None, who=None):
-        o = from_state2(vec, grid, meta, who, derived=self.noise is None or not len(ids))
+    def build(self, vec, grid, meta, ids, cmd=None, who=None, gadget=None):
+        o = from_state2(vec, grid, meta, who, derived=self.noise is None or not len(ids), gadget=gadget)
         if self.noise is None or not len(ids):
             return o
         r, B = self.rng, len(ids)
@@ -157,7 +157,7 @@ def _who(rng, vec):
 def _check(steps=300):
     rng = np.random.default_rng(1)
     a, b = O.ObsV5(seed=5), FastObsV5(seed=5)
-    base = _synthetic(rng, 30); bw = _who(rng, base[0]); n_id = 0
+    base = _synthetic(rng, 30); bw = _who(rng, base[0]); n_id = n_gad = 0
     for t in range(steps):                               # the same agents drift; random subsets per poll; new agents now and then
         vec, grid, meta, ids = base
         vec = vec + rng.normal(size=vec.shape).astype(np.float32) * 0.01 * (vec != 0)
@@ -166,10 +166,11 @@ def _check(steps=300):
         x = (vec[pick], grid[pick], meta[pick], ids2)
         cmd = rng.normal(size=(int(pick.sum()), 2)).astype(np.float32) * 0.12 if t % 2 else None   # A2 path every other poll
         w = bw[pick] if t % 3 else None                  # identities given on 2 of 3 polls
-        oa, ob = a.build(*[y.copy() for y in x], cmd=cmd, who=w), b.build(*[y.copy() for y in x], cmd=cmd, who=w)
+        gd = (rng.random(len(ids2)) < 0.5).astype(np.float32) if t % 4 else None   # gadget ready (self 3, v5.7) on 3 of 4
+        oa, ob = a.build(*[y.copy() for y in x], cmd=cmd, who=w, gadget=gd), b.build(*[y.copy() for y in x], cmd=cmd, who=w, gadget=gd)
         assert same(oa, ob), t
-        n_id += int(oa["ent"][..., O.ID_KNOWN].sum())
-    assert n_id > 1000, n_id                             # the identity path ran (known rows, wrong picks, links)
+        n_id += int(oa["ent"][..., O.ID_KNOWN].sum()); n_gad += int(oa["self"][:, 3].sum())
+    assert n_id > 1000 and n_gad > 100, (n_id, n_gad)    # the identity path ran (known rows, wrong picks, links), self 3 set
     # eviction path: > 4096 agents
     a, b = O.ObsV5(seed=6), FastObsV5(seed=6)
     for t in range(250):

@@ -2,7 +2,8 @@
 
     net = Policy(); logits, v, h = net(s, ent, grid, h)      # one decision; s = cat[self (8), cond (30), intent (11)], h (B, HID)
     logits, v = net.seq(s, ent, grid, h0)                     # (N, L, ...) chunks from stored h0 -> flat (N * L) outputs
-    logits = move 17 | fire 3 (none / attack / super) | aim 360 (pointer over visible enemies / boxes + free) | distance 8
+    logits = move 17 | fire 4 (obs_v5.FIRE: none / attack / super / gadget) | aim 360 (pointer over visible enemies / boxes
+             + free) | distance 8
 
     python -m model      # self-check (CPU, no game)
 The critic also gets `priv` (PRIV = 40: every player's true offset, hp, alive; train_ppo.priv) through a zero-initialised
@@ -23,6 +24,14 @@ Obs v5.6: identity (14) + line-of-sight (2) columns at the end of the observatio
 their input weights in ent.0 / cand.0 / aux.fut.0 are inserted as zero columns before the lead columns (a fresh Policy
 draws the v5.5 weights under a given seed, then the zero columns are put in), and pad_param inserts them the same way
 into a v5.5 / v5.4 / v5.3 checkpoint's weights (load_state_dict) and Adam moments (train_ppo.load_opt): same outputs.
+Obs v5.7: fire classes past none / attack / super (gadget) come from their own zero-initialised linear `fire_x` (one
+output per extra class, appended to pi's three fire logits), so pi keeps its layout; fire_x is built on a forked RNG
+stream (a fresh Policy draws the v5.6 weights, then zeroes vec.0's self-3 column) and registered after every other acting module (its parameters are the
+tail of the main Adam's list: train_ppo.load_opt gives an older optimizer state fresh moments for them). An older
+checkpoint loads with fire_x = zeros and its vec.0 column of self 3 (gadget ready; always 0 before, so still its random
+init) zeroed. Each such class is masked while its obs_v5.FIRE_READY self column is off (mask_fire); with those columns
+0 an older checkpoint acts exactly as before. The aim head counts for the classes in obs_v5.FIRE_AIM (gadget: its
+direction), the distance head only for a super (dist_logp_ent, masked_kl).
 Heads the actor never runs (NONACT; fast_act / act_stacked skip them, old checkpoints load with strict=False and get
 fresh ones; built on their own RNG stream, so Policy() under a given seed has the acting weights it had without them):
 * live value `vl` (trainer --vlive): MLP on the detached cat[x, h], no priv, so it works live (priv does not exist
@@ -43,9 +52,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import obs_v5 as O
-from models4 import UnfoldConv2d, dist_logp_ent      # nirkt (MIOpen-safe conv; masked log-prob / entropy / sampling)
+from models4 import UnfoldConv2d                     # nirkt (MIOpen-safe conv)
 
-NVEC, HID, PRIV = [17, 3, 360, 8], 256, 40
+N_FIRE = len(O.FIRE); N_FX = N_FIRE - 3               # fire classes; those past none / attack / super (fire_x outputs)
+NVEC, HID, PRIV = [17, N_FIRE, 360, 8], 256, 40
+_SUPER, _GADGET = O.FIRE.index("super"), O.FIRE_READY[O.FIRE.index("gadget")]   # super's class; gadget-ready self column
+_GATE = [(c, k) for c, k in enumerate(O.FIRE_READY) if k is not None]   # fire class -> the self column that allows it
 NONACT = ("vl.", "aux.")                              # parameter prefixes acting never uses (skipped by fast_act / act_stacked)
 AUX_SLOTS = 9                                         # fut head: the enemy block (ent 0-8)
 AUX_REL = {"fut": 1.0, "hit": 0.5, "gas": 0.5, "bush": 0.5}   # relative aux loss weights (behaviour design 5; x --aux-w)
@@ -143,6 +155,10 @@ class Policy(nn.Module):
             self.aux = nn.ModuleDict({"fut": mlp(d + HID + F55, 2), "hit": mlp(d + HID, 1), "gas": mlp(d + HID, 1), "bush": mlp(d + HID, 8)})
             nn.init.zeros_(self.aux["fut"][2].weight); nn.init.zeros_(self.aux["fut"][2].bias)
             with torch.no_grad(): _widen(self.aux["fut"][0], O.F_ENT_V55)
+        with torch.random.fork_rng(devices=[]):          # v5.7 extra fire classes: zero-init, no draw from the acting stream;
+            self.fire_x = nn.Linear(d + HID, N_FX)       # registered last = the tail of the main Adam's parameter list
+        nn.init.zeros_(self.fire_x.weight); nn.init.zeros_(self.fire_x.bias)
+        with torch.no_grad(): self.vec[0].weight[:, _GADGET] = 0   # the gadget-ready input (self 3, always 0 before v5.7) starts unused
 
     def add_heroes(self, stats):
         """put each (13,) stats row not in the table yet into the next free row (order-stable across resumes) -> count"""
@@ -160,9 +176,14 @@ class Policy(nn.Module):
         """old checkpoints: grown inputs zero-padded in place (pad_param: the entity input weights by the lead columns,
         the area-effect columns (v5.3) and the identity / line-of-sight columns (v5.6), between the observation's row and
         the lead columns; s / cond / intent at the tail) = same outputs; no hemb -> zeros (a reused league slot must not
-        keep the previous snapshot's rows; the hero table may stay)"""
+        keep the previous snapshot's rows; the hero table may stay); no fire_x (before v5.7) -> zeros (the new classes
+        start at logit 0, masked until ready), fewer fire_x rows -> zero-padded, and its vec.0 column of the gadget-ready
+        input zeroed: self 3 was always 0, so those weights are still their random init"""
         own = self.state_dict(); sd = dict(sd)
-        if "hemb.weight" not in sd: sd["hemb.weight"] = torch.zeros_like(own["hemb.weight"])
+        if "fire_x.weight" not in sd and "vec.0.weight" in sd:
+            sd["vec.0.weight"] = sd["vec.0.weight"].clone(); sd["vec.0.weight"][:, _GADGET] = 0
+        for k in ("hemb.weight", "fire_x.weight", "fire_x.bias"):
+            if k not in sd: sd[k] = torch.zeros_like(own[k])
         for k, v in sd.items():
             if k in own: sd[k] = pad_param(k, v, own[k])
         return super().load_state_dict(sd, strict=strict, **kw)
@@ -177,7 +198,7 @@ class Policy(nn.Module):
     def heads(self, x, ent, s, priv=None):
         """x = cat[trunk, gru]. The aim head is nirkt's PointerAim: a bump at every target's angle (+ a learned lead of
         up to 25 degrees, learned width) mixed with a free 360-bin component; log-probabilities."""
-        mv, fi, di = torch.split(self.pi(x), [17, 3, 8], -1)
+        mv, fi, di = torch.split(self.pi(x), [17, 3, 8], -1); fi = torch.cat([fi, self.fire_x(x)], -1)
         c = ent[:, _CAND]; c = torch.cat([c, lead(c, s)], -1); B, K, _ = c.shape
         here = (c[..., 0] > 0.5) & (c[..., _FOE].sum(-1) > 0.5)
         o = self.cand(torch.cat([x[:, None].expand(B, K, x.shape[-1]), c], -1))
@@ -193,7 +214,7 @@ class Policy(nn.Module):
     def forward(self, s, ent, grid, h, priv=None):
         x = self.encode(s, ent, grid); h = self.gru(x, h)
         (mv, fi, ai, di), v = self.heads(torch.cat([x, h], -1), ent, s, priv)
-        return (mv, mask_super(fi, s), ai, di), v, h
+        return (mv, mask_fire(fi, s), ai, di), v, h
 
     def seq(self, s, ent, grid, h, priv=None, feats=False):
         """feats: also return xc = cat[x, h] (N * L, d + HID), the input of value_live / the aux heads"""
@@ -203,7 +224,7 @@ class Policy(nn.Module):
             h = self.gru(x[:, t], h); hs.append(h)
         xc = f(torch.cat([x, torch.stack(hs, 1)], -1))
         (mv, fi, ai, di), v = self.heads(xc, f(ent), f(s), None if priv is None else f(priv))
-        return ((mv, mask_super(fi, f(s)), ai, di), v, xc) if feats else ((mv, mask_super(fi, f(s)), ai, di), v)
+        return ((mv, mask_fire(fi, f(s)), ai, di), v, xc) if feats else ((mv, mask_fire(fi, f(s)), ai, di), v)
 
     def value_live(self, xc):
         """(N,) live value from cat[x, h]: no priv, detached input (a probe: its loss reaches only `vl`)"""
@@ -238,10 +259,38 @@ def aux_losses(out, lab):
     return sum(AUX_REL[k] * v for k, v in L.items()), L
 
 
-def mask_super(fi, s):
-    """fire head (none, attack, super): super only while obs_v5 self[2] (super ready) is set; s = the self (+ cond) rows.
-    HISTORY 77: 12 % of decisions pressed an uncharged super (live that blocks the fire finger 150 ms)"""
-    return fi.masked_fill((s[..., 2] < 0.5)[..., None] & (torch.arange(fi.shape[-1], device=fi.device) == 2), -1e9)
+def mask_fire(fi, s):
+    """fire head (obs_v5.FIRE): a class with a FIRE_READY column only while that self column is set (super: self 2, super
+    ready; gadget: self 3, gadget ready); s = the self (+ cond + intent) rows. HISTORY 77: 12 % of decisions pressed an
+    uncharged super (live that blocks the fire finger 150 ms). Works on a 3-class head too (classes past its width are
+    skipped)."""
+    cls = torch.arange(fi.shape[-1], device=fi.device)
+    for c, k in _GATE:
+        if c < fi.shape[-1]: fi = fi.masked_fill((s[..., k] < 0.5)[..., None] & (cls == c), -1e9)
+    return fi
+
+
+def aim_mask(fire):
+    """(...,) fire class -> 1.0 where the aim head counts (obs_v5.FIRE_AIM)"""
+    return torch.as_tensor(O.FIRE_AIM, dtype=torch.float32, device=fire.device)[fire]
+
+
+def dist_logp_ent(logits, actions=None, masks=None):
+    """categorical heads (move, fire, aim, distance) -> (log-prob of actions, entropy, sampled actions): nirkt's
+    models4.dist_logp_ent for the obs_v5.FIRE classes (models4 masks only a 3-class fire head): the aim head counts when
+    the fire class aims (FIRE_AIM) and the distance head only for a super (their values do nothing otherwise). Same draws
+    and, for fire < 3, the same values as models4's. masks: unused (as in models4)."""
+    lps, ents, samples = [], [], []
+    for i, lg in enumerate(logits):
+        d = torch.distributions.Categorical(logits=lg)
+        a = d.sample() if actions is None else actions[:, i]
+        samples.append(a); lps.append(d.log_prob(a)); ents.append(d.entropy())
+    lp, en = torch.stack(lps, -1), torch.stack(ents, -1)
+    if len(logits) == 4:
+        fire = samples[1]; one = torch.ones_like(fire, dtype=lp.dtype)
+        m = torch.stack([one, one, aim_mask(fire).to(lp.dtype), (fire == _SUPER).to(lp.dtype)], -1)
+        lp, en = lp * m, en * m
+    return lp.sum(-1), en.sum(-1), torch.stack(samples, -1)
 
 
 class _Act(nn.Module):
@@ -254,7 +303,7 @@ class _Act(nn.Module):
         ir, iz, i_n = F.linear(x, g.weight_ih, g.bias_ih).chunk(3, -1); hr, hz, h_n = F.linear(h, g.weight_hh, g.bias_hh).chunk(3, -1)
         r, z = torch.sigmoid(ir + hr), torch.sigmoid(iz + hz); h = (1 - z) * torch.tanh(i_n + r * h_n) + z * h
         (mv, fi, ai, di), v = p.heads(torch.cat([x, h], -1), ent, s, priv)
-        return (mv, mask_super(fi, s), ai, di), v, h
+        return (mv, mask_fire(fi, s), ai, di), v, h
 
 
 _ACT_META = None
@@ -284,13 +333,14 @@ def act_stacked(nets, xs):
 
 
 def masked_kl(ref, new):
-    """KL(ref || new) of the factored policy: move + fire + P_ref(fire > 0) aim + P_ref(super) distance (nirkt F1.4)"""
+    """KL(ref || new) of the factored policy: move + fire + P_ref(an aiming fire class) aim + P_ref(super) distance
+    (nirkt F1.4; aiming classes = obs_v5.FIRE_AIM)"""
     kl = []
     for a, b in zip(ref, new):
         pa, pb = torch.log_softmax(a.float(), -1), torch.log_softmax(b.float(), -1)
         kl.append((pa.exp() * (pa - pb)).sum(-1))
-    pf = torch.softmax(ref[1].float(), -1)
-    return kl[0] + kl[1] + (1 - pf[:, 0]) * kl[2] + pf[:, 2] * kl[3]
+    pf = torch.softmax(ref[1].float(), -1); aim = torch.as_tensor(O.FIRE_AIM[:pf.shape[-1]], dtype=pf.dtype, device=pf.device)
+    return kl[0] + kl[1] + (pf * aim).sum(-1) * kl[2] + pf[:, _SUPER] * kl[3]
 
 
 def _check():
@@ -403,6 +453,7 @@ def _check_stage2():
     assert max((x - y).abs().max().item() for x, y in zip(ref, b.seq(s, ent, grid, h0)[0])) > 1e-3   # the embedding is used
     _check_v55(ent, grid, h0)
     _check_v56(ent, grid, h0)
+    _check_fire()
 
 
 def _check_v55(ent, grid, h0):
@@ -459,6 +510,50 @@ def _check_v56(ent, grid, h0):
     assert torch.equal(pm[:, :pre + O.F_ENT_V55], m[:, :pre + O.F_ENT_V55]) and torch.equal(pm[:, -N_LEAD:], m[:, -N_LEAD:]) and not pm[:, pre + O.F_ENT_V55:pre + O.F_ENT].any()
     v = torch.randn(128, O.S_INT); pv = pad_param("vec.0.weight", v, b.vec[0].weight)       # tail inputs: the generic pad
     assert torch.equal(pv[:, :O.S_INT], v) and not pv[:, O.S_INT:].any()
+
+
+
+def _check_fire():
+    """v5.7 fire head: the gadget class is masked while self 3 is off; a v5.6 checkpoint (no fire_x) acts exactly as
+    before with self 3 off and can learn the gadget once it is ready; log-prob masking (aim for the gadget, distance only
+    for a super) and the masked KL; fire_x is the tail of the acting parameters"""
+    torch.manual_seed(2); N, L, G_ = 3, 4, O.FIRE.index("gadget")
+    s = torch.randn(N, L, O.N_S); s[..., 2] = 1.0; s[..., 3] = 0.0                          # super ready, gadget not
+    ent = torch.zeros(N, L, O.N_ENT, O.F_ENT); ent[..., 0, 0] = 1; ent[..., 0, 1 + O.ENT.index("enemy")] = 1; ent[..., 0, O.XY] = 0.3
+    grid = torch.randint(0, O.UNKNOWN + 1, (N, L, O.G, O.G), dtype=torch.uint8); h0 = torch.zeros(N, HID)
+    assert list(acting_params(Policy()))[-2:] == ["fire_x.weight", "fire_x.bias"] and not Policy().vec[0].weight[:, _GADGET].any()
+    a = Policy(); nn.init.normal_(a.pi.weight, std=0.1)
+    with torch.no_grad(): a.vec[0].weight[:, _GADGET].normal_(0, 1.0)                     # as an old run left it (never trained)
+    lg = a.seq(s, ent, grid, h0)[0]
+    assert lg[1].shape[-1] == N_FIRE == 4 and (lg[1][:, G_] < -1e8).all(), lg[1][:2]
+    old = {k: v for k, v in a.state_dict().items() if not k.startswith("fire_x")}          # a v5.6 checkpoint
+    b = Policy(); nn.init.normal_(b.fire_x.weight, std=1.0); b.load_state_dict(old)       # strict: fire_x filled with zeros
+    assert b.fire_x.weight.abs().max() == 0 and b.fire_x.bias.abs().max() == 0 and not b.vec[0].weight[:, _GADGET].any()
+    got = b.seq(s, ent, grid, h0)[0]
+    assert all(torch.equal(x, y) for x, y in zip(lg, got))
+    p3 = torch.softmax(lg[1][:, :3], -1)                                                  # = the 3-class head's distribution
+    assert torch.allclose(torch.softmax(got[1], -1)[:, :3], p3, atol=1e-6) and torch.softmax(got[1], -1)[:, G_].max() < 1e-30
+    s2 = s.clone(); s2[..., 3] = 1.0                                                     # gadget ready: the old heads unchanged,
+    g2 = b.seq(s2, ent, grid, h0)[0]; fg = g2[1]                                          # the gadget at logit 0
+    assert torch.equal(fg[:, :3], got[1][:, :3]) and (fg[:, G_] == 0).all() and all(torch.equal(x, y) for x, y in zip(g2[::2], got[::2]))
+    s3 = s2.clone(); s3[..., 2] = 0.0                                                    # super not ready: only super masked
+    f3 = b.seq(s3, ent, grid, h0)[0][1]; assert (f3[:, _SUPER] < -1e8).all() and (f3[:, G_] == 0).all()
+    acts = torch.tensor([[1, 0, 10, 5], [1, 1, 10, 5], [1, 2, 10, 5], [1, G_, 10, 5]]).repeat(N * L // 4, 1)
+    lgs = [x[:len(acts)] for x in b.seq(s2, ent, grid, h0)[0]]
+    lp, en, _ = dist_logp_ent(lgs, acts)
+    ls = [torch.log_softmax(x, -1).gather(-1, acts[:, i:i + 1])[:, 0] for i, x in enumerate(lgs)]
+    want = ls[0] + ls[1] + (acts[:, 1] > 0) * ls[2] + (acts[:, 1] == _SUPER) * ls[3]   # gadget: aim yes, distance no
+    assert torch.allclose(lp, want, atol=1e-5), (lp, want)
+    import models4                                                                       # nirkt's, on the 3-class head
+    l3 = [lgs[0], lgs[1][:, :3], lgs[2], lgs[3]]; a3 = acts.clone(); a3[a3[:, 1] == G_, 1] = 1
+    assert all(torch.allclose(x, y) for x, y in zip(dist_logp_ent(l3, a3)[:2], models4.dist_logp_ent(l3, a3)[:2]))
+    torch.manual_seed(7); x1 = dist_logp_ent(l3); torch.manual_seed(7); x2 = models4.dist_logp_ent(l3)   # same draws
+    assert all(torch.equal(x, y) for x, y in zip(x1, x2))
+    assert masked_kl(lgs, lgs).abs().max() < 1e-5 and torch.isfinite(masked_kl(lgs, [x.flip(0) for x in lgs])).all()
+    l4 = [lgs[0], torch.cat([lgs[1][:, :3], torch.full_like(lgs[1][:, :1], -1e9)], -1), lgs[2], lgs[3]]   # gadget masked:
+    l3n = [x.flip(0) for x in l3]; l4n = [l3n[0], torch.cat([l3n[1], l4[1][:, 3:]], -1), l3n[2], l3n[3]]  # = the 3-class KL
+    pf = torch.softmax(l3[1].float(), -1); kl = [(torch.softmax(a_, -1) * (torch.log_softmax(a_, -1) - torch.log_softmax(b_, -1))).sum(-1) for a_, b_ in zip(l3, l3n)]
+    assert torch.allclose(masked_kl(l4, l4n), kl[0] + kl[1] + (1 - pf[:, 0]) * kl[2] + pf[:, 2] * kl[3], atol=1e-5)
 
 
 if __name__ == "__main__":

@@ -11,6 +11,9 @@
 The observations carry the identity columns (who = env_v5.Env.last_who, recorded per poll; obs v5.6).
 Intents are on (--intent-scale, default 0.25; p_steer / p_rand_intent 1): the policy input s carries real intent blocks
 (env_v5.Env.intents, shared by both paths), so the intent columns of s go through both actors too.
+Gadget (obs v5.7): self 3 = env_v5.Env.gadget OR a random --gadget-p share of the rows (recorded per poll; the host
+implements no gadget kind yet, so Env.gadget alone is all 0), so the gadget class (fire_x) is sampled by both actors and
+its fire code 3 reaches the host.
 """
 import argparse, time
 import numpy as np
@@ -26,6 +29,7 @@ def main():
     ap.add_argument("--ckpt", default="", help="learner checkpoint ('' = a fresh Policy with every input column in use)")
     ap.add_argument("--base", default="", help="league checkpoint ('' = another fresh Policy)"); ap.add_argument("--seed", type=int, default=3)
     ap.add_argument("--intent-scale", type=float, default=0.25, help="intents on (> 0): real intent blocks in s")
+    ap.add_argument("--gadget-p", type=float, default=0.5, help="share of rows with self 3 (gadget ready) set on top of Env.gadget")
     a = ap.parse_args()
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu"); rng_b = np.random.default_rng(a.seed); loc = "Survival604"
     made = []
@@ -37,6 +41,7 @@ def main():
             with torch.no_grad():
                 m.hemb.weight.normal_(0, 0.1); m.ent[0].weight.normal_(0, 0.1); m.vp[2].weight.normal_(0, 0.1); m.vec[0].weight[:, O.S_INT:].normal_(0, 0.1)
                 pre = m.cand[0].weight.shape[1] - O.F_ENT - 2; m.cand[0].weight[:, pre + O.ID0:pre + O.F_ENT].normal_(0, 0.1)   # v5.6 columns
+                m.fire_x.weight.normal_(0, 0.1); m.fire_x.bias.normal_(0, 0.5); m.vec[0].weight[:, 3].normal_(0, 0.1)          # v5.7 gadget
         return m
     nets = [net_of(a.ckpt), None, None, net_of(a.base), net_of(a.base)]    # learner / (eval) / (base) / league slots 0, 1
 
@@ -53,14 +58,16 @@ def main():
     env = E.Env(a.n, battle_fn, ticks=2, fair=True, max_ticks=4000, verbose=True, seed=a.seed, tag="fasteq%d" % a.seed)
     ob_live = FO.FastObsV5(seed=a.seed); actor = FA.StackedActor(dev); hid = {}; z = np.zeros(HID, np.float32)
     rec, dmax, t_priv = [], {"fwd": 0, "fwd_allclose_ratio": 0, "logp": 0, "v": 0, "h": 0}, np.zeros(2); rows = 0; n_int = 0; n_id = 0
+    n_gr = n_ga = 0; g_rng = np.random.default_rng(a.seed + 1)
     try:
         while len(rec) < a.polls:
             obs, ids, tr = env.poll(min_ready=a.n, max_wait=0.004)
             for (aid, rew, done, t, rank) in tr:
                 if done: hid.pop(aid, None)
             if not len(ids): env.send([], []); continue
-            rec.append((obs["vec"].copy(), obs["grid"].copy(), env.last_meta.copy(), ids.copy(), env.last_who.copy()))
-            o = ob_live.build(obs["vec"], obs["grid"], env.last_meta, ids, who=env.last_who)
+            gd = np.maximum(env.gadget(ids), g_rng.random(len(ids)) < a.gadget_p).astype(np.float32)
+            rec.append((obs["vec"].copy(), obs["grid"].copy(), env.last_meta.copy(), ids.copy(), env.last_who.copy(), gd))
+            o = ob_live.build(obs["vec"], obs["grid"], env.last_meta, ids, who=env.last_who, gadget=gd)
             tq = time.perf_counter(); p0 = priv(env, ids); t1 = time.perf_counter(); p1 = FO.priv_fast(env, ids); t2 = time.perf_counter()
             assert np.array_equal(p0, p1), "priv"
             t_priv += [t1 - tq, t2 - t1]
@@ -70,6 +77,8 @@ def main():
             d = FA.compare(nets, gidx, s, o["ent"], o["grid"], h, p1, actor)
             dmax = {k: max(dmax[k], d[k]) for k in d}
             A, lp, v, h2 = actor(nets, gidx, s, o["ent"], o["grid"], h, p1); rows += len(ids)
+            gad = A[:, 1] == O.FIRE.index("gadget"); n_ga += int(gad.sum()); n_gr += int((s[:, 3] > 0.5).sum())
+            assert not (gad & (s[:, 3] < 0.5)).any(), "gadget sampled while self 3 is off"
             for x, hh in zip(ids, h2): hid[int(x)] = hh
             env.send(ids, A)
     finally:
@@ -82,14 +91,16 @@ def main():
     print("intents: %d of %d rows had an active intent; ended episodes' counts [started, achieved, timeout, invalid] %s" % (n_int, rows, cnt))
     assert not a.intent_scale or n_int > 0
     print("identity (obs v5.6): %d entity rows with a known brawler (Env.last_who + the identity noise)" % n_id); assert n_id > 0
+    print("gadget (obs v5.7): %d rows with self 3 set, %d gadget actions sent (none while self 3 was off)" % (n_gr, n_ga))
+    assert not a.gadget_p or n_ga > 0
     print("priv == priv_fast on every poll; per poll %.3f ms -> %.3f ms" % tuple(t_priv / len(rec) * 1e3))
     # observations on the recorded polls: same seed, bit-equal; timing
     res = {}
     for name, ob in (("ObsV5", O.ObsV5(seed=11)), ("FastObsV5", FO.FastObsV5(seed=11))):
         outs, t = [], 0.0
-        for vec, grid, meta, ids, who in rec:
+        for vec, grid, meta, ids, who, gd in rec:
             x = (vec.copy(), grid.copy(), meta.copy(), ids)
-            tq = time.perf_counter(); outs.append(ob.build(*x, who=who)); t += time.perf_counter() - tq
+            tq = time.perf_counter(); outs.append(ob.build(*x, who=who, gadget=gd)); t += time.perf_counter() - tq
         res[name] = (outs, t / len(rec) * 1e3)
     bad = [i for i, (x, y) in enumerate(zip(res["ObsV5"][0], res["FastObsV5"][0])) if not FO.same(x, y)]
     print("observations: %d recorded polls, %d differ (bit-equality); build per poll ObsV5 %.2f ms -> FastObsV5 %.2f ms (mean B %.1f)"

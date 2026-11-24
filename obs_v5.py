@@ -4,7 +4,7 @@
     python -m obs_v5 --live     # + 1 instance, 300 decisions: real MAEnv observations through the builder
 
     ob = ObsV5()                                     # one per MAEnv
-    o = ob.build(obs["vec"], obs["grid"], env.last_meta, ids, who=env.last_who)
+    o = ob.build(obs["vec"], obs["grid"], env.last_meta, ids, who=env.last_who, gadget=env.gadget(ids))   # gadget: optional
     o["self"] (B, 8)   hp fraction, ammo 0-1, super / gadget / hypercharge ready, in bush, own velocity x, y
     o["ent"]  (B, 39, 36)  present | class one-hot (ENT) | dx, dy (10 tiles, x right / y down) | vx, vy (tiles/tick) | hp fraction
                        | area effects: radius (10 tiles), harms me, helps me, slows me (0 for every other class)
@@ -34,8 +34,12 @@ grid the policy gets (seg / HUD / bleed noise included; UNKNOWN blocks nothing);
 Area effects (item rows with feature 4 != 0): radius and kind come from the game's tables through the data id (_area_lut:
 area_effects_skin -> area_effects_logic Radius / Type / Damage / status effects; a bomb item through its TriggerAreaEffect),
 relative to the observer: an enemy (or neutral bomb) area harms / slows me, an area of my team helps me.
-shortcut: the host dumps no gadget state (self 3 stays 0), and faded_bush / power_box tiles are render states the tile map
-does not have; add them to snap2 / encode.c when the policy needs them.
+Gadget (v5.7, issue #3): self 3 = the gadget can be used now (a use left, no cooldown), passed in as `gadget` (B,) from
+the host's gadget state (env_v5.Env.gadget; 0 = no gadget, a host that publishes none, or a gadget kind the host cannot
+activate yet). The fire head has the classes FIRE; a class with a FIRE_READY column is only allowed while that self column
+is set (model.mask_fire), so with self 3 = 0 a policy acts exactly as before the gadget class existed.
+shortcut: faded_bush / power_box tiles are render states the tile map does not have; add them to snap2 / encode.c when
+the policy needs them.
 shortcut: an area effect's radius is its table Radius (no ExpandOnDistance growth), and DontShowToEnemy areas stay visible.
 shortcut: no box size (the sim has none; a per-class constant adds nothing to the one-hot); add with the agent adapter.
 """
@@ -53,8 +57,12 @@ ENT = ("enemy", "teammate", "enemy_summon", "teammate_summon", "power_box", "pow
 SLIDERS = ("bush_camp", "collect", "protect", "retreat", "kite", "peek", "focus", "aggressive", "third_party", "bush_control",
            "leash", "gas_safe")
 # v5.3: + 4 area-effect columns (RAD, HARM, HELP, SLOW) at the end of each entity row; v5.4: slider 7 push -> aggressive,
-# + sliders leash / gas_safe at the end of cond (COND_SLIDERS); v5.5: + the intent block (N_INT) at the end of s
-OBS_VERSION = "v5.6"
+# + sliders leash / gas_safe at the end of cond (COND_SLIDERS); v5.5: + the intent block (N_INT) at the end of s;
+# v5.7: the fire head gained "gadget" (a 4th class, gated by self 3; no input shape change)
+OBS_VERSION = "v5.7"
+FIRE = ("none", "attack", "super", "gadget")     # fire head classes = NbeAction.fire codes 0-3 (host env.c apply_actions)
+FIRE_READY = (None, None, 2, 3)                  # self column that must be >= 0.5 for the class to be allowed (model.mask_fire)
+FIRE_AIM = (False, True, True, True)             # the aim head counts for the class (the host takes the gadget's aim as its direction)
 # per-second goals (intent.py, behaviour design 4): block = one-hot of kinds 1..7 (none = all zeros) | dx, dy (10-tile
 # units, clip +-2.5) | radius / 10 tiles | time left 1 -> 0. s = cat[self, cond, intent]: at the tail, so an older
 # checkpoint's vec.0 zero-pads those columns and free play (none) is exactly its input; v5.6: + identity (14) and line of
@@ -186,13 +194,15 @@ def area_feats(code, side):
     return f
 
 
-def from_state2(vec, grid, meta, who=None, derived=True):
+def from_state2(vec, grid, meta, who=None, derived=True, gadget=None):
     """fair state2 vec (B, 436), grid (B, 6, 25, 25), meta (B, 5) = x, y, tick, W, H (MAEnv.last_meta), who (B, N_ENT, 3)
-    (module doc; None = identities unknown) -> clean obs (every row with an owner known). derived=False: identity and
-    line-of-sight columns left 0 (the noisy build computes them itself)"""
+    (module doc; None = identities unknown), gadget (B,) the gadget can be used now (env_v5.Env.gadget; None = 0) -> clean
+    obs (every row with an owner known). derived=False: identity and line-of-sight columns left 0 (the noisy build
+    computes them itself)"""
     B = len(vec)
     s = np.zeros((B, N_SELF), np.float32)
     s[:, 0] = vec[:, 0]; s[:, 1] = np.minimum(vec[:, 2], 1.0); s[:, 2] = vec[:, 5] >= 1.0; s[:, 5] = vec[:, 8]
+    if gadget is not None: s[:, 3] = np.asarray(gadget, np.float32).reshape(B) >= 0.5
     s[:, 4] = vec[:, 18] >= 1.0
     s[:, 6:8] = vec[:, 12:14] * (40 / 300)
     ent = np.zeros((B, N_ENT, F_ENT), np.float32)
@@ -336,12 +346,13 @@ class ObsV5:
                 for k in list(self.ep)[:2048]: del self.ep[k]
         return e
 
-    def build(self, vec, grid, meta, ids, cmd=None, who=None):
+    def build(self, vec, grid, meta, ids, cmd=None, who=None, gadget=None):
         """cmd (B, 2) tiles / tick (sim_plan A2, train_fast --cmd-vel): own velocity = the commanded move, as the agent gets
         it live (BSRL brain / play_live: move direction x brawler speed); entity velocities then carry the same error
         (live: matched position difference + commanded own velocity). Noisy path only. who (B, N_ENT, 3): the rows'
-        owners (env_v5.Env.last_who; module doc), None = every identity unknown."""
-        o = from_state2(vec, grid, meta, who, derived=self.noise is None or not len(ids))
+        owners (env_v5.Env.last_who; module doc), None = every identity unknown. gadget (B,): from_state2's (self 3; like
+        the rest of self it reaches the policy with the episode's latency)."""
+        o = from_state2(vec, grid, meta, who, derived=self.noise is None or not len(ids), gadget=gadget)
         if self.noise is None or not len(ids):
             return o
         r, B = self.rng, len(ids)
@@ -505,6 +516,10 @@ def _check():
     o = from_state2(vec, grid, meta)
     assert o["self"].shape == (2, N_SELF) and o["ent"].shape == (2, N_ENT, F_ENT) and o["grid"].shape == (2, G, G)
     assert np.allclose(o["self"][0], [0.5, 2 / 3, 1, 0, 1, 0, 40 / 300, 0])
+    og = from_state2(vec, grid, meta, gadget=np.array([1, 0]))   # self 3 = gadget ready, nothing else changes
+    assert og["self"][0, 3] == 1 and og["self"][1, 3] == 0 and np.array_equal(np.delete(og["self"], 3, 1), np.delete(o["self"], 3, 1))
+    assert all(np.array_equal(og[k], o[k]) for k in ("ent", "grid"))
+    assert len(FIRE) == len(FIRE_READY) == len(FIRE_AIM) and FIRE[:3] == ("none", "attack", "super") and FIRE_READY[3] == 3
     e = o["ent"][0]; cls = lambda k: ENT[int(e[k, 1:1 + len(ENT)].argmax())]
     got = [(k, cls(k)) for k in np.nonzero(e[:, 0])[0]]
     assert got == [(0, "enemy"), (1, "teammate"), (2, "enemy_summon"), (3, "teammate_summon"), (9, "teammate_projectile"),
@@ -587,7 +602,7 @@ def _check():
     assert pv.shape == (len(PRESETS), len(SLIDERS)) and pv.min() >= 0 and pv.max() <= 2 and (preset_vec("balanced") == 1).all()
     assert preset_vec("bush_camper")[SLIDERS.index("bush_camp")] == 2 and len({tuple(r) for r in pv}) == len(PRESETS)
     assert N_INT == 11 and len(INTENTS) == 8 and INTENTS[0] == "none" and N_S == N_SELF + N_COND + N_INT == 49 and S_INT == 38
-    assert (I_XY, I_RAD, I_LEFT) == (7, 9, 10) and OBS_VERSION == "v5.6"
+    assert (I_XY, I_RAD, I_LEFT) == (7, 9, 10) and OBS_VERSION == "v5.7"
     assert (F_ENT_V55, ID0, ID_KNOWN, LOS, F_ENT) == (20, 20, 33, 34, 36)
     _check_id(vec, grid, meta)
     print("obs_v5 ok (%s): %d brawlers, %d thrown, %d melee, cond %d, intent %d, s %d, ent %dx%d" % (

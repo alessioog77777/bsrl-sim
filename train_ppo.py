@@ -56,6 +56,11 @@
   [started, achieved, timeout, invalid]}, intent_follow (achieved / started) and with the planner plan_rules {rule:
   [picked, started, preempted]} over the recent episodes; replay frames carry "i" (the active intent: kind, target dx /
   dy, radius, time left, "y" its reason) or "iy" (the planner's reason for none).
+* Gadgets (--gadgets 1, default 0 = off; obs v5.7, issue #3): every battle but the hard scenarios gives each player one
+  of its brawler's gadget cards (env_v5.with_gadgets, drawn from MAEnv's rng: rng_b's draws stay the same) and the
+  observation's self 3 = env_v5.Env.gadget (the host's gadget state: usable now); the fire head's gadget class
+  (model.mask_fire) is allowed only then. Off: self 3 = 0, the class stays masked. fire_hist has one bin per
+  obs_v5.FIRE class.
 shortcut: no exploiters (a second learner trained only to beat this one); add them if b_rank flattens again with PFSP.
 """
 import argparse, glob, json, os, shutil, signal, sys, time
@@ -324,14 +329,36 @@ def head_flags(ap):
     ap.add_argument("--aux-w", type=float, default=0.0, help="weight of the aux head losses (model.Policy.aux; 0 = off: no loss, no gradient; start 0.1)")
 
 
+def _opt_tail(opt, sd):
+    """an optimizer state saved before parameters were appended to its groups (obs v5.7: model.Policy.fire_x is the tail
+    of the acting parameters) -> the state with fresh ids for the new tail parameters (no moments: Adam starts them
+    fresh); None if the groups do not match that way (fewer groups, fewer parameters now, or a moment that does not fit
+    its parameter's shape)"""
+    gs, cur = sd["param_groups"], opt.param_groups
+    if len(gs) != len(cur) or any(len(g["params"]) > len(c["params"]) for g, c in zip(gs, cur)): return None
+    for g, c in zip(gs, cur):
+        for i, p in zip(g["params"], c["params"]):
+            for v in sd["state"].get(i, {}).values():
+                if torch.is_tensor(v) and v.dim() == p.dim() and not all(a <= b for a, b in zip(v.shape, p.shape)): return None
+    nxt = 1 + max([i for g in gs for i in g["params"]], default=-1); groups = []
+    for g, c in zip(gs, cur):
+        n = len(c["params"]) - len(g["params"]); groups.append({**g, "params": list(g["params"]) + list(range(nxt, nxt + n))}); nxt += n
+    return {"state": sd["state"], "param_groups": groups}
+
+
 def load_opt(opt, sd, what="optimizer state", net=None):
     """an optimizer state from a checkpoint; moments of a parameter that grew since (new input columns, zero-padded by
     model.load_state_dict) are padded the same way (model.pad_param by the parameter's name in net: the entity inputs
     get their new columns before the lead columns; without net, or a tail input: zeros at the end; torch loads them
-    unchecked and the first step would fail); a different parameter set -> the fresh Adam is kept (printed)"""
+    unchecked and the first step would fail); parameters appended since (model.Policy.fire_x, v5.7) start with fresh
+    moments (_opt_tail); any other change of the parameter set -> the fresh Adam is kept (printed)"""
     if not sd: return
     try: opt.load_state_dict(sd)
-    except ValueError: print("%s not loaded (parameters changed): fresh Adam" % what, flush=True); return
+    except ValueError:
+        t = _opt_tail(opt, sd)
+        if t is None: print("%s not loaded (parameters changed): fresh Adam" % what, flush=True); return
+        opt.load_state_dict(t); print("%s loaded; %d parameters added since start fresh" % (what, sum(
+            len(c["params"]) - len(g["params"]) for g, c in zip(sd["param_groups"], opt.param_groups))), flush=True)
     from model import pad_param
     name = {id(p): k for k, p in net.named_parameters()} if net is not None else {}
     for g in opt.param_groups:
@@ -540,6 +567,16 @@ def _check():
     o3 = torch.optim.Adam([c_, n_.cand[0].bias]); load_opt(o3, o_.state_dict(), net=n_); m3, m0 = o3.state[c_]["exp_avg"], o_.state[a_.weight]["exp_avg"]
     assert m3.shape == c_.shape and torch.equal(m3[:, :pre + O.F_ENT_V55], m0[:, :pre + O.F_ENT_V55]) and torch.equal(m3[:, -2:], m0[:, -2:])
     assert not m3[:, pre + O.F_ENT_V55:pre + O.F_ENT].any() and M.ENT_IN[1] == "cand.0.weight"
+    torch.manual_seed(3); n6 = P_(); p6, _ = split_params(n6); old6 = [p for k, p in n6.named_parameters() if p in set(p6) and not k.startswith("fire_x")]
+    o6 = torch.optim.Adam(old6); sum(x.float().sum() for x in old6).backward(); o6.step()           # a v5.6 run's Adam (no fire_x)
+    sd6 = o6.state_dict(); sd6["state"][0]["exp_avg"] = sd6["state"][0]["exp_avg"][:, :5]            # + an input that grew since
+    n7 = P_(); p7, _ = split_params(n7); o7 = torch.optim.Adam(p7); load_opt(o7, sd6, net=n7)        # v5.7: fire_x at the tail
+    assert len(p7) == len(old6) + 2 and [k for k, p in n7.named_parameters() if p is p7[-1]] == ["fire_x.bias"]
+    assert all(torch.equal(o7.state[a]["exp_avg_sq"], o6.state[b]["exp_avg_sq"]) for a, b in zip(p7[1:-2], old6[1:]))
+    assert o7.state[p7[0]]["exp_avg"].shape == p7[0].shape and not o7.state[p7[-1]] and not o7.state[p7[-2]]
+    sum(x.float().sum() for x in p7).backward(); o7.step(); assert o7.state[p7[-1]]["step"] == 1 and o7.state[p7[0]]["step"] == 2
+    o8 = torch.optim.Adam(p7[:-3]); load_opt(o8, sd6)                                                  # fewer parameters: fresh
+    assert not o8.state
     import intent as I                                   # replay frame "i", progress intent fields
     o = {"intent": I.encode([0, 5], [0, 3.0], [0, -1.0], [0, 1.0], [0, 0.5])}
     x = np.zeros(O.F_ENT, np.float32); assert id_name(x) == []
@@ -594,6 +631,7 @@ def main():
     ap.add_argument("--eval-n", type=int, default=99, help="instances that play the evals (the rest keep training; fewer than --n was slower overall, see README)")
     ap.add_argument("--opp-slots", type=int, default=3); ap.add_argument("--opp-hold", type=int, default=2)
     ap.add_argument("--pfsp-p", type=float, default=2.0)
+    ap.add_argument("--gadgets", type=int, default=0, help="1 = players carry a gadget, the policy sees it ready (self 3) and may use it (obs v5.7, issue #3; needs a host that activates its kind)")
     a = ap.parse_args()
     if a.smoke: a.n, a.rollout, a.chunks, a.bc_updates, a.eval_episodes, a.evalb_episodes, a.hours, a.scenario_seeds = 2, 2048, 64, 1, 4, 4, 0.2, 1
     torch.manual_seed(a.seed); np.random.seed(a.seed)
@@ -630,6 +668,10 @@ def main():
     bc = lambda: upd < a.bc_updates
 
     def battle_fn(rng, i):
+        cfg = battle_cfg(rng, i)                         # --gadgets: MAEnv's rng, so rng_b's draws stay the same
+        return E.with_gadgets(cfg, rng) if a.gadgets and "scenario" not in cfg else cfg   # scenarios: as set up
+
+    def battle_cfg(rng, i):
         tag = {"loc": loc, "chr": [a.brawler] * 10, "team_size": 1, "groups": [0] * 10}
         cfg = {"div": D.make_div(location=loc, chr=tag["chr"]), "tag": tag, "end": "agents"}
         if eval_queue and not bc() and i >= a.n - a.eval_n:
@@ -707,7 +749,7 @@ def main():
                 for aid in env.dropped: pending.pop(aid, None); hid.pop(aid, None)
                 env.dropped = []
                 if not len(ids): continue
-                tq = time.perf_counter(); o = ob.build(obs["vec"], obs["grid"], env.last_meta, ids, who=env.last_who); tm[1] += time.perf_counter() - tq
+                tq = time.perf_counter(); o = ob.build(obs["vec"], obs["grid"], env.last_meta, ids, who=env.last_who, gadget=env.gadget(ids) if a.gadgets else None); tm[1] += time.perf_counter() - tq
                 s = policy_s(env, ids, o); h = np.stack([hid.get(int(x), z) for x in ids])
                 pv = priv(env, ids); B = len(ids); kind = np.array([t["kind"] for t in env.last_tags])
                 isev = np.char.startswith(kind, "eval"); opp = np.array([int(x) & 15 in t.get("opp", ()) for x, t in zip(ids, env.last_tags)], bool)
@@ -824,7 +866,7 @@ def main():
                    "ticks": mean([r["ticks"] for r in ok]), "storm_death": mean([r["storm_death"] for r in ok]),
                    "hit_rate": round(sum(r["terms"]["hits"] for r in recent) / max(1.0, sum(r["terms"]["shots"] for r in recent)), 4),
                    "attack_frac": mean([r["attack_steps"] / max(1, r["steps"]) for r in recent]),
-                   "move_hist": np.bincount(acts[:, 0], minlength=17)[:17].tolist(), "fire_hist": np.bincount(acts[:, 1], minlength=3)[:3].tolist(),
+                   "move_hist": np.bincount(acts[:, 0], minlength=17)[:17].tolist(), "fire_hist": np.bincount(acts[:, 1], minlength=len(O.FIRE))[:len(O.FIRE)].tolist(),
                    "aim_hist": np.bincount(fired[:, 2] // 15, minlength=24)[:24].tolist()}
             for k in sorted({r["tag"]["kind"] for r in ok}): row["rank_" + k] = mean([r["rank"] for r in ok if r["tag"]["kind"] == k])
             row["pfsp"] = {os.path.basename(p)[:-3]: [round(pfr(p), 2), pf.get(os.path.basename(p), [0, 0])[1]] for p in pool}
