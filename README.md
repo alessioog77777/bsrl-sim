@@ -18,34 +18,27 @@ intent (or none = free play), with a readable reason. The intent goes into the o
 
 ```mermaid
 flowchart LR
-    H["Game host<br/>nirkt's sim, many instances"] -->|"observation vec + state dump"| O
-    subgraph O["Observation (OBS v5.7)"]
-        direction TB
-        S["self · 8<br/>hp, ammo, super / gadget ready, bush, velocity"]
-        C["cond · 30<br/>my brawler's stats + 12 play-style sliders"]
-        I["intent · 11<br/>kind, target, radius, time left"]
-        E["entity rows · 64 × 36<br/>class, position, hp, velocity, area radius / kind,<br/>enemy brawler stats + known, wall / water between"]
-        G["grid · 25 × 25<br/>live tiles"]
-    end
-    O -->|"about 1 per second"| PL["Rule planner<br/>12 rules, first match wins<br/>intent + reason"]
-    PL -->|"intent"| I
-    O -->|"10 per second"| P["Policy<br/>encoders → GRU<br/>move · aim · attack · super · gadget"]
-    P --> A["Actions"] -->|"next step"| H
-    P -.->|"training only"| X["critic (true state)<br/>live value head<br/>aux: enemy position in 1 s, hit, gas, bush"]
+    H["Game host"] -->|"obs + state"| O["Observation v5.7<br/>self · cond · intent · 39 entity rows · 25×25 grid"]
+    O -->|"1 / s"| PL["Rule planner"] -->|"intent"| O
+    O -->|"10 / s"| P["Policy (GRU)"] -->|"actions"| H
 ```
+
+Observation parts: self 8 (hp, ammo, super / gadget ready, bush, velocity), cond 30 (own brawler stats + 12 play-style
+sliders + HUD numbers), intent 11, entity rows 39 × 36 (below), grid 25 × 25 live tiles. The policy heads are move,
+aim, fire (attack / super / gadget) and distance; in training a critic also sees the true state and aux heads predict
+it (enemy position in 1 s, hit, gas, bush).
 
 ### Training loop
 
 ```mermaid
 flowchart LR
-    W["Collection workers<br/>(train_fast)"] -->|"rollouts"| B["Buffer"]
-    B --> U["PPO update<br/>+ KL anchor, aux loss"]
-    U -->|"new weights"| W
-    R["Reward<br/>placement, damage, survival<br/>+ slider terms × --slider-scale<br/>+ intent following (i_rew, ≤ 0.15)"] --> B
-    U -->|"frozen copy"| EV["Evals vs native AI<br/>presets · 7 hard scenarios ·<br/>planner vs free play"]
-    EV --> SC["scorecard.py"]
-    U --> V["viz.html dashboard<br/>charts + replays with planner reasons"]
+    W["Workers"] -->|"rollouts"| U["PPO update"] -->|"weights"| W
+    U -->|"frozen copy"| EV["Evals"] --> SC["scorecard.py"]
 ```
+
+Reward: placement, damage, survival, slider terms × `--slider-scale`, intent following (`i_rew`, ≤ 0.15). The update
+adds a KL anchor and the aux loss. Evals play vs the native AI (presets, 7 hard scenarios, planner vs free play);
+`viz.html` shows the curves and replays with planner reasons.
 
 Each training battle splits its agents: some follow planner intents (`--p-plan`), some random valid intents
 (`--p-rand-intent`), the rest play free. Evals and hard scenarios always play with intent none, so their results stay
@@ -53,46 +46,26 @@ comparable across runs.
 
 ### Planner rules, in priority order
 
-```mermaid
-flowchart TD
-    T(["planner tick"]) --> R1{"gas within 2 tiles?"}
-    R1 -- yes --> A1["move out of the gas"]
-    R1 -- no --> R2{"low hp and an enemy<br/>within its reach?"}
-    R2 -- yes --> A2["disengage: bush or away"]
-    R2 -- no --> R3{"known thrower behind a wall?"}
-    R3 -- yes --> A3["engage it or leave its range"]
-    R3 -- no --> R4{"known short-range enemy close,<br/>I outrange it?"}
-    R4 -- yes --> A4["keep my distance"]
-    R4 -- no --> R5{"two enemies fighting nearby?"}
-    R5 -- yes --> A5["third-party the low one or go away"]
-    R5 -- no --> R6{"2 teams left, gas in view?"}
-    R6 -- yes --> A6["hold the gas edge"]
-    R6 -- no --> R7{"mate too far?"}
-    R7 -- yes --> A7["regroup"]
-    R7 -- no --> R8{"weaker enemy, or one in range?"}
-    R8 -- yes --> A8["engage"]
-    R8 -- no --> R9{"cube or safe box?"}
-    R9 -- yes --> A9["farm"]
-    R9 -- no --> R10{"bush camper, no enemy?"}
-    R10 -- yes --> A10["hide in a bush"]
-    R10 -- no --> R11{"map edge in view?"}
-    R11 -- yes --> A11["explore away from it"]
-    R11 -- no --> A12["none: free play"]
-```
+First match wins. Share = planner calls per rule (31,053 calls, 5-minute live check, noisy observations, 0.65 ms per call).
+
+| # | When | Intent | Share |
+|---|---|---|---|
+| 1 | gas within 2 tiles | move out of the gas | 9.8 % |
+| 2 | low hp, an enemy within its reach | disengage: bush or away | 3.0 % |
+| 3 | known thrower behind a wall | engage it or leave its range | 0.1 % |
+| 4 | known short-range enemy close, I outrange it | keep my distance | 0.6 % |
+| 5 | two enemies fighting nearby | third-party the low one or go away | 0.4 % |
+| 6 | 2 teams left, gas in view | hold the gas edge | 10.3 % |
+| 7 | mate too far | regroup | 9.6 % |
+| 8 | weaker enemy, or one in range | engage | 5.4 % |
+| 9 | cube or safe box | farm | 21.4 % |
+| 10 | bush camper, no enemy | hide in a bush | 6.1 % |
+| 11 | map edge in view | explore away from it | 4.1 % |
+| 12 | otherwise | none: free play | 28.9 % |
 
 Thresholds come from the sliders. Rules 3 and 4 need the enemy's brawler and skip enemies that were not identified.
 Example reasons: `Undertaker (melee, range 3) 4 tiles E: keeping my distance W`,
 `hp 30 %, Gunslinger 9 tiles N (reach 11 tiles): disengaging S`. A higher rule can replace a held intent early.
-
-How often each rule fires (31,053 planner calls, 5-minute live check, noisy observations, 0.65 ms per call):
-
-```mermaid
-xychart-beta
-    title "Share of planner calls per rule (%)"
-    x-axis ["none", "farm", "endgame", "gas", "regroup", "hide", "engage", "explore", "low hp", "keep away", "fight", "thrower wall"]
-    y-axis "% of calls" 0 --> 30
-    bar [28.9, 21.4, 10.3, 9.8, 9.6, 6.1, 5.4, 4.1, 3.0, 0.6, 0.4, 0.1]
-```
 
 ### Entity row (36 columns)
 
@@ -121,6 +94,7 @@ xychart-beta
 | `obs_v5.py` | The observation: `self` (8; self 3 = gadget ready, v5.7; self 4 = hypercharge ready, v5.8), `ent` (39 x 36 entity slots; area effects with radius and harms / helps / slows me; enemy / teammate brawler and projectile-owner identity (brawler stats + known flag, per-battle identity noise); wall / water between me and each player), `grid` (25 x 25 tile classes), `cond` (30: brawler stats, 12 slider weights, team size, cubes, players left), the intent block (11: kind one-hot, target offset, radius, time left; all zeros = free play); named slider presets (play-style modes: bush camper, aggressive, cube farmer, ...). Per-episode detector noise, latency and HUD masking. `python -m obs_v5` |
 | `intent.py` | Intents (per-second goals: move to, avoid, hold, engage, farm, regroup, hide): kind specs and end rules, the block encoder, the intent-following reward (signed progress, capped per intent), the random-valid sampler. `env_v5.Env.intents` runs them in battles (trainer `--intent-scale`, default 0 = off). `python -m intent` |
 | `planner.py` | Rule planner: 12 priority rules (gas, low HP, thrower behind a wall, keep away from a short-range enemy, fight / third party, endgame, regroup, engage, farm, hide, explore, none) on what the policy sees, thresholds from the sliders, rules needing the enemy's brawler skip unknown ones; each pick has a readable reason (replay frames, viz). Training rollouts: trainer `--p-plan` (default 0 = off; design 0.5) with preemption of held planner intents; `--eval-plan 1` = eval kind `evalp_plan` (planner vs free play, same seeds). `python -m planner` |
+| `export_policy.py` | Checkpoint -> ONNX policy for the BSRL bot (inputs s / ent / grid / h, fire head masked in the graph, metadata `spec`: obs version, shapes, sliders and presets, trained brawlers, every brawler's display name and stats for live identity) + a `.ref.npz` of torch outputs the bot's test replays. `python -m export_policy CKPT OUT.onnx --trained Sniper`, `--check` |
 | `fast_obs.py`, `fast_act.py` | Batched, vectorised versions of the observation builder and the actor for the multi-process trainer (bit-equal to the reference paths). |
 | `model.py` | Policy: entity set + tile grid + conditioning -> GRU -> move (17) / fire (5: none, attack, super, gadget, hypercharge; each of the last three masked until ready) / aim (360, pointer over targets) / distance heads, critic with a privileged branch; heads that never act: a live value without the privileged input (`--vlive`) and aux predictions of the true state (enemy positions in 1 s, being hit, gas, hidden bush enemies; `--aux-w`). `python -m model` |
 | `train_ppo.py` | Behaviour cloning from the native AI, then PPO with a KL anchor, league / self-play, evals, replays; live value / aux head targets and readouts. `python -m train_ppo --check` |
@@ -169,7 +143,7 @@ What `setup.sh` does, the pinned versions and troubleshooting: **[SETUP.md](SETU
 Self-checks (no battle is booted; `obs_v5` / `env_v5` read the game's data tables, so they need the game files):
 
 ```bash
-python -m obs_v5 && python -m intent && python -m planner && python -m model && python -m fast_obs && python -m env_v5 --check && python -m train_ppo --check && python -m scenarios --check && python -m gadget_check --check && python -m hyper_check --check && python -m charge_check --check && python apply_noise.py --test
+python -m obs_v5 && python -m intent && python -m planner && python -m model && python -m fast_obs && python -m env_v5 --check && python -m train_ppo --check && python -m scenarios --check && python -m gadget_check --check && python -m hyper_check --check && python -m charge_check --check && python -m export_policy --check && python apply_noise.py --test
 ```
 
 Live checks (boot the host; each boot takes about 60-90 s):
