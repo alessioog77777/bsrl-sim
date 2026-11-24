@@ -206,10 +206,12 @@ def live(a):
     print("cube drops: %d falls, %d with the expected count; (held, seen, team size) %s" % (len(DROPS), ok_drop, collections.Counter(DROPS).most_common(10)))
     print("misses (fall, at the end, held, seen):", MISS.most_common(12))
     print("respawn protection flags:", collections.Counter(PROT), "| restarts", env.stats["restarts"])
-    lines = []
+    LS, bad = collections.Counter(), []
+    # one instance at a time: the read starts after each instance's first "battle start" line, so one joined log would
+    # compare an instance's first meteor with the previous instance's last one
     for p, off in logs.items():
-        with open(p, errors="replace") as f: f.seek(off); lines += f.readlines()
-    LS, bad = parse_log(lines)
+        with open(p, errors="replace") as f: f.seek(off); s, b = parse_log(f.readlines())
+        LS.update(s); bad += b
     print("storm and events (host log):", dict(LS), "| rule misses %d" % len(bad), bad[:5])
     assert not bad, "storm / event rule misses"
     assert sum(v for k, v in LS.items() if k.startswith("gas hits")), "no storm hit logged"
