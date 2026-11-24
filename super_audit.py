@@ -10,7 +10,9 @@ players 0-4 shoot in phase A, players 5-9 in phase B; in each phase every shoote
 wide corridor of open tiles in at least two directions, spots >= SPACING apart; A and B use different spots) with one
 enemy target at distance d along a corridor. Per phase: teleport + heal everyone and end spawn protection; the target fires
 one normal attack at the shooter (so a self-heal is visible); fill the shooters' supers; fire the super (fire 2, aim at the
-target, super_dist = d / CastingRange, a charge aims ~1 tile past the target); watch WATCH ticks.
+target, super_dist = d / CastingRange, a charge aims ~1 tile past the target); watch WATCH ticks. A super the player steers
+while it runs (FlyJump, Ww) has its shooter walk towards the target once its CastingTime is over (moves sent while it
+casts are dropped), so its "move" is plain walking.
 Measured per shooter (state2 dump each step, attributed by owner player index): super consumed (charge < half of max),
 damage = target HP lost (or the shooter's NbeResp damage_dealt summed over the watch steps: the host reports it per step), own max displacement (dash / jump / charge; host `leaping` flag), target max
 displacement (pushback / pull), own HP gain (only when the pre-damage hit), new projectiles / summons / area effects
@@ -45,6 +47,7 @@ CORR = 8                                 # corridor length in tiles from the sho
 SPACING = 13                             # tiles between spot centres (3900 u: a long super past its target stays clear)
 WATCH = 50                               # ticks watched after the fire (2.5 s at 20 ticks/s; regen starts 3 s after a hit)
 STEP = 2                                 # ticks per env step while watching
+POST_HIT = 0                             # --post-hit: tick after the fire at which the target shoots the shooter again (0 off)
 DIST_F = (0.6, 0.35)                     # target distance per attempt, as a fraction of the super's CastingRange
 DIST_MIN, DIST_MAX = 450, (CORR - 1) * TILE
 MOVE_MIN, PUSH_MIN, HEAL_MIN = 300, 100, 100   # units / units / HP: above walk jitter, setup rounding and regen ticks
@@ -142,17 +145,23 @@ def expected(name, hyper=False):
     areas = [a for a in (s.get("AreaEffectObject"), s.get("AreaEffectObject2")) if a]
     areas += [a for r in ps for a in (r.get("SpawnAreaEffectObject"), r.get("SpawnAreaEffectObject2")) if a]
     alog = [T["alog"].get(T["askin"].get(a, {}).get("Logic") or a, {}) for a in areas]
+    chain = [r.get(k) for r in alog for k in ("ChainAreaEffect", "ChainAreaEffect2", "ChainAreaEffect3") if r.get(k)]
+    alog += [T["alog"].get(T["askin"].get(a, {}).get("Logic") or a, {}) for a in chain]   # an area's follow-up area
     summons = [x for x in (s.get("SummonedCharacters") or "").split(";") if x] + [r["SpawnCharacter"] for r in pl if r.get("SpawnCharacter")]
     items = [x for x in [s.get("SpawnedItem")] + [r.get("SpawnItem") for r in ps] if x]
     charge = bt == "Charge"
     if charge or bt in ("Blink", "BlinkReturn", "BlinkToPlaceholder", "BlinkToProjectile", "FlyJump"): ex.append("move")
-    if bt == "ChangeCharacter": ex.append("change")
+    turns = bt == "ChangeCharacter" or (charge and bool(s.get("SummonedCharacters")))   # Bonnie / Moe: the charge ends in the other form
+    if turns: ex.append("change")
     if projs: ex.append("projectile")
+    if turns: summons = []   # SummonedCharacters is the character it turns into, not a summon
     if summons: ex.append("summon")
     if areas: ex.append("area")
     if items: ex.append("item")
     leap_bombs = charge and bool(items)          # Piper: the damage is the bombs left at the start point, not on the target
-    if _num(s, "Damage") > 0 and not leap_bombs and bt not in ("ChangeCharacter", "ProjectileShield"): ex.append("damage")
+    heals_only = any(_num(r, "HealOwnPercent") > 0 for r in pl)   # Poco: the skill Damage is the heal, enemies are not hit
+    if ((_num(s, "Damage") > 0 or any(_num(r, "Damage") > 0 and r.get("Type") != "WallSpawn" for r in alog)) and not leap_bombs and not heals_only
+            and bt not in ("ChangeCharacter", "ProjectileShield")): ex.append("damage")
     if _num(s, "ChargePushback") > 0 or any(_num(r, "PushbackStrength") > 0 for r in pl + alog): ex.append("push")
     if (_num(s, "HealSelfOnActivationPower") > 0 or any(_num(r, "HealOwnPercent") > 0 for r in pl)
             or any(r.get("Type") in ("Heal", "Hot", "HealRegen", "HealAndDamage", "HotAndDot") for r in alog)): ex.append("heal")
@@ -162,7 +171,16 @@ def expected(name, hyper=False):
             "Attack: summon" if bt == "Attack" and summons else "Attack: area" if bt == "Attack" and areas and not projs else
             "Attack: item" if bt == "Attack" and items else "Attack: projectile" if bt == "Attack" else bt)
     cr = _num(s, "CastingRange") * 100
-    out = {"skill": sk_name, "type": bt, "kind": kind, "range": cr if cr > 0 else 2600.0, "charge": charge, "expect": ex,
+    ring = max((( _num(r, "InnerRadius") + _num(r, "Radius")) / 2 for r in alog
+                if _num(r, "InnerRadius") > 0 and _num(r, "InnerRadiusDamagePercent") == 0), default=0.0)
+    if cr <= 0 and not projs and alog and not charge:   # no aim range, the effect is an area at the brawler: the target stands inside it
+        cr = max((_num(r, "Radius") for r in alog), default=0.0)
+    # a BulletExplosion area at the brawler (Hank) spreads its children over 360 degrees from world angle 0 (spawnfix.c: no
+    # parent projectile): the target stands on angle 0, not between two children
+    east = not projs and any(r.get("Type") == "BulletExplosion" for r in alog)
+    steer = bt in ("FlyJump", "Ww")   # the brawler moves under its player's control while the super runs: walk it to the target
+    out = {"skill": sk_name, "type": bt, "kind": kind, "range": cr if cr > 0 else 2600.0, "charge": charge, "ring": ring, "east": east,
+           "steer": steer, "cast": _num(s, "CastingTime"), "expect": ex,
            "projectiles": projs, "summons": summons, "areas": areas, "items": items, "notes": notes}
     if hyper:
         names = lambda i: set(i["projectiles"]) | set(i["summons"]) | set(i["areas"]) | set(i["items"])
@@ -401,10 +419,13 @@ class Auditor:
         for k, (j, s, t) in enumerate(run):
             inf = self.info[j.name]; x, y, dirs = spots[k]
             dx, dy = dirs[min(j.attempt, len(dirs) - 1)]
+            if inf.get("east") and (1, 0) in dirs: dx, dy = 1, 0
             d = float(np.clip(DIST_F[min(j.attempt, 1)] * inf["range"], DIST_MIN, DIST_MAX))
             if j.attempt and len(dirs) == 1: d = float(np.clip(d * 0.6, DIST_MIN, DIST_MAX))
             tx, ty = x + dx * d, y + dy * d
-            sd = min(1.0, (d + TILE if inf["charge"] else d) / inf["range"])
+            if inf.get("ring") and inf["range"] > inf["ring"]:   # no damage inside InnerRadius (Kaze): land past the target
+                d = float(np.clip(inf["range"] - inf["ring"], DIST_MIN, DIST_MAX))
+            sd = min(1.0, (d + TILE if inf["charge"] else d + inf.get("ring", 0)) / inf["range"])
             aim = float(np.degrees(np.arctan2(dy, dx)))
             geo[j] = dict(d=round(d), aim=aim, super_dist=round(sd, 3), spot=[round(x), round(y)])
             pos[s] = (int(x), int(y)); pos[t] = (int(tx), int(ty))
@@ -470,13 +491,28 @@ class Auditor:
                         if min(np.hypot(row[3] - m["tx0"], row[4] - m["ty0"]), np.hypot(row[3] - m["x0"], row[4] - m["y0"])) < 2000:
                             m["foreign_near"] = True
             if n >= WATCH: break
-            r = stp(); n += STEP
+            acts = dict(idle)
+            for j, s, t in run:   # steered supers (FlyJump, Ww): once cast, the shooter walks to the target (16 joystick directions)
+                p, q = r.pl[s], r.pl[t]; inf = self.info[j.name]
+                if inf.get("steer") and n * 50 > inf.get("cast", 0) + 100 and q.alive and np.hypot(q.x - p.x, q.y - p.y) > 150:
+                    acts[s] = (int(round(np.degrees(np.arctan2(q.y - p.y, q.x - p.x)) / 22.5)) % 16, 0, 0.0, 0.0)
+            if POST_HIT and n >= POST_HIT and not any("ph_hp0" in M[j] for j, _, _ in run):   # shield / status supers: hit again
+                for j, s, t in run:
+                    M[j]["ph_hp0"] = int(r.pl[s].hp); M[j]["ph_hp_min"] = int(r.pl[s].hp); M[j]["ph_tick"] = n
+                    acts[t] = (-1, 1, (geo[j]["aim"] + 180.0) % 360, 0.0)
+                r = stp(acts, 1); n += 1
+            else:
+                r = stp(acts); n += STEP
+            for j, s, t in run:
+                if "ph_hp0" in M[j]: M[j]["ph_hp_min"] = min(M[j]["ph_hp_min"], int(r.pl[s].hp))
         out = []
         for j, s, t in run:
             m = M[j]
             m["consumed"] = bool(m["filled"] and m["sc_min"] < m["super_max"] / 2)
             m["damage"] = max(m["thp0"] - m["thp_min"], m.get("dd", 0))
             m["heal"] = m["hp_max"] - m["hp0"]
+            m["pre_hit"] = m["max_hp"] - m["hp0"]                     # the target's shot before the super
+            if "ph_hp0" in m: m["post_hit"] = m["ph_hp0"] - m["ph_hp_min"]   # its shot POST_HIT ticks after the fire
             for k in ("projectiles", "summons", "items"): m[k] = sorted(m[k].values())
             m["areas"] = sorted(m["areas"].values(), key=lambda a: a["name"])
             if self.hyper:   # the fire reaches the game one step later (env.c g_fire_delay): counted after the watch
@@ -626,11 +662,15 @@ def main():
     ap.add_argument("--no-retry", action="store_true", help="no second attempt for non-works brawlers")
     ap.add_argument("--out", default=os.environ.get("SIM_WORK", "work"), help="folder of super_audit.json / .md")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--watch", type=int, default=WATCH, help="ticks watched after the fire (default %d)" % WATCH)
+    ap.add_argument("--post-hit", type=int, default=0, help="the target shoots the shooter again this many ticks after the fire "
+                    "(pre_hit / post_hit HP in the json: shields, damage reduction); 0 = off")
     ap.add_argument("--host-args", default="", help="extra game host arguments, e.g. '--native-charge 0'")
     ap.add_argument("--hyper", action="store_true", help="the hypercharged supers: hypercharge each shooter first (fire 4), expect "
                     "the hypercharged super's effects; writes super_audit_hyper.json / .md")
     a = ap.parse_args()
     if a.check: return _check()
+    globals()["WATCH"] = a.watch; globals()["POST_HIT"] = a.post_hit
     import env_v5
     roster = env_v5.heroes()
     names = [x for x in a.only.split(",") if x] or roster

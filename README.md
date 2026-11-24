@@ -139,7 +139,7 @@ xychart-beta
 | `env.sh` | Environment variables for the host, nirkt's packages and the work folder. |
 | `setup.sh` | One-command setup: host build, venv, game files (SETUP.md). |
 | `engine/` | nirkt's battle host and environment as one tree: `native/` (host sources, qemu patches), `py/` (`nbpc`, `models4.py`), `train/`, nirkt's vision-label tools; this project's changes applied. What came from where: `engine/NOTICE.md`. |
-| `engine/patches/` | Record of this project's changes to nirkt's host and camera rules (`training_round`, `fair_view`, `live_state`, `gadgets`, `charge`, `hypercharge`, `hypercharged_supers`; already applied in `engine/`). |
+| `engine/patches/` | Record of this project's changes to nirkt's host and camera rules (`training_round`, `fair_view`, `live_state`, `gadgets`, `charge`, `hypercharge`, `hypercharged_supers`, `supers`; already applied in `engine/`). |
 | `pro_strategies.md` | Community Showdown habits and what each means for the observation / reward. |
 
 ## Vision models
