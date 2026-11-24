@@ -36,7 +36,8 @@ class Div(C.Structure):
                 ("gadget", C.c_int32 * MAXP), ("star", C.c_int32 * MAXP),   # cards.csv ids (gadget MetaType 5 / star power 4)
                 ("setup_super_mask", C.c_uint32),                            # SETUP: bit i = fill player i's super
                 ("setup_unprotect_mask", C.c_uint32),                        # SETUP: bit i = clear player i's spawn protection
-                ("reserved", C.c_int32 * 2)]
+                ("reserved", C.c_int32 * 2),
+                ("hyper_mask", C.c_uint32)]   # hypercharge round (bsrl-sim issue #4): bit i = equip player i's hypercharge card
 
 
 DIV_MAGIC = 0x31564944   # Hdr.reserved[0] of a game host that understands Cmd.div / Resp.div_*
@@ -84,7 +85,12 @@ class Resp(C.Structure):
         # (gad_valid 0) with a host without it. Per player: cards.csv id, GAD_* kind (0 = not implemented), uses left,
         # ticks of cooldown left, activations so far
         ("gad_valid", C.c_int32), ("gad_card", C.c_int32 * MAXP), ("gad_kind", C.c_int32 * MAXP),
-        ("gad_charges", C.c_int32 * MAXP), ("gad_cd", C.c_int32 * MAXP), ("gad_used", C.c_int32 * MAXP)]
+        ("gad_charges", C.c_int32 * MAXP), ("gad_cd", C.c_int32 * MAXP), ("gad_used", C.c_int32 * MAXP),
+        # hypercharge round (bsrl-sim issue #4, appended): the host's hypercharge (native/loader/hyper.c); all 0 (hyp_valid 0)
+        # with a host without it. Per player: equipped card id (0 = none), ticks active left (0 = off), activations so far,
+        # the buffs while active (percent: damage dealt +, move speed +, damage taken -). Charge / max: Player.reserved[0] / [1]
+        ("hyp_valid", C.c_int32), ("hyp_card", C.c_int32 * MAXP), ("hyp_left", C.c_int32 * MAXP), ("hyp_used", C.c_int32 * MAXP),
+        ("hyp_damage_pct", C.c_int32 * MAXP), ("hyp_speed_pct", C.c_int32 * MAXP), ("hyp_shield_pct", C.c_int32 * MAXP)]
 
 
 GAD_NONE, GAD_DASH, GAD_HEAL, GAD_SHIELD, GAD_SPAWN, GAD_PROJECTILE, GAD_STATUS = range(7)   # Resp.gad_kind (nbenv_proto.h NBE_GAD_*)

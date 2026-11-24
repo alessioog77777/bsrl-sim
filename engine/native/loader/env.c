@@ -125,6 +125,7 @@ static struct {
     /* damage model / charge */
     int charge_level;   /* >0 while a root call with a level-scaled character attacker is in progress */
     long dm_applied, charge_fixes, guard_hits, alive_forced, root_calls, events;
+    long hyper_dmg, hyper_moves;   /* hypercharge round: damage hits scaled, moves sped up */
     int in_own_call;    /* 1 = gas, 2 = bomb (our own calls to the damage root) */
     int seed_applied;
 } E;
@@ -165,6 +166,14 @@ static uint8_t *resp_mate(void *sim, int i) {   /* a living, not waiting teammat
 static int brawler_owner(void *sim, uint8_t *c) {   /* player index whose current brawler c is, else -1 */
     int np, ow = I32(c, 0x80); void **ps = players(sim, &np);
     return ow >= 0 && ow < np && ow < NBE_MAXP && ps[ow] && player_char_id(ps[ow]) == I32(c, 8) ? ow : -1;
+}
+/* hypercharge round (bsrl-sim issue #4): hyper.c */
+void hyper_clear(void); void hyper_reset_player(int i, void *p); int hyper_active(void *p); int hyper_use(int i, void *p, uint8_t *ch);
+int hyper_tick_player(void *p, uint8_t *ch, int alive); int hyper_damage(void *pa, int ai, void *pv, int vi, int d);
+int hyper_speed(int i, void *p, uint8_t *ch); void hyper_publish(NbeResp *r, void **ps, int np);
+static void *owner_player(void *sim, void *c, int *idx) {   /* the player whose current brawler c is (NULL: none) */
+    *idx = -1; if (!sim || !c || VTOF(c) != VT_CHAR) return NULL;
+    int np; void **ps = players(sim, &np); *idx = brawler_owner(sim, c); return *idx >= 0 ? ps[*idx] : NULL;
 }
 static int local_index(void) {
     if (!E.battle) return -1; void *c = PTR(E.battle, 0x28); return c ? I32(c, 0xe0) : -1;
@@ -347,6 +356,13 @@ static uint64_t my_root(void *victim, int a1, int dmg, int a3, int a4, void *att
             }
         }
         E.charge_level = lvl;
+    }
+    if (dmg > 0 && E.sim && attacker && victim) {   /* hypercharge round: +damage of a hypercharged attacker, shield of a hypercharged victim */
+        int ai, vi; void *pa = owner_player(E.sim, attacker, &ai), *pv = owner_player(E.sim, victim, &vi);
+        if ((pa && hyper_active(pa)) || (pv && hyper_active(pv))) {
+            int nd = hyper_damage(pa, ai, pv, vi, dmg);
+            if (nd != dmg) { if (a3 == dmg) a3 = nd; dmg = nd; E.hyper_dmg++; }
+        }
     }
     int vchar = victim && VTOF(victim) == VT_CHAR, before = vchar ? I32(victim, 0x3c4) : 0;
     int ow = vchar && mode3 && resp_on() && E.sim ? brawler_owner(E.sim, victim) : -1;
@@ -606,7 +622,15 @@ static void rec_put(int kind, uint8_t *ch, int a, int b, int c, int d) {
     int32_t *r = RECB + 8 * g_rec_n++;
     r[0] = I32(E.sim, 0x10); r[1] = I32(ch, 8); r[2] = kind; r[3] = a; r[4] = b; r[5] = c; r[6] = d; r[7] = I32(ch, 0x80);
 }
-static void rec_move(uint64_t *ctx) { rec_put(0, (uint8_t *)ctx[0], (int)ctx[1], (int)ctx[2], (int)ctx[6], 0); }
+/* mover 0xb4790c(char, x, y, useSpeed, speed, ..): with useSpeed 0 it moves at the CharacterData speed (0xab31e0); hypercharge
+ * round: a hypercharged brawler's move gets the +OverchargeSpeedPercent speed instead (moves with their own speed are left) */
+static void rec_move(uint64_t *ctx) {
+    rec_put(0, (uint8_t *)ctx[0], (int)ctx[1], (int)ctx[2], (int)ctx[6], 0);
+    if ((int)ctx[3] == 0 && E.sim) {
+        int i; void *p = owner_player(E.sim, (void *)ctx[0], &i); int sp = p ? hyper_speed(i, p, (uint8_t *)ctx[0]) : 0;
+        if (sp > 0) { ctx[3] = 1; ctx[4] = (uint64_t)(uint32_t)sp; E.hyper_moves++; }
+    }
+}
 static void rec_stop(uint64_t *ctx) { rec_put(2, (uint8_t *)ctx[0], 0, 0, 0, 0); }
 /* pctrain round: "native + lead" (research B1/B2/D2). The native AI's targeted attack (0xb8d888 -> bl 0xb487c4 at
  * 0xb8dd38, return 0xb8dd3c; w6 = isSuper) passes the target's position + U[-150,150)^2 and never leads. For owners in
@@ -854,10 +878,19 @@ static void client_pos(int i, uint8_t *ch, int *x, int *y) {
     int k = (n - 5) & 7;      /* 4 ticks before the newest entry */
     *x = jround(X - CLIENT_LAG_F * (X - E.hx[i][k])); *y = jround(Y - CLIENT_LAG_F * (Y - E.hy[i][k]));
 }
+static void hyper_tick(void *sim) {   /* hypercharge round: drain / end (hyper.c); an ended one re-sends the move at normal speed */
+    int np; void **ps = players(sim, &np);
+    for (int i = 0; i < np && i < NBE_MAXP; i++) {
+        if (!ps[i] || !hyper_active(ps[i])) continue;
+        uint8_t *c = obj_by_id(sim, player_char_id(ps[i])); if (c && VTOF(c) != VT_CHAR) c = NULL;
+        if (hyper_tick_player(ps[i], c, c && I32(c, 0x3c4) > 0 && !waiting(i))) E.sent_valid[i] = 0;
+    }
+}
 void env_tick_leave(void *sim) {   /* after a completed outer tick: showdownTick + afterState */
     if (sim != E.sim) return;
     if (--E.depth > 0) return;
     record_positions(sim);
+    hyper_tick(sim);
     if (I32(sim, 0x104) != 6) return;
     item_tick(sim);
     elimination_tick(sim);
@@ -962,6 +995,11 @@ static void gadget_input(void *sim, int pidx, uint8_t *ch, double deg) {
     if (gadget_use(sim, pidx, ch, deg, I32(sim, 0x10))) return;
     double r = deg * M_PI / 180; apply_input(sim, pidx, 8, jround(1000 * cos(r)), jround(1000 * sin(r)), NULL);
 }
+/* hypercharge round: NbeAction.fire 4 -> libg's activation 0xc42584 (hyper.c); the move is re-sent at the hypercharged speed */
+static void hyper_input(void *sim, int pidx, uint8_t *ch) {
+    int np; void **ps = players(sim, &np);
+    if (pidx < np && hyper_use(pidx, ps[pidx], ch)) E.sent_valid[pidx] = 0;
+}
 /* rl round (tests): fire the character's skill instance idx (char +0x458 array, +0x464 count; instance +0 = SkillData) like an attack */
 static void skill_idx_input(void *sim, int pidx, uint8_t *ch, int idx, double deg) {
     uint8_t **arr = PTR(ch, 0x458); int n = I32(ch, 0x464);
@@ -1004,6 +1042,7 @@ static int client_intents(void *sim, int i, uint8_t *ch, const NbeAction *a) {
     if (a->fire == 1) { fire_input_at(sim, i, ch, 0, a->aim_deg, 1, cx, cy); E.cl_attacks++; }
     else if (a->fire == 2) { fire_input_at(sim, i, ch, 1, a->aim_deg, a->super_dist > 0 && a->super_dist <= 1 ? a->super_dist : 1, cx, cy); E.cl_attacks++; }
     else if (a->fire == 3) gadget_input(sim, i, ch, a->aim_deg);   /* diversity round */
+    else if (a->fire == 4) hyper_input(sim, i, ch);                /* hypercharge round */
     else if (a->fire >= 200) skill_idx_input(sim, i, ch, a->fire - 200, a->aim_deg);   /* rl round (tests) */
         else if (a->fire >= 100) apply_input(sim, i, a->fire - 100, 1, 1, NULL);   /* rl round: raw input kind (tests) */
     (void)cc; return 1;
@@ -1032,6 +1071,7 @@ static void apply_actions(void *sim, const NbeCmd *c) {
             E.moving[i] = 0; E.last_dir[i] = -1; E.sent_valid[i] = 0;
         }
         if (a->fire == 3) gadget_input(sim, i, ch, a->aim_deg);   /* diversity round */
+        else if (a->fire == 4) hyper_input(sim, i, ch);                /* hypercharge round */
         else if (a->fire >= 200) skill_idx_input(sim, i, ch, a->fire - 200, a->aim_deg);   /* rl round (tests) */
         else if (a->fire >= 100) apply_input(sim, i, a->fire - 100, 1, 1, NULL);   /* rl round: raw input kind (tests) */
         if (a->fire == 1) fire_input(sim, i, ch, 0, a->aim_deg, 1);
@@ -1143,6 +1183,7 @@ static void my_setseed(void *sim, int seed) {   /* builder 0x9bb7c4: bl 0xc24a08
  * All requests are checked against the game's own tables; a rejected one falls back to the default (NbeResp.div_err). */
 #define LOC_GLOBAL 0x12eefc0
 int32_t g_div_char[NBE_MAXP], g_div_skin[NBE_MAXP], g_div_gadget[NBE_MAXP], g_div_star[NBE_MAXP];   /* offline.c my_player_ctor */
+uint32_t g_div_hyper;   /* hypercharge round: RESET div.hyper_mask (offline.c my_player_ctor) */
 static uint32_t g_div_team;
 static void *g_div_map_loc;   /* RESET div.reserved[1]: a location (any mode) whose Map row the battle location uses instead (my_loc_map) */   /* RESET div.reserved[0]: bit i = player i joins player 0's team (env_after_build) */
 static void *g_play_loc, *g_div_cl_loc; static uint8_t *g_theme_loc; static void *g_theme_orig; static int32_t g_div_err;
@@ -1175,6 +1216,7 @@ static void div_reset(const NbeCmd *c) {   /* a RESET was accepted: set up the n
         else g_div_err |= 1u << 31;
     }
     g_div_team = (uint32_t)c->div.reserved[0];
+    g_div_hyper = c->div.hyper_mask;   /* hypercharge round: offline.c my_player_ctor */
     g_div_map_loc = c->div.reserved[1] ? div_data(c->div.reserved[1]) : NULL;
     if (c->div.reserved[1] && (!g_div_map_loc || c->div.reserved[1] / 1000000 != 15)) { g_div_err |= 1 << 30; g_div_map_loc = NULL; }
     for (int i = 0; i < NBE_MAXP; i++) { g_div_char[i] = c->div.chr[i]; g_div_skin[i] = c->div.skin[i]; g_div_gadget[i] = c->div.gadget[i]; g_div_star[i] = c->div.star[i]; }
@@ -1196,7 +1238,7 @@ static void div_publish(void *sim) {   /* RESET response: read the battle back f
     R->div_variation = I32(sim, 0x104);
     R->div_reserved[0] = U8(sim, 0x134);   /* the builder's "cards" flag (global 0x12eefd4): 0 = player configs get no star power /
                                               gadget / overcharge cards (0xc27d64) */
-    int np; void **ps = players(sim, &np); gadget_clear();
+    int np; void **ps = players(sim, &np); gadget_clear(); hyper_clear();
     for (int i = 0; i < NBE_MAXP; i++) {
         R->pl_char[i] = R->pl_skin[i] = 0;
         if (i >= np || !ps[i]) continue;
@@ -1205,6 +1247,7 @@ static void div_publish(void *sim) {   /* RESET response: read the battle back f
         R->pl_char[i] = ld ? data_id(ld[0]) : 0; R->pl_skin[i] = data_id(skin);
         if (PTR(ps[i], 0x190)) R->div_reserved[1] |= 1 << i;
         gadget_reset_player(i, PTR(ps[i], 0x190) != NULL);   /* gadget round */
+        hyper_reset_player(i, ps[i]);                         /* hypercharge round */
         if (ld && ld[1] && PTR(ld[1], 0x08)) R->div_reserved[2] |= 1 << i;
     }
 }
@@ -1344,6 +1387,7 @@ static void publish(void *sim, uint32_t seq, int status, const char *err) {
     fill_players(sim);
     if (E.cur.type == NBE_CMD_RESET) div_publish(sim);   /* diversity round (before gadget_publish: it sets up the gadgets) */
     gadget_publish(R, I32(sim, 0x10));                   /* gadget round */
+    { int np; void **ps = players(sim, &np); hyper_publish(R, ps, np); }   /* hypercharge round */
     R->njumps = 0; for (int i = 0; i < E.njobs && i < NBE_MAXP; i++) { int *j = R->jumps[R->njumps++]; j[0] = E.jobs[i].id; j[1] = E.jobs[i].t; j[2] = E.jobs[i].T; j[3] = E.jobs[i].x1; j[4] = E.jobs[i].y1; }
     R->ncubes = 0; for (int i = 0; i < E.ncube && i < NBE_MAXP; i++) { R->cubes[R->ncubes][0] = E.cube_id[i]; R->cubes[R->ncubes++][1] = E.cube_n[i]; }
     R->cam_valid = 0;

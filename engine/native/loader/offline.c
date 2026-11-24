@@ -147,7 +147,7 @@ static void *char_data(const char *name) {
  * player at players[sim+0x60]) the RESET's character / skin (env.c div_reset -> g_div_char / g_div_skin, global data ids);
  * 0 = the default above. The character must be a playable brawler (characters.csv Type Hero: data+0x23c equal to the
  * roster brawler's), the skin one of that character's (the game's own check 0xc70d2c: the skin's SkinConf lists it). */
-extern int32_t g_div_char[16], g_div_skin[16], g_div_gadget[16], g_div_star[16]; extern void *div_data(int id); extern void div_reject(int i);
+extern int32_t g_div_char[16], g_div_skin[16], g_div_gadget[16], g_div_star[16]; extern uint32_t g_div_hyper; void *hyper_card_for(void *chardata); extern void *div_data(int id); extern void div_reject(int i);
 static void my_player_ctor(uint64_t *ctx) {
     if (!g_building || !g_roster || !*g_roster) return;
     uint8_t *sim = (uint8_t *)ctx[0]; int variation = *(int32_t *)(sim + 0x104), slot = *(int32_t *)(sim + 0x60);
@@ -175,6 +175,13 @@ static void my_player_ctor(uint64_t *ctx) {
         if (card && id / 1000000 == 23 && *(void **)(card + 0xd8) == d && *(int32_t *)(card + 0x108) == (k ? 4 : 5))
             *(void **)((uint8_t *)cfg + (k ? 0x08 : 0x10)) = card;
         else { div_reject(slot); LOG("[battle] roster: slot %d %s card %d rejected\n", slot, k ? "star power" : "gadget", id); }
+    }
+    /* hypercharge round (bsrl-sim issue #4): the RESET's div.hyper_mask bit = this character's hypercharge card (MetaType 6) into
+     * config +0x28, where libg's activation 0xc42584 looks for it (hyper.c); a character without one gets none (not an error) */
+    if (slot >= 0 && slot < 16 && ((g_div_hyper >> slot) & 1)) {
+        void *hc = hyper_card_for(d);
+        if (hc) *(void **)((uint8_t *)cfg + 0x28) = hc;
+        static int nlog; if (nlog++ < 40) LOG("[battle] roster: slot %d hypercharge card %d\n", slot, hc ? *(int32_t *)((uint8_t *)hc + 0x20) : 0);
     }
     ctx[2] = (uint64_t)d; ctx[3] = (uint64_t)cfg; *(void **)((uint8_t *)ctx + 160 + 8) = skin;
     if (g_pinned++ < 10 || ((ci || si) && g_pinned < 400)) LOG("[battle] roster: slot %d -> %s (data id %d, skin %d)\n", slot, ci ? "div" : g_roster,
