@@ -115,7 +115,8 @@ static struct {
     int gas_count, gas_since_valid[NBE_MAXP], gas_since[NBE_MAXP]; GasHit gq[NBE_MAXP]; int ngq;
     int gas_lethal_id[NBE_MAXP], gas_lethal_tick[NBE_MAXP];
     int gas_args_ok, ga4, ga5, ga7, gs0;   /* renderer's 0xc69094 arguments (constant per frame except the step) */
-    long gas_native_checks, gas_formula_mismatch;
+    long gas_native_checks, gas_formula_mismatch, gas_heal_cut;
+    int gas_hp[NBE_MAXP], gas_mx[NBE_MAXP], gas_hp_valid[NBE_MAXP];   /* last tick's hp / max hp (half healing in the gas) */
     /* leap (SF) */
     Leap jobs[NBE_MAXP]; int njobs; int sf_started, sf_landed, sf_blocked, sf_ignored, sf_boxes, sf_pops;
     int sf_owner_id[NBE_MAXP], sf_owner_dmg[NBE_MAXP];
@@ -985,25 +986,57 @@ static void cube_counter_install(void) {
     hook_bl(g_libg, 0xb36924, cube84_a); hook_bl(g_libg, 0xb36904, cube84_b);
     LOG("[env] cube counter: snapshot tag 0x84 = env's power cubes (0xb36904, 0xb36924)\n");
 }
+/* issue #21: the game's storm rules on top of the phone agent's (NB_GAS_RULES=0 turns them off): Trio's ramp after 1 s, and
+ * healing inside the gas halved, all sources (since 04/09/24, #22 comment). The cut is on the hp gained since the last tick
+ * while in the gas both ticks with the same max hp (a cube pickup or a respawn is not a heal); a heal and a hit in the same
+ * tick are cut on the net gain. Not modelled: the extra damage deeper in the gas (since 22/04/26, amount not published). */
+int g_gas_rules = 1;
 static void gas_tick(void *sim) {   /* the storm schedule (check every 20 ticks) + regen block + per-tick gas flags */
     int tick = I32(sim, 0x10), np; void **ps = players(sim, &np);
     E.gas_count++;
     for (int i = 0; i < np && i < NBE_MAXP; i++) {
         if (!ps[i]) continue; uint8_t *c = obj_by_id(sim, player_char_id(ps[i]));
         int alive = c && VTOF(c) == VT_CHAR && I32(c, 0x3c4) > 0;
-        if (!alive || waiting(i)) { E.ingas[i] = 0; continue; }
+        if (!alive || waiting(i)) { E.ingas[i] = 0; E.gas_hp_valid[i] = 0; continue; }
         int g = in_gas_tile(sim, (int)floor(I32(c, 0x38) / 300.0), (int)floor(I32(c, 0x3c) / 300.0));
+        if (g && E.gas_on && g_gas_rules && E.gas_hp_valid[i] && E.ingas[i] && I32(c, 0x3c8) == E.gas_mx[i]) {
+            int hp = I32(c, 0x3c4), up = hp - E.gas_hp[i];
+            if (up > 1) {   /* half healing in the gas */
+                I32(c, 0x3c4) = hp - up / 2; E.gas_heal_cut += up / 2;
+                extern int g_sd_dbg; if (g_sd_dbg) LOG("[gas] heal cut player %d tick %d hp %d -> %d (gain %d)\n", i, tick, E.gas_hp[i], hp - up / 2, up);
+            }
+        }
         E.ingas[i] = g; if (g) E.gast[i]++;
+        E.gas_hp[i] = I32(c, 0x3c4); E.gas_mx[i] = I32(c, 0x3c8); E.gas_hp_valid[i] = 1;
         if (g && E.gas_on) I32(c, 0x7d8) = tick;        /* gasBlockRegen */
         if (E.gas_on && E.gas_count % 20 == 0) {
             if (!g) { E.gas_since_valid[i] = 0; continue; }
             if (!E.gas_since_valid[i]) { E.gas_since_valid[i] = 1; E.gas_since[i] = tick; }
-            double secs = (tick - E.gas_since[i]) / 20.0, pct = 20;
-            if (secs > 5) pct += (secs - 5) * 5;
+            /* the ramp starts after 5 s in Solo / Duo and after 1 s in Trio (#22 comment: wiki + patch notes); the
+             * phone agent's storm (g_gas_rules 0) used 5 s everywhere */
+            double secs = (tick - E.gas_since[i]) / 20.0, pct = 20, ramp = g_gas_rules && sd_group_size(i) >= 3 ? 1 : 5;
+            if (secs > ramp) pct += (secs - ramp) * 5;
             int mx = I32(c, 0x3c8), dmg = jround(mx * pct / 100); if (dmg < 1) dmg = 1;
             if (E.ngq < NBE_MAXP) E.gq[E.ngq++] = (GasHit){I32(c, 8), dmg, (int)pct, (int)(secs * 10), mx, 0, 0};
+            { extern int g_sd_dbg; if (g_sd_dbg) LOG("[gas] hit player %d group %d tick %d secs %.2f pct %.1f max %d dmg %d\n", i, sd_group_size(i), tick, secs, pct, mx, dmg); }
         }
     }
+}
+/* issue #21: what showdown_mods.c (event modifiers) needs from env: the living, placed player brawlers, storm flags, the
+ * battle's seed, the game's knockback and circle tile destroy */
+int env_sd_chars(void *sim, uint8_t **out, int *pidx, int max) {
+    int np, n = 0; void **ps = players(sim, &np);
+    for (int i = 0; i < np && i < NBE_MAXP && n < max; i++) {
+        if (!ps[i] || waiting(i)) continue; uint8_t *c = obj_by_id(sim, player_char_id(ps[i]));
+        if (c && VTOF(c) == VT_CHAR && I32(c, 0x3c4) > 0) { out[n] = c; pidx[n++] = i; }
+    }
+    return n;
+}
+int env_sd_in_gas_xy(void *sim, int x, int y) { return E.gas_on && in_gas_tile(sim, (int)floor(x / 300.0), (int)floor(y / 300.0)); }
+int env_sd_seed(void) { return E.reset_seed; }
+void env_sd_knockback(uint8_t *v, int sx, int sy, int strength) { KNOCKBACK(v, sx, sy, strength, -1); }
+void env_sd_break(void *sim, int x, int y, int r) {   /* as charge_break, with no owner (team -1) */
+    void *m = PTR(sim, 0x68); if (m) ((fn_circ)B(0xa53b60))(m, x, y, r, 0, -1, -1, 0, 0, PTR(sim, 0));
 }
 static void apply_setup(void *sim) {   /* the phone test's debug_js_tick: park/freeze/teleport inside a tick */
     int np; void **ps = players(sim, &np);
@@ -1112,6 +1145,8 @@ void env_tick_leave(void *sim) {   /* after a completed outer tick: showdownTick
     if (I32(sim, 0x104) != 6) return;
     item_tick(sim);
     elimination_tick(sim);
+    { extern void sd_mods_tick(void *); sd_mods_tick(sim); }   /* issue #21: event modifiers (showdown_mods.c), before the
+                                                                  * storm's heal cut sees their heals */
     gas_tick(sim);
     sf_bomb_state(sim);
 }
@@ -2301,6 +2336,7 @@ void hits_dump(const char *why) {
 void env_install(void) {
     if (!g_env_on) return;
     KIND_BY_TYPE = B(0x185710);
+    { const char *e = getenv("NB_GAS_RULES"); if (e) g_gas_rules = atoi(e); extern void sd_mods_install(void); sd_mods_install(); }
     /* B3 determinism patch: 0x9bb864 cbnz w8,#0x9bb890 -> b #0x9bb890 (keep the seed; no srand(time)/rand reseed) */
     if (*(uint32_t *)B(0x9bb864) != 0x35000168) { LOG("[env] seed patch: unexpected bytes %08x\n", *(uint32_t *)B(0x9bb864)); exit(1); }
     patch_u32(g_libg, 0x9bb864, 0x1400000b);

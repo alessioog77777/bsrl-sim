@@ -73,6 +73,11 @@ Changes made to nirkt's code, all recorded in `engine/patches/`:
   `env.c` mirrors each brawler's power cubes into character `+0x874`, so libg's own death drop (inside the damage root)
   drops min(cubes / 3 + 1, 5) cubes, 2 at most for a trio group, as Trio Showdown does; a respawned teammate comes back
   after 17 s (`RespawnSeconds`) with 3 s of spawn protection. `python -m showdown_check` checks it live.
+- `showdown_leftovers.patch` (issue #21, a diff on top of the others): the storm's ramp starts after 1 s in Trio (5 s in
+  Solo / Duo) and healing inside the gas is halved (`env.c` `gas_tick`; `NB_GAS_RULES=0` restores the phone agent's storm);
+  the Meteors and HealingMushrooms event modifiers as env tick jobs in `native/loader/showdown_mods.c`, off unless
+  `NB_SD_MODIFIERS=3,5`; WallSpawn areas place every tile closer than their Radius (Sprout: a plus of 5, Rosa's Grow Light:
+  3x3) and bush-grow areas grow bushes (`spawnfix.c` `wall_ring`). `NB_SD_DBG=1` logs storm hits and events.
 - `supers.patch` (issue #6, a diff on top of `gadgets.patch`): supers whose effect the client libg compiles out, in
   `native/loader/superfix*.c` (status-effect store, areas, summons; `NB_SUPERFIX=0` turns it off).
 - `status_movement.patch` (issue #19, a diff on top of `supers.patch`): speed boosts and slows from statuses in the mover
