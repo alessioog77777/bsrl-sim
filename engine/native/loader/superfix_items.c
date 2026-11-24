@@ -48,6 +48,12 @@ static int busy;   /* our own spawns run 0xb29494 / update code again: no nested
 #define BOMB_ITEM 18000035                  /* Piper's bomb: env.c sf_bomb_state / sf_explode explode it */
 #define FUSE_TYPES 0x4802020200005040ULL    /* b6cf0c: item types with a trigger fuse */
 
+static long hp_sum(uint8_t *src) {   /* debug: HP of every character (vtable 0x1209020) in src's object manager */
+    uint8_t *mgr = PTR(src, 0x20); void **arr = mgr ? PTR(mgr, 0x28) : NULL; int cnt = mgr ? I32(mgr, 0x34) : 0; long s = 0;
+    for (int i = 0; arr && i < cnt && i < 512; i++) { uint8_t *o = arr[i]; if (o && *(uint8_t **)o == B(0x1209020)) s += I32(o, 0x3c4); }
+    return s;
+}
+static long g_last_hit;   /* debug: HP the last spawned area took at its start */
 /* the item destroy 0xb6e0b0's area spawn (b6e0f8..b6e1e0) with the source object, owner/kind/flag, damage pair and modifiers
  * as arguments (item: +0xb0, +0xb8, 0, +0xe0, +0x150; area: +0x108, +0xf8, +0x2d0, +0xe8, +0x168) */
 static uint8_t *spawn_area_at(uint8_t *src, void *ad, void *owner, int kind, int flag, uint64_t dmg, void *mods) {
@@ -64,14 +70,16 @@ static uint8_t *spawn_area_at(uint8_t *src, void *ad, void *owner, int kind, int
     U64(a, 0xe8) = dmg;
     ((void (*)(void *, void *, int))B(0xb2b2d4))(a, mods, 0);
     ((void (*)(void *, void *))B(0xb63198))(PTR(src, 0x20), a);
+    long h0 = g_superfix_dbg ? hp_sum(src) : 0;
     ((void (*)(void *))B(0xb29494))(a);
+    g_last_hit = g_superfix_dbg ? h0 - hp_sum(src) : 0;
     return a;
 }
 
 /* ---- item TriggerAreaEffect */
 typedef void (*upd_t)(void *, void *, void *, void *);
 static upd_t o_item_update;
-static int g_sign_ring[64], g_sign_pos;
+static int g_sign_ring[64], g_sign_pos, g_sign_last = -1;
 static int seen(int *ring, int n, int *pos, int id) {
     for (int i = 0; i < n; i++) if (ring[i] == id) return 1;
     ring[*pos] = id; *pos = (*pos + 1) % n; return 0;
@@ -84,15 +92,29 @@ static void my_item_update(uint8_t *it, void *x1, void *x2, void *x3) {
     if (!on) return;
     int type = I32(d, 0x54), id = I32(d, 0x20); void *trig = PTR(d, 0x60);
     if (!trig || id == BOMB_ITEM) return;
+    static int ring2[64], pos2;   /* debug: where each trap lies once armed (the audit's target stands still) */
+    if (g_superfix_dbg && type >= 0 && type < 64 && ((FUSE_TYPES >> type) & 1) && I32(it, 0x94) <= 0 && !seen(ring2, 64, &pos2, I32(it, 8))) {
+        uint8_t *mgr = PTR(it, 0x20); void **arr = mgr ? PTR(mgr, 0x28) : NULL; int cnt = mgr ? I32(mgr, 0x34) : 0; long best = -1;
+        for (int i = 0; arr && i < cnt && i < 512; i++) { uint8_t *o = arr[i];
+            if (!o || *(uint8_t **)o != B(0x1209020) || o == PTR(it, 0xb0) || I32(o, 0x3c4) <= 0) continue;
+            long dx = I32(o, 0x38) - I32(it, 0x38), dy = I32(o, 0x3c) - I32(it, 0x3c), d2 = dx * dx + dy * dy; if (best < 0 || d2 < best) best = d2; }
+        LOG("[superfix] trap %d armed at %d,%d tick %d, nearest other character %ld u\n", I32(it, 8), I32(it, 0x38), I32(it, 0x3c),
+            now_of(it), best < 0 ? -1L : (long)__builtin_sqrt((double)best));
+    }
     int fire = 0;
     if (type >= 0 && type < 64 && ((FUSE_TYPES >> type) & 1) && fuse && I32(it, 0x9c) <= 0) { fire = 1; g_ntrig++; }
-    if (type == 53 && I32(it, 0xd4) <= now_of(it) && !seen(g_sign_ring, 64, &g_sign_pos, I32(it, 8))) { fire = 2; g_nsign++; }
+    if (type == 53) {   /* object ids restart in every battle: the ring is cleared when the tick goes back */
+        int t = now_of(it);
+        if (t < g_sign_last) { for (int i = 0; i < 64; i++) g_sign_ring[i] = 0; }
+        g_sign_last = t;
+        if (I32(it, 0xd4) <= t && !seen(g_sign_ring, 64, &g_sign_pos, I32(it, 8))) { fire = 2; g_nsign++; }
+    }
     if (!fire) return;
     busy = 1;
     uint8_t *a = spawn_area_at(it, trig, PTR(it, 0xb0), I32(it, 0xb8), 0, U64(it, 0xe0), it + 0x150);
     busy = 0;
-    if (g_superfix_dbg) LOG("[superfix] item %d (data %d type %d) %s -> area %p (type %d) at %d,%d dmg %d/%d tick %d\n", I32(it, 8), id,
-                            type, fire == 2 ? "landed" : "fuse out", a, I32(trig, 0x118), I32(it, 0x38), I32(it, 0x3c), I32(it, 0xe0), I32(it, 0xe4), now_of(it));
+    if (g_superfix_dbg) LOG("[superfix] item %d (data %d type %d) %s -> area %p (type %d) at %d,%d dmg %d/%d tick %d, HP taken %ld\n", I32(it, 8), id,
+                            type, fire == 2 ? "landed" : "fuse out", a, I32(trig, 0x118), I32(it, 0x38), I32(it, 0x3c), I32(it, 0xe0), I32(it, 0xe4), now_of(it), g_last_hit);
 }
 
 /* ---- area ChainAreaEffect */
@@ -114,8 +136,8 @@ static void on_area_expire(uint64_t *c) {
     }
     busy = 0;
     if (a2) g_nchain++;
-    if (g_superfix_dbg) LOG("[superfix] area %p (type %d) expired at tick %d (end %d) -> chain area %p (type %d) dmg %d at %d,%d item %p\n", a,
-                            I32(d, 0x118), now_of(a), I32(a, 0xd8), a2, I32(chain, 0x118), a2 ? I32(a2, 0xe8) : 0, I32(a, 0x38), I32(a, 0x3c), (void *)it);
+    if (g_superfix_dbg) LOG("[superfix] area %p (data %d type %d) expired at tick %d (end %d) -> chain area %p (type %d) dmg %d at %d,%d item %p, HP taken %ld\n", a,
+                            I32(d, 0x20), I32(d, 0x118), now_of(a), I32(a, 0xd8), a2, I32(chain, 0x118), a2 ? I32(a2, 0xe8) : 0, I32(a, 0x38), I32(a, 0x3c), (void *)it, g_last_hit);
 }
 
 /* ---- Otis (Silencer) super hit: at b74b2c the projectile hit code sees a character hit by a projectile whose SpawnedItem is
