@@ -29,7 +29,8 @@ WATCH ticks, effects on allies (every player is solo), how close a re-implementa
 Every non-works brawler is retried once (other corridor direction, d from a smaller fraction of its range); the best
 attempt counts. A host crash requeues that phase's shooters one at a time (a reboot each) to find the brawler.
 Output: $SIM_WORK/super_audit.json (per brawler: name, super, type, class, attempts with measurements) and
-$SIM_WORK/super_audit.md (also stdout): a checklist grouped by class then super type. With --only the brawlers are
+$SIM_WORK/super_audit.md (also stdout): a checklist grouped by class then super type. The default list is env_v5.heroes()
+(the playable brawlers) then env_v5.forms() (the other forms and event transforms, spawned directly as shooters). With --only the brawlers are
 merged into an existing super_audit.json.
 --hyper (hypercharge round): every player gets its hypercharge card; each shooter's hypercharge is filled with its super and
 activated (fire 4) one tick before the super. The expected effects are the hypercharged super's (`hyper_skill`: characters.csv
@@ -627,7 +628,7 @@ def _check():
     n_tab = 0
     try:                                                     # the tables (game files from setup.sh), when present
         import env_v5
-        hs = env_v5.heroes(); _tables()
+        hs = env_v5.heroes() + env_v5.forms(); _tables()
     except Exception as e:
         print("super_audit: game tables not available (%s): table checks skipped" % type(e).__name__)
     else:
@@ -639,6 +640,7 @@ def _check():
         assert {"projectile", "area", "damage"} <= set(inf["TntDude"]["expect"])
         assert "heal" in inf["DeadMariachi"]["expect"] and inf["Rosa"]["expect"] == [] and "change" in inf["MechaDude"]["expect"]
         assert all(i["range"] > 0 and i["skill"] for i in inf.values())
+        assert "MechaDudeBig" in inf and len(env_v5.forms()) == 9 and "MechaDudeBig" not in env_v5.heroes()   # forms audited, never picked
         assert display("BullDude") == "Bull" and data_name(16000000 + list(_tables()["char"]).index("BullDude")) == "BullDude"
         hy = {h: expected(h, hyper=True) for h in ("Jester", "Beamer", "Twins", "Skater", "Domain", "Dancer", "MechaDudeBig", "ShotgunGirl", "PowerLeveler")}
         assert hy["Jester"]["skill"] == "JesterOverchargedUlti" and "ChesterOverchargedUltiProjectile" in hy["Jester"]["hyper_names"]
@@ -651,7 +653,7 @@ def _check():
         sp = find_spots(MAP)
         assert len(sp) == 10 and all(len(d) >= 2 for _, _, d in sp), len(sp)
         assert min(max(abs(a[0] - c[0]), abs(a[1] - c[1])) for i, a in enumerate(sp) for c in sp[i + 1:]) >= SPACING * TILE
-    print("super_audit ok: classification%s" % (", tables of %d brawlers, %d spots on %s" % (n_tab, 10, MAP) if n_tab else ""))
+    print("super_audit ok: classification%s" % (", tables of %d brawlers and forms, %d spots on %s" % (n_tab, 10, MAP) if n_tab else ""))
 
 
 def main():
@@ -672,13 +674,14 @@ def main():
     if a.check: return _check()
     globals()["WATCH"] = a.watch; globals()["POST_HIT"] = a.post_hit
     import env_v5
-    roster = env_v5.heroes()
-    names = [x for x in a.only.split(",") if x] or roster
+    roster, forms = env_v5.heroes(), env_v5.forms()     # forms (Meg's mech, event transforms): never a pick, audited after
+    names = [x for x in a.only.split(",") if x] or roster + forms
     bad = [x for x in names if x not in _tables()["char"]]
     if bad: sys.exit(f"unknown brawlers: {bad}")
     au = Auditor(names, n=a.n, retry=not a.no_retry, seed=a.seed, host_args=a.host_args.split(), hyper=a.hyper)
     stem = "super_audit_hyper" if a.hyper else "super_audit"
-    au.log(f"{len(names)} brawlers, {a.n} instances, {au.npair} pairs per phase on {MAP}")
+    nf = sum(x in forms for x in names)
+    au.log(f"{len(names) - nf} brawlers + {nf} forms, {a.n} instances, {au.npair} pairs per phase on {MAP}")
     res = au.run()
     rows = summary(names, res, au.info)
     os.makedirs(a.out, exist_ok=True); jp = os.path.join(a.out, stem + ".json")

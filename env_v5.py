@@ -4,7 +4,7 @@
     python3 -m env_v5 --n 3 --minutes 15 --native 1 --episodes nat.jsonl && python3 -m env_v5 --norm nat.jsonl
                                                           # slider_norm factors from native-AI battles (NORM_MEASURED)
 
-battle_fn(): every battle a random Showdown map, a random brawler per player, solo / duo (5 x 2) / trio (3 x 3 + 1
+battle_fn(): every battle a random Showdown map, a random playable brawler per player (heroes()), solo / duo (5 x 2) / trio (3 x 3 + 1
 solo: the sim has 10 players, the real mode 12) teams, and `agents` policy-controlled slots (the rest = native AI).
 The battle is still Solo Showdown underneath (teams only change who can hurt whom), so MAEnv's rank / place reward is
 per player; `Env` holds a grouped agent's final transition until its team's rank is known and swaps in the team's
@@ -57,11 +57,30 @@ def SC():
     return scenarios
 
 
+def _off(r):
+    """a csv row's Disabled flag (cards.csv writes both true and TRUE)"""
+    return (r.get("Disabled") or "").lower() == "true"
+
+
+@functools.lru_cache(None)
+def _unlocked():
+    """brawlers (characters.csv Name) with an enabled unlock card (cards.csv MetaType 0, Type unlock, Target = the brawler)"""
+    return frozenset(r["Target"] for r in D._rows("cards.csv")
+                     if r[next(iter(r))] and r.get("MetaType") == "0" and r.get("Type") == "unlock" and r.get("Target") and not _off(r))
+
+
 def heroes():
-    """playable brawlers = Hero rows that own cards (obs_v5.hero_names: drops transforms, bosses and the hashed unreleased
-    rows) minus skip.json"""
+    """playable brawlers = obs_v5.hero_names rows with an enabled unlock card (106 in this build), table order, minus
+    skip.json: the battle pool. The hero_names rows without one are forms()."""
     bad = set(_skip().get("brawlers", []))
-    return [n for n in O.hero_names() if n not in bad]
+    return [n for n in O.hero_names() if n in _unlocked() and n not in bad]
+
+
+def forms():
+    """hero_names rows without an unlock card (9 in this build): other forms a brawler turns into in battle (Meg's mech
+    MechaDudeBig, Bonnie's CannonGirlSmall, Moe's DiggerDrill, Kaze's GeishaTransformed) and the SuperNova* event
+    transforms. Never picked; they keep their identity rows (a transformed Meg is still a brawler to identify)."""
+    return [n for n in O.hero_names() if n not in _unlocked()]
 
 
 T_CARD = 23   # cards.csv data type (gadget cards are 23xxxxxx; ids count the named rows, as nbpc.diversity.table)
@@ -74,7 +93,7 @@ def gadget_cards():
     out, k = {}, 0
     for r in D._rows("cards.csv"):
         if not r[next(iter(r))]: continue
-        if r.get("MetaType") == "5" and r.get("Target") and r.get("Disabled") != "true":
+        if r.get("MetaType") == "5" and r.get("Target") and not _off(r):
             out.setdefault(r["Target"], []).append(T_CARD * 1000000 + k)
         k += 1
     return out
@@ -97,7 +116,7 @@ def with_hyper(cfg):
 def hyper_brawlers():
     """brawlers (characters.csv Name) with a hypercharge card (cards.csv MetaType 6, Target = the brawler)"""
     return frozenset(r["Target"] for r in D._rows("cards.csv")
-                     if r[next(iter(r))] and r.get("MetaType") == "6" and r.get("Target") and r.get("Disabled") != "true")
+                     if r[next(iter(r))] and r.get("MetaType") == "6" and r.get("Target") and not _off(r))
 
 
 def locations():
@@ -963,7 +982,21 @@ def _check():
     _check_who(NS)
     _check_gadgets(NS)
     _check_hyper(NS)
-    print("env_v5 sliders, aux labels, intents, planner hook, identity rows, gadget / hypercharge readiness ok")
+    _check_roster()
+    print("env_v5 sliders, aux labels, intents, planner hook, identity rows, gadget / hypercharge readiness, roster ok")
+
+
+def _check_roster():
+    """the battle pool (issue #23): the playable brawlers, not the other forms or event transforms (the game's tables)"""
+    hs, fs = heroes(), forms()
+    assert len(hs) == 106 and len(fs) == 9 and not set(hs) & set(fs) and set(hs) | set(fs) == set(O.hero_names()), (len(hs), fs)
+    assert {"MechaDudeBig", "CannonGirlSmall", "DiggerDrill", "GeishaTransformed", "SuperNovaCactus"} <= set(fs)
+    assert {"MechaDude", "CannonGirl", "Digger", "Geisha", "ShotgunGirl", "KatanaKid", "FutureGirl"} <= set(hs)
+    assert all(O.id_row(f) >= 0 for f in fs)                                    # forms keep their identity rows
+    cfg = make_battle_fn(10, seed0=7)(np.random.default_rng(1), 0)
+    assert set(cfg["tag"]["chr"]) <= set(hs), cfg["tag"]["chr"]
+    gc = gadget_cards()                                                         # Disabled TRUE (Driller_Proto, Baseball_Proto): out
+    assert len(gc["Driller"]) == 2 and len(gc["Baseball"]) == 2, (gc.get("Driller"), gc.get("Baseball"))
 
 
 def _check_gadgets(NS):

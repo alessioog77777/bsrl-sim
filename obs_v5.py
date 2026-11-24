@@ -446,8 +446,9 @@ def brawler_stats(name):
 
 @functools.lru_cache(None)
 def hero_names():
-    """playable brawlers = Hero rows that own cards (drops transforms, bosses and the hashed unreleased rows), table order
-    (env_v5.heroes = these minus skip.json)"""
+    """identity names = Hero rows that own cards (drops bosses and the hashed unreleased rows), table order: the playable
+    brawlers and the forms they turn into in battle (env_v5.heroes = the playable ones, the battle pool; env_v5.forms =
+    the rest). Sizes the identity table (id_lut), so it is part of the observation contract."""
     import re
     owners = {r["Target"] for r in D._rows("cards.csv")}
     return tuple(n for n, (_, r) in D.table("characters.csv").items()
