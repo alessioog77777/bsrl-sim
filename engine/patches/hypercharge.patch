@@ -1,0 +1,416 @@
+# hypercharge (bsrl-sim issue #4): the hypercharge card on request (NbeDiv.hyper_mask -> offline.c my_player_ctor, config
+# +0x28), activation by NbeAction.fire 4 through libg's own 0xc42584, and the parts the client build lacks in
+# native/loader/hyper.c: the drain (+0xa4 per tick, 5 s from full), the end, and the speed / damage / shield buffs from
+# characters.csv (env.c rec_move / my_root). State in NbeResp hyp_*, mirrored in py/nbpc/proto.py; py/nbpc/instance.py
+# set_div takes "hyper". Applies on top of gadgets.patch. Paths relative to engine/.
+diff --git a/native/loader/build.sh b/native/loader/build.sh
+index 2e51585..a9ef4f5 100755
+--- a/native/loader/build.sh
++++ b/native/loader/build.sh
+@@ -10,5 +10,5 @@
+ set -e
+ cd "$(dirname "$0")"
+ aarch64-linux-gnu-gcc -O2 -g -ffp-contract=off -fno-omit-frame-pointer -static -D_GNU_SOURCE -Wall -Wno-unused-function -Wno-incompatible-pointer-types \
+-  -Wno-int-conversion -fno-strict-aliasing -Iinc -o nbhost_spawnfix2.tmp main.c elfload.c bionic_shim.c android_shim.c jni_fake.c boot.c hook.c offline.c battle_fix.c env.c prof.c encode.c heapcheck.c bar_fix.c gl_client.c gl_client_gen.c spawnfix.c gadget.c trace.c thunk.S -lm -lpthread
++  -Wno-int-conversion -fno-strict-aliasing -Iinc -o nbhost_spawnfix2.tmp main.c elfload.c bionic_shim.c android_shim.c jni_fake.c boot.c hook.c offline.c battle_fix.c env.c prof.c encode.c heapcheck.c bar_fix.c gl_client.c gl_client_gen.c spawnfix.c gadget.c hyper.c trace.c thunk.S -lm -lpthread
+ mv -f nbhost_spawnfix2.tmp nbhost_spawnfix2 && echo "built native/loader/nbhost_spawnfix2"
+diff --git a/native/loader/env.c b/native/loader/env.c
+index fa1e4f0..4c79906 100644
+--- a/native/loader/env.c
++++ b/native/loader/env.c
+@@ -125,6 +125,7 @@ static struct {
+     /* damage model / charge */
+     int charge_level;   /* >0 while a root call with a level-scaled character attacker is in progress */
+     long dm_applied, charge_fixes, guard_hits, alive_forced, root_calls, events;
++    long hyper_dmg, hyper_moves;   /* hypercharge round: damage hits scaled, moves sped up */
+     int in_own_call;    /* 1 = gas, 2 = bomb (our own calls to the damage root) */
+     int seed_applied;
+ } E;
+@@ -166,6 +167,14 @@ static int brawler_owner(void *sim, uint8_t *c) {   /* player index whose curren
+     int np, ow = I32(c, 0x80); void **ps = players(sim, &np);
+     return ow >= 0 && ow < np && ow < NBE_MAXP && ps[ow] && player_char_id(ps[ow]) == I32(c, 8) ? ow : -1;
+ }
++/* hypercharge round (bsrl-sim issue #4): hyper.c */
++void hyper_clear(void); void hyper_reset_player(int i, void *p); int hyper_active(void *p); int hyper_use(int i, void *p, uint8_t *ch);
++int hyper_tick_player(void *p, uint8_t *ch, int alive); int hyper_damage(void *pa, int ai, void *pv, int vi, int d);
++int hyper_speed(int i, void *p, uint8_t *ch); void hyper_publish(NbeResp *r, void **ps, int np);
++static void *owner_player(void *sim, void *c, int *idx) {   /* the player whose current brawler c is (NULL: none) */
++    *idx = -1; if (!sim || !c || VTOF(c) != VT_CHAR) return NULL;
++    int np; void **ps = players(sim, &np); *idx = brawler_owner(sim, c); return *idx >= 0 ? ps[*idx] : NULL;
++}
+ static int local_index(void) {
+     if (!E.battle) return -1; void *c = PTR(E.battle, 0x28); return c ? I32(c, 0xe0) : -1;
+ }
+@@ -348,6 +357,13 @@ static uint64_t my_root(void *victim, int a1, int dmg, int a3, int a4, void *att
+         }
+         E.charge_level = lvl;
+     }
++    if (dmg > 0 && E.sim && attacker && victim) {   /* hypercharge round: +damage of a hypercharged attacker, shield of a hypercharged victim */
++        int ai, vi; void *pa = owner_player(E.sim, attacker, &ai), *pv = owner_player(E.sim, victim, &vi);
++        if ((pa && hyper_active(pa)) || (pv && hyper_active(pv))) {
++            int nd = hyper_damage(pa, ai, pv, vi, dmg);
++            if (nd != dmg) { if (a3 == dmg) a3 = nd; dmg = nd; E.hyper_dmg++; }
++        }
++    }
+     int vchar = victim && VTOF(victim) == VT_CHAR, before = vchar ? I32(victim, 0x3c4) : 0;
+     int ow = vchar && mode3 && resp_on() && E.sim ? brawler_owner(E.sim, victim) : -1;
+     uint64_t r = o_root(victim, a1, dmg, a3, a4, attacker, src, a7, s0, s1, s2, s3, s4, s5, s6, s7, s8, s9);
+@@ -606,7 +622,15 @@ static void rec_put(int kind, uint8_t *ch, int a, int b, int c, int d) {
+     int32_t *r = RECB + 8 * g_rec_n++;
+     r[0] = I32(E.sim, 0x10); r[1] = I32(ch, 8); r[2] = kind; r[3] = a; r[4] = b; r[5] = c; r[6] = d; r[7] = I32(ch, 0x80);
+ }
+-static void rec_move(uint64_t *ctx) { rec_put(0, (uint8_t *)ctx[0], (int)ctx[1], (int)ctx[2], (int)ctx[6], 0); }
++/* mover 0xb4790c(char, x, y, useSpeed, speed, ..): with useSpeed 0 it moves at the CharacterData speed (0xab31e0); hypercharge
++ * round: a hypercharged brawler's move gets the +OverchargeSpeedPercent speed instead (moves with their own speed are left) */
++static void rec_move(uint64_t *ctx) {
++    rec_put(0, (uint8_t *)ctx[0], (int)ctx[1], (int)ctx[2], (int)ctx[6], 0);
++    if ((int)ctx[3] == 0 && E.sim) {
++        int i; void *p = owner_player(E.sim, (void *)ctx[0], &i); int sp = p ? hyper_speed(i, p, (uint8_t *)ctx[0]) : 0;
++        if (sp > 0) { ctx[3] = 1; ctx[4] = (uint64_t)(uint32_t)sp; E.hyper_moves++; }
++    }
++}
+ static void rec_stop(uint64_t *ctx) { rec_put(2, (uint8_t *)ctx[0], 0, 0, 0, 0); }
+ /* pctrain round: "native + lead" (research B1/B2/D2). The native AI's targeted attack (0xb8d888 -> bl 0xb487c4 at
+  * 0xb8dd38, return 0xb8dd3c; w6 = isSuper) passes the target's position + U[-150,150)^2 and never leads. For owners in
+@@ -854,10 +878,19 @@ static void client_pos(int i, uint8_t *ch, int *x, int *y) {
+     int k = (n - 5) & 7;      /* 4 ticks before the newest entry */
+     *x = jround(X - CLIENT_LAG_F * (X - E.hx[i][k])); *y = jround(Y - CLIENT_LAG_F * (Y - E.hy[i][k]));
+ }
++static void hyper_tick(void *sim) {   /* hypercharge round: drain / end (hyper.c); an ended one re-sends the move at normal speed */
++    int np; void **ps = players(sim, &np);
++    for (int i = 0; i < np && i < NBE_MAXP; i++) {
++        if (!ps[i] || !hyper_active(ps[i])) continue;
++        uint8_t *c = obj_by_id(sim, player_char_id(ps[i])); if (c && VTOF(c) != VT_CHAR) c = NULL;
++        if (hyper_tick_player(ps[i], c, c && I32(c, 0x3c4) > 0 && !waiting(i))) E.sent_valid[i] = 0;
++    }
++}
+ void env_tick_leave(void *sim) {   /* after a completed outer tick: showdownTick + afterState */
+     if (sim != E.sim) return;
+     if (--E.depth > 0) return;
+     record_positions(sim);
++    hyper_tick(sim);
+     if (I32(sim, 0x104) != 6) return;
+     item_tick(sim);
+     elimination_tick(sim);
+@@ -962,6 +995,11 @@ static void gadget_input(void *sim, int pidx, uint8_t *ch, double deg) {
+     if (gadget_use(sim, pidx, ch, deg, I32(sim, 0x10))) return;
+     double r = deg * M_PI / 180; apply_input(sim, pidx, 8, jround(1000 * cos(r)), jround(1000 * sin(r)), NULL);
+ }
++/* hypercharge round: NbeAction.fire 4 -> libg's activation 0xc42584 (hyper.c); the move is re-sent at the hypercharged speed */
++static void hyper_input(void *sim, int pidx, uint8_t *ch) {
++    int np; void **ps = players(sim, &np);
++    if (pidx < np && hyper_use(pidx, ps[pidx], ch)) E.sent_valid[pidx] = 0;
++}
+ /* rl round (tests): fire the character's skill instance idx (char +0x458 array, +0x464 count; instance +0 = SkillData) like an attack */
+ static void skill_idx_input(void *sim, int pidx, uint8_t *ch, int idx, double deg) {
+     uint8_t **arr = PTR(ch, 0x458); int n = I32(ch, 0x464);
+@@ -1004,6 +1042,7 @@ static int client_intents(void *sim, int i, uint8_t *ch, const NbeAction *a) {
+     if (a->fire == 1) { fire_input_at(sim, i, ch, 0, a->aim_deg, 1, cx, cy); E.cl_attacks++; }
+     else if (a->fire == 2) { fire_input_at(sim, i, ch, 1, a->aim_deg, a->super_dist > 0 && a->super_dist <= 1 ? a->super_dist : 1, cx, cy); E.cl_attacks++; }
+     else if (a->fire == 3) gadget_input(sim, i, ch, a->aim_deg);   /* diversity round */
++    else if (a->fire == 4) hyper_input(sim, i, ch);                /* hypercharge round */
+     else if (a->fire >= 200) skill_idx_input(sim, i, ch, a->fire - 200, a->aim_deg);   /* rl round (tests) */
+         else if (a->fire >= 100) apply_input(sim, i, a->fire - 100, 1, 1, NULL);   /* rl round: raw input kind (tests) */
+     (void)cc; return 1;
+@@ -1032,6 +1071,7 @@ static void apply_actions(void *sim, const NbeCmd *c) {
+             E.moving[i] = 0; E.last_dir[i] = -1; E.sent_valid[i] = 0;
+         }
+         if (a->fire == 3) gadget_input(sim, i, ch, a->aim_deg);   /* diversity round */
++        else if (a->fire == 4) hyper_input(sim, i, ch);                /* hypercharge round */
+         else if (a->fire >= 200) skill_idx_input(sim, i, ch, a->fire - 200, a->aim_deg);   /* rl round (tests) */
+         else if (a->fire >= 100) apply_input(sim, i, a->fire - 100, 1, 1, NULL);   /* rl round: raw input kind (tests) */
+         if (a->fire == 1) fire_input(sim, i, ch, 0, a->aim_deg, 1);
+@@ -1143,6 +1183,7 @@ static void my_setseed(void *sim, int seed) {   /* builder 0x9bb7c4: bl 0xc24a08
+  * All requests are checked against the game's own tables; a rejected one falls back to the default (NbeResp.div_err). */
+ #define LOC_GLOBAL 0x12eefc0
+ int32_t g_div_char[NBE_MAXP], g_div_skin[NBE_MAXP], g_div_gadget[NBE_MAXP], g_div_star[NBE_MAXP];   /* offline.c my_player_ctor */
++uint32_t g_div_hyper;   /* hypercharge round: RESET div.hyper_mask (offline.c my_player_ctor) */
+ static uint32_t g_div_team;
+ static void *g_div_map_loc;   /* RESET div.reserved[1]: a location (any mode) whose Map row the battle location uses instead (my_loc_map) */   /* RESET div.reserved[0]: bit i = player i joins player 0's team (env_after_build) */
+ static void *g_play_loc, *g_div_cl_loc; static uint8_t *g_theme_loc; static void *g_theme_orig; static int32_t g_div_err;
+@@ -1175,6 +1216,7 @@ static void div_reset(const NbeCmd *c) {   /* a RESET was accepted: set up the n
+         else g_div_err |= 1u << 31;
+     }
+     g_div_team = (uint32_t)c->div.reserved[0];
++    g_div_hyper = c->div.hyper_mask;   /* hypercharge round: offline.c my_player_ctor */
+     g_div_map_loc = c->div.reserved[1] ? div_data(c->div.reserved[1]) : NULL;
+     if (c->div.reserved[1] && (!g_div_map_loc || c->div.reserved[1] / 1000000 != 15)) { g_div_err |= 1 << 30; g_div_map_loc = NULL; }
+     for (int i = 0; i < NBE_MAXP; i++) { g_div_char[i] = c->div.chr[i]; g_div_skin[i] = c->div.skin[i]; g_div_gadget[i] = c->div.gadget[i]; g_div_star[i] = c->div.star[i]; }
+@@ -1196,7 +1238,7 @@ static void div_publish(void *sim) {   /* RESET response: read the battle back f
+     R->div_variation = I32(sim, 0x104);
+     R->div_reserved[0] = U8(sim, 0x134);   /* the builder's "cards" flag (global 0x12eefd4): 0 = player configs get no star power /
+                                               gadget / overcharge cards (0xc27d64) */
+-    int np; void **ps = players(sim, &np); gadget_clear();
++    int np; void **ps = players(sim, &np); gadget_clear(); hyper_clear();
+     for (int i = 0; i < NBE_MAXP; i++) {
+         R->pl_char[i] = R->pl_skin[i] = 0;
+         if (i >= np || !ps[i]) continue;
+@@ -1205,6 +1247,7 @@ static void div_publish(void *sim) {   /* RESET response: read the battle back f
+         R->pl_char[i] = ld ? data_id(ld[0]) : 0; R->pl_skin[i] = data_id(skin);
+         if (PTR(ps[i], 0x190)) R->div_reserved[1] |= 1 << i;
+         gadget_reset_player(i, PTR(ps[i], 0x190) != NULL);   /* gadget round */
++        hyper_reset_player(i, ps[i]);                         /* hypercharge round */
+         if (ld && ld[1] && PTR(ld[1], 0x08)) R->div_reserved[2] |= 1 << i;
+     }
+ }
+@@ -1344,6 +1387,7 @@ static void publish(void *sim, uint32_t seq, int status, const char *err) {
+     fill_players(sim);
+     if (E.cur.type == NBE_CMD_RESET) div_publish(sim);   /* diversity round (before gadget_publish: it sets up the gadgets) */
+     gadget_publish(R, I32(sim, 0x10));                   /* gadget round */
++    { int np; void **ps = players(sim, &np); hyper_publish(R, ps, np); }   /* hypercharge round */
+     R->njumps = 0; for (int i = 0; i < E.njobs && i < NBE_MAXP; i++) { int *j = R->jumps[R->njumps++]; j[0] = E.jobs[i].id; j[1] = E.jobs[i].t; j[2] = E.jobs[i].T; j[3] = E.jobs[i].x1; j[4] = E.jobs[i].y1; }
+     R->ncubes = 0; for (int i = 0; i < E.ncube && i < NBE_MAXP; i++) { R->cubes[R->ncubes][0] = E.cube_id[i]; R->cubes[R->ncubes++][1] = E.cube_n[i]; }
+     R->cam_valid = 0;
+diff --git a/native/loader/hyper.c b/native/loader/hyper.c
+new file mode 100644
+index 0000000..3dc007b
+--- /dev/null
++++ b/native/loader/hyper.c
+@@ -0,0 +1,130 @@
++/* hypercharge round (bsrl-sim issue #4): the host's own hypercharge ("Overcharge" in libg) for the battle.
++ *
++ * What the shipped libg v68.279 (a client build) still has: the activation 0xc42584(player, char) (reached in the game by
++ * input kind 17 and by the bot AI; the input path is gated off offline) and the charging inside the super charge 0xc420d8
++ * (player+0x98 += damage-based charge x CharacterData OverchargeChargeMul, 0 while active: OverchargeChargeActiveMul).
++ * The activation needs the brawler's hypercharge card (cards.csv MetaType 6) in the player config (+0x28, the slot 0xc33e84
++ * fills for MetaType 6), a full charge (+0x98 >= +0x9c) and not already active (+0xa0); it sets +0xa0 = 1, char+0x68 = 1
++ * (overcharged) and the drain per tick +0xa4 = 40 (divided by 1 + x/100 for an "extend" card modifier), and spends nothing.
++ * What is compiled out (server code): the drain and the expiry, and the three buffs. Measured (2026-11-24, Shelly, host
++ * without this file): speed, shot damage and damage taken identical active and inactive; active never ended (400+ ticks),
++ * the charge stayed full.
++ *
++ * Here: equip (offline.c my_player_ctor puts hyper_card_for(character) in cfg+0x28 for the RESET's div.hyper_mask), activate
++ * (NbeAction.fire 4 -> hyper_use -> libg's own 0xc42584), drain +0xa4 per tick from the charge and end at 0 (hyper_tick:
++ * 4000 / 40 = 100 ticks = 5 s at 20 ticks/s, as in the real game), and the buffs from the brawler's characters.csv row while
++ * active: OverchargeSpeedPercent on the move speed (env.c rec_move), OverchargeDamagePercent on damage dealt and
++ * OverchargeShieldPercent off damage taken (env.c my_root). The state goes to Python in NbeResp hyp_* (every response).
++ *
++ * NOT done: the hypercharged super (characters.csv OverchargedUltimateSkill / skills.csv OverchargedVersion, 7 brawlers in
++ * this table): the super stays the normal one. The visual effects (client side) are whatever the client draws from +0xa0. */
++#include "nbhost.h"
++#include "nbenv_proto.h"
++#include <string.h>
++
++#define I32(p, o) (*(int32_t *)((uint8_t *)(p) + (o)))
++#define U8(p, o) (*(uint8_t *)((uint8_t *)(p) + (o)))
++#define PTR(p, o) (*(void **)((uint8_t *)(p) + (o)))
++extern Module *g_libg;
++#define B(off) ((uint8_t *)g_libg->base + (off))
++void *div_data(int id);   /* env.c: data row by global id, NULL unless the table has it */
++
++#define DRAIN_DEFAULT 40   /* +0xa4 that 0xc42584 sets without a duration modifier (4000 max / 40 = 100 ticks = 5 s) */
++
++static void *player_cfg(void *p) {   /* the active loadout's config (player+0x30[player+0x40] -> +0x08); +0x28 hypercharge card */
++    void **lo = PTR(p, 0x30); int li = I32(p, 0x40); void **ld = lo && li >= 0 && li < 8 ? lo[li] : NULL;
++    return ld ? ld[1] : NULL;
++}
++static void *player_chardata(void *p) {
++    void **lo = PTR(p, 0x30); int li = I32(p, 0x40); void **ld = lo && li >= 0 && li < 8 ? lo[li] : NULL;
++    return ld ? ld[0] : NULL;
++}
++static int cd_pct(void *cd, unsigned off) { return cd ? ((int (*)(void *))B(off))(cd) : 0; }
++/* CharacterData getters (characters.csv Overcharge* columns) */
++#define CD_DAMAGE_PCT 0xab32a4
++#define CD_SPEED_PCT 0xab32b0
++#define CD_SHIELD_PCT 0xab32bc
++
++/* the character's hypercharge card (cards.csv MetaType 6 whose target, card+0xd8, is this CharacterData), NULL if it has
++ * none; cached per character (the cards table does not change while the host runs) */
++void *hyper_card_for(void *chardata) {
++    static struct { void *d, *card; } cache[128]; static int n;
++    if (!chardata) return NULL;
++    for (int k = 0; k < n; k++) if (cache[k].d == chardata) return cache[k].card;
++    void *found = NULL;
++    for (int idx = 0, miss = 0; idx < 20000 && miss < 64; idx++) {   /* table 23 = cards; stop after a run of missing rows */
++        uint8_t *card = div_data(23000000 + idx);
++        if (!card) { miss++; continue; }
++        miss = 0;
++        if (*(void **)(card + 0xd8) == chardata && I32(card, 0x108) == 6) { found = card; break; }
++    }
++    if (n < 128) { cache[n].d = chardata; cache[n].card = found; n++; }
++    return found;
++}
++
++typedef struct { int card, used, dmg_pct, speed_pct, shield_pct; } Hyp;
++static Hyp g_hyp[NBE_MAXP];
++
++void hyper_clear(void) { memset(g_hyp, 0, sizeof g_hyp); }
++
++/* RESET response (env.c div_publish), per player: the card the game's config holds and the brawler's buff percents */
++void hyper_reset_player(int i, void *p) {
++    if (i < 0 || i >= NBE_MAXP) return;
++    Hyp *h = &g_hyp[i]; memset(h, 0, sizeof *h);
++    void *cfg = p ? player_cfg(p) : NULL, *card = cfg ? PTR(cfg, 0x28) : NULL, *cd = p ? player_chardata(p) : NULL;
++    if (!card) return;
++    h->card = I32(card, 0x20);
++    h->dmg_pct = cd_pct(cd, CD_DAMAGE_PCT); h->speed_pct = cd_pct(cd, CD_SPEED_PCT); h->shield_pct = cd_pct(cd, CD_SHIELD_PCT);
++    static int nlog; if (nlog++ < 20) LOG("[hyper] player %d card %d: damage +%d%%, speed +%d%%, shield %d%%\n", i, h->card,
++                                          h->dmg_pct, h->speed_pct, h->shield_pct);
++}
++
++int hyper_active(void *p) { return p && U8(p, 0xa0); }
++
++/* NbeAction.fire 4 for player i (its brawler ch, alive): libg's activation; -> 1 if the hypercharge is now active and was not */
++int hyper_use(int i, void *p, uint8_t *ch) {
++    if (i < 0 || i >= NBE_MAXP || !p || !ch || !g_hyp[i].card || U8(p, 0xa0) || I32(p, 0x98) < I32(p, 0x9c)) return 0;
++    ((void (*)(void *, void *))B(0xc42584))(p, ch);
++    if (!U8(p, 0xa0)) return 0;   /* refused by the game's own checks (e.g. a state that forbids it) */
++    g_hyp[i].used++;
++    static int nlog; if (nlog++ < 40) LOG("[hyper] player %d activated (charge %d, drain %d/tick)\n", i, I32(p, 0x98), I32(p, 0xa4));
++    return 1;
++}
++
++/* after every tick, per player (ch = its brawler or NULL): drain the charge; -> 1 if the hypercharge ended at this tick */
++int hyper_tick_player(void *p, uint8_t *ch, int alive) {
++    if (!p || !U8(p, 0xa0)) return 0;
++    int drain = I32(p, 0xa4) > 0 ? I32(p, 0xa4) : DRAIN_DEFAULT, c = I32(p, 0x98) - drain;
++    if (c > 0 && alive) { I32(p, 0x98) = c; return 0; }
++    I32(p, 0x98) = alive ? 0 : (c > 0 ? c : 0); U8(p, 0xa0) = 0;   /* ended (charge used up, or the brawler died) */
++    if (ch) U8(ch, 0x68) = 0;
++    return 1;
++}
++
++/* damage through the root 0xb422d0: d > 0 dealt by player ai's brawler to player vi's brawler (-1 = not a player's brawler) */
++int hyper_damage(void *pa, int ai, void *pv, int vi, int d) {
++    if (d <= 0) return d;
++    if (ai >= 0 && ai < NBE_MAXP && hyper_active(pa) && g_hyp[ai].dmg_pct) d = d * (100 + g_hyp[ai].dmg_pct) / 100;
++    if (vi >= 0 && vi < NBE_MAXP && hyper_active(pv) && g_hyp[vi].shield_pct) d = d * (100 - g_hyp[vi].shield_pct) / 100;
++    return d;
++}
++
++/* the move speed (units/s) player i's brawler moves with now, 0 = unchanged (not hypercharged) */
++int hyper_speed(int i, void *p, uint8_t *ch) {
++    if (i < 0 || i >= NBE_MAXP || !hyper_active(p) || !g_hyp[i].speed_pct || !ch) return 0;
++    void *cd = ((void *(*)(void *))B(0xb6a384))(ch);   /* the brawler's CharacterData (what the mover reads its speed from) */
++    int base = cd ? ((int (*)(void *))B(0xab31e0))(cd) : 0;
++    return base > 0 ? base * (100 + g_hyp[i].speed_pct) / 100 : 0;
++}
++
++void hyper_publish(NbeResp *r, void **ps, int np) {   /* every response */
++    r->hyp_valid = 1;
++    for (int i = 0; i < NBE_MAXP; i++) {
++        const Hyp *h = &g_hyp[i]; void *p = i < np ? ps[i] : NULL;
++        int on = hyper_active(p), drain = p && I32(p, 0xa4) > 0 ? I32(p, 0xa4) : DRAIN_DEFAULT;
++        r->hyp_card[i] = h->card; r->hyp_used[i] = h->used;
++        r->hyp_left[i] = on ? (I32(p, 0x98) + drain - 1) / drain : 0;
++        r->hyp_damage_pct[i] = h->card ? h->dmg_pct : 0; r->hyp_speed_pct[i] = h->card ? h->speed_pct : 0;
++        r->hyp_shield_pct[i] = h->card ? h->shield_pct : 0;
++    }
++}
+diff --git a/native/loader/nbenv_proto.h b/native/loader/nbenv_proto.h
+index 0aae8ff..5765e7f 100644
+--- a/native/loader/nbenv_proto.h
++++ b/native/loader/nbenv_proto.h
+@@ -30,7 +30,8 @@ enum { NBE_ST_BOOT = 0, NBE_ST_READY = 1, NBE_ST_RUNNING = 2, NBE_ST_DEAD = 9 };
+ 
+ typedef struct {
+     int32_t move_dir;     /* -1 = joystick released (stop if moving), 0..15 = direction k*22.5 deg (x right, y down) */
+-    int32_t fire;         /* 0 none, 1 attack (attack_angle), 2 super (super_angle + super_dist), 3 gadget (input kind 8, diversity round) */
++    int32_t fire;         /* 0 none, 1 attack (attack_angle), 2 super (super_angle + super_dist), 3 gadget (input kind 8, diversity round),
++                             4 hypercharge (hypercharge round, hyper.c; no aim) */
+     float aim_deg;        /* any degrees, x right / y down */
+     float super_dist;     /* (0, 1] -> leap length 2600 * dist */
+ } NbeAction;
+@@ -47,6 +48,9 @@ typedef struct {          /* diversity round: NbeCmd.div (RESET) */
+     uint32_t setup_super_mask; /* SETUP (test harness): bit i = fill player i's super charge (player +0x54 = +0x58); bit 16+i = its hypercharge (+0x98 = +0x9c) */
+     uint32_t setup_unprotect_mask; /* SETUP (test harness): bit i = clear player i's spawn protection (char +0x4f0 end tick = 0) */
+     int32_t reserved[2];
++    /* hypercharge round (bsrl-sim issue #4, appended): bit i = put player i's brawler's hypercharge card (cards.csv MetaType 6)
++     * in its config (+0x28), so NbeAction.fire 4 can activate it (hyper.c); 0 = none (as before). A brawler without one gets none */
++    uint32_t hyper_mask;
+ } NbeDiv;
+ #define NBE_DIV_MAGIC 0x31564944u   /* 'DIV1' in NbeHdr.reserved[0]: this game host understands NbeCmd.div / NbeResp.div_* */
+ 
+@@ -144,6 +148,14 @@ typedef struct {
+     int32_t gad_charges[NBE_MAXP];    /* uses left this battle */
+     int32_t gad_cd[NBE_MAXP];         /* ticks until it can be used again (0 = now) */
+     int32_t gad_used[NBE_MAXP];       /* activations so far this battle */
++    /* hypercharge round (bsrl-sim issue #4, appended): the host's hypercharge (hyper.c: libg's activation, the host's drain,
++     * expiry and buffs). The charge and its max are NbePlayer.reserved[0] / [1]. A host without it leaves all 0 (hyp_valid 0).
++     * Per player index: */
++    int32_t hyp_valid;                /* 1 = written by a host with hyper.c (every response) */
++    int32_t hyp_card[NBE_MAXP];       /* cards.csv data id of the equipped hypercharge card (0 = none: cannot hypercharge) */
++    int32_t hyp_left[NBE_MAXP];       /* ticks of hypercharge left (0 = not active) */
++    int32_t hyp_used[NBE_MAXP];       /* activations so far this battle */
++    int32_t hyp_damage_pct[NBE_MAXP], hyp_speed_pct[NBE_MAXP], hyp_shield_pct[NBE_MAXP];   /* buffs while active (characters.csv) */
+ } NbeResp;
+ /* NbeResp.gad_kind: what an activation does (one re-implementation per kind, from the gadget's own data rows) */
+ #define NBE_GAD_NONE 0
+diff --git a/native/loader/offline.c b/native/loader/offline.c
+index d82bb74..3ef7d0e 100644
+--- a/native/loader/offline.c
++++ b/native/loader/offline.c
+@@ -147,7 +147,7 @@ static void *char_data(const char *name) {
+  * player at players[sim+0x60]) the RESET's character / skin (env.c div_reset -> g_div_char / g_div_skin, global data ids);
+  * 0 = the default above. The character must be a playable brawler (characters.csv Type Hero: data+0x23c equal to the
+  * roster brawler's), the skin one of that character's (the game's own check 0xc70d2c: the skin's SkinConf lists it). */
+-extern int32_t g_div_char[16], g_div_skin[16], g_div_gadget[16], g_div_star[16]; extern void *div_data(int id); extern void div_reject(int i);
++extern int32_t g_div_char[16], g_div_skin[16], g_div_gadget[16], g_div_star[16]; extern uint32_t g_div_hyper; void *hyper_card_for(void *chardata); extern void *div_data(int id); extern void div_reject(int i);
+ static void my_player_ctor(uint64_t *ctx) {
+     if (!g_building || !g_roster || !*g_roster) return;
+     uint8_t *sim = (uint8_t *)ctx[0]; int variation = *(int32_t *)(sim + 0x104), slot = *(int32_t *)(sim + 0x60);
+@@ -176,6 +176,13 @@ static void my_player_ctor(uint64_t *ctx) {
+             *(void **)((uint8_t *)cfg + (k ? 0x08 : 0x10)) = card;
+         else { div_reject(slot); LOG("[battle] roster: slot %d %s card %d rejected\n", slot, k ? "star power" : "gadget", id); }
+     }
++    /* hypercharge round (bsrl-sim issue #4): the RESET's div.hyper_mask bit = this character's hypercharge card (MetaType 6) into
++     * config +0x28, where libg's activation 0xc42584 looks for it (hyper.c); a character without one gets none (not an error) */
++    if (slot >= 0 && slot < 16 && ((g_div_hyper >> slot) & 1)) {
++        void *hc = hyper_card_for(d);
++        if (hc) *(void **)((uint8_t *)cfg + 0x28) = hc;
++        static int nlog; if (nlog++ < 40) LOG("[battle] roster: slot %d hypercharge card %d\n", slot, hc ? *(int32_t *)((uint8_t *)hc + 0x20) : 0);
++    }
+     ctx[2] = (uint64_t)d; ctx[3] = (uint64_t)cfg; *(void **)((uint8_t *)ctx + 160 + 8) = skin;
+     if (g_pinned++ < 10 || ((ci || si) && g_pinned < 400)) LOG("[battle] roster: slot %d -> %s (data id %d, skin %d)\n", slot, ci ? "div" : g_roster,
+         *(int32_t *)((uint8_t *)d + 0x20), *(int32_t *)((uint8_t *)skin + 0x20));
+diff --git a/py/nbpc/instance.py b/py/nbpc/instance.py
+index 2b2583f..2d8e225 100644
+--- a/py/nbpc/instance.py
++++ b/py/nbpc/instance.py
+@@ -25,7 +25,8 @@ class InstanceDead(RuntimeError):
+ 
+ 
+ def set_div(d, div):
+-    """fill a proto.Div from {"location", "theme", "chr", "skin"} (chr / skin: {player index: id} or a list by index)"""
++    """fill a proto.Div from {"location", "theme", "chr", "skin", "gadget", "star", "hyper", ...} (chr / skin / gadget / star:
++    {player index: id} or a list by index; hyper: player indices, or a bit mask)"""
+     div = div or {}
+     d.location = int(div.get("location") or 0); d.theme = int(div.get("theme") or 0)
+     for f in ("chr", "skin", "gadget", "star"):
+@@ -42,6 +43,8 @@ def set_div(d, div):
+     g = div.get("team_groups")   # rl round: group id 0-7 per player (0 = alone); players of one group share a team
+     if g: d.reserved[0] = ((1 << 31) | sum((int(x) & 7) << (3 * i) for i, x in enumerate(list(g)[:10]))) - (1 << 32)
+     d.reserved[1] = int(div.get("map_location") or 0)   # RESET: a location (any mode) whose map layout is used (needs native/loader/nbhost_maps)
++    hm = div.get("hyper") or ()   # hypercharge round: player indices whose brawler gets its hypercharge card (needs native/loader/hyper.c)
++    d.hyper_mask = int(hm) & 0xffffffff if isinstance(hm, int) else sum(1 << int(i) for i in hm if 0 <= int(i) < P.MAXP)
+ 
+ 
+ QEMU_NB = os.path.join(NATIVE, "qemu", "bin", "qemu-aarch64-nb")
+diff --git a/py/nbpc/proto.py b/py/nbpc/proto.py
+index 779d56c..9ef5158 100644
+--- a/py/nbpc/proto.py
++++ b/py/nbpc/proto.py
+@@ -36,7 +36,8 @@ class Div(C.Structure):
+                 ("gadget", C.c_int32 * MAXP), ("star", C.c_int32 * MAXP),   # cards.csv ids (gadget MetaType 5 / star power 4)
+                 ("setup_super_mask", C.c_uint32),                            # SETUP: bit i = fill player i's super
+                 ("setup_unprotect_mask", C.c_uint32),                        # SETUP: bit i = clear player i's spawn protection
+-                ("reserved", C.c_int32 * 2)]
++                ("reserved", C.c_int32 * 2),
++                ("hyper_mask", C.c_uint32)]   # hypercharge round (bsrl-sim issue #4): bit i = equip player i's hypercharge card
+ 
+ 
+ DIV_MAGIC = 0x31564944   # Hdr.reserved[0] of a game host that understands Cmd.div / Resp.div_*
+@@ -84,7 +85,12 @@ class Resp(C.Structure):
+         # (gad_valid 0) with a host without it. Per player: cards.csv id, GAD_* kind (0 = not implemented), uses left,
+         # ticks of cooldown left, activations so far
+         ("gad_valid", C.c_int32), ("gad_card", C.c_int32 * MAXP), ("gad_kind", C.c_int32 * MAXP),
+-        ("gad_charges", C.c_int32 * MAXP), ("gad_cd", C.c_int32 * MAXP), ("gad_used", C.c_int32 * MAXP)]
++        ("gad_charges", C.c_int32 * MAXP), ("gad_cd", C.c_int32 * MAXP), ("gad_used", C.c_int32 * MAXP),
++        # hypercharge round (bsrl-sim issue #4, appended): the host's hypercharge (native/loader/hyper.c); all 0 (hyp_valid 0)
++        # with a host without it. Per player: equipped card id (0 = none), ticks active left (0 = off), activations so far,
++        # the buffs while active (percent: damage dealt +, move speed +, damage taken -). Charge / max: Player.reserved[0] / [1]
++        ("hyp_valid", C.c_int32), ("hyp_card", C.c_int32 * MAXP), ("hyp_left", C.c_int32 * MAXP), ("hyp_used", C.c_int32 * MAXP),
++        ("hyp_damage_pct", C.c_int32 * MAXP), ("hyp_speed_pct", C.c_int32 * MAXP), ("hyp_shield_pct", C.c_int32 * MAXP)]
+ 
+ 
+ GAD_NONE, GAD_DASH, GAD_HEAL, GAD_SHIELD, GAD_SPAWN, GAD_PROJECTILE, GAD_STATUS = range(7)   # Resp.gad_kind (nbenv_proto.h NBE_GAD_*)

@@ -41,6 +41,10 @@ Changes made to nirkt's code, all recorded in `engine/patches/`:
 - `gadgets.patch` (issue #3, a diff on top of the three above): per-player gadget state in the response (`NbeResp`
   `gad_*`, mirrored in `nbpc/proto.py`) and the host's own gadget activation in `native/loader/gadget.c`, which
   `env.c` `gadget_input` tries first. No gadget kind is implemented yet, so every gadget still reads as not usable.
+- `hypercharge.patch` (issue #4, a diff on top of `gadgets.patch`): the hypercharge card on request (`NbeDiv.hyper_mask`,
+  put in the player config by `offline.c`), activation by `NbeAction.fire` 4 through libg's own activation, and in
+  `native/loader/hyper.c` the parts the client build lacks: the drain to 0 over 5 s, the end, and the speed / damage /
+  shield buffs from `characters.csv` (`env.c` `rec_move` / `my_root`). State in `NbeResp` `hyp_*`, mirrored in `nbpc/proto.py`.
 - `maenv.py` and `fair.py` copied from nbrl-env's `py/nbpc` into bulletlabels' `vendor/nbpc` (now `engine/py/nbpc`),
   so one `nbpc` package holds the host side and the environment side.
 - The game download link removed from bulletlabels' `setup.sh` (`engine/setup.sh`) (this repo's `setup.sh` downloads it instead).
@@ -60,9 +64,13 @@ downloaded game build, default `work/`), `SIM_VENV`.
 - **Variables come out empty.** `env.sh` must have LF line endings (CRLF breaks every variable). From Windows, pass
   scripts to `wsl.exe ... bash -s` on stdin.
 - **Slow start.** One boot takes 60-90 s. Batch your checks into one run.
-- **The fire head never uses gadgets or hypercharge.** The game build compiles gadget activation out, and the host
-  activates only the kinds `native/loader/gadget.c` implements (none yet), so the gadget class stays masked. Hypercharge
-  has no fire class yet (issue #4). `python -m gadget_check` shows which kinds the built host publishes.
-- **`gadget_check` says the host publishes no gadget state.** `setup.sh` builds the host only when
+- **The fire head never uses gadgets.** The game build compiles gadget activation out, and the host activates only the
+  kinds `native/loader/gadget.c` implements (none yet), so the gadget class stays masked. `python -m gadget_check` shows
+  which kinds the built host publishes.
+- **The fire head never uses hypercharge.** It needs `--hyper 1` (players get their card) and a host built with
+  `native/loader/hyper.c`. `python -m hyper_check` checks the built host.
+- **Every boot crashes at "loading 45%".** A game file is a Git LFS pointer, not the file (seen with `assets/sc/ui.sc`
+  from a git clone of the game files): run `git lfs pull` in that clone.
+- **`gadget_check` / `hyper_check` say the host publishes no gadget / hypercharge state.** `setup.sh` builds the host only when
   `native/loader/nbhost_rl` is missing: after a change in `engine/native/loader`, delete it and rerun
   `./setup.sh --no-apt --no-python`.
