@@ -110,8 +110,10 @@ void superfix_install(void) {
     LOG("[superfix] installed (spawnAreaEffect, delayed damage, heal own)\n");
     extern void superfix_items_install(void) __attribute__((weak)); if (superfix_items_install) superfix_items_install();
     extern void superfix_moves_install(void) __attribute__((weak)); if (superfix_moves_install) superfix_moves_install();
+    extern void superfix_status_install(void) __attribute__((weak)); if (superfix_status_install) superfix_status_install();
 }
 void superfix_status(void) { LOG("[superfix] areas spawned %ld, skipped %ld; delayed damage %ld; heal own %ld projectiles, %ld owners\n",
                                  g_narea, g_narea_skip, g_ndelayed, g_nheal, g_nheal_self);
     extern void superfix_items_status(void) __attribute__((weak)); if (superfix_items_status) superfix_items_status();
-    extern void superfix_moves_status(void) __attribute__((weak)); if (superfix_moves_status) superfix_moves_status(); }
+    extern void superfix_moves_status(void) __attribute__((weak)); if (superfix_moves_status) superfix_moves_status();
+    extern void superfix_status_status(void) __attribute__((weak)); if (superfix_status_status) superfix_status_status(); }
