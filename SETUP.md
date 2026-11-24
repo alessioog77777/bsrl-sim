@@ -60,6 +60,11 @@ Changes made to nirkt's code, all recorded in `engine/patches/`:
   game builds it as the brawler's third skill instance) it takes the super's place while hypercharged (`hyper.c`
   `swap_ulti` / `hyper_unswap`). Meg's mech takes Meg's card. `NbeResp` `hyp_supers` / `hyp_super_id` count the supers cast
   while hypercharged (`python -m super_audit --hyper`).
+- `showdown.patch` (issue #21, a diff on top of the others): Showdown rules the client build lacks. `native/loader/env.c`
+  `elimination_tick` ends a battle with teams when one team is left (`NbeResp.winner` = that team's lowest-index player);
+  `env.c` mirrors each brawler's power cubes into character `+0x874`, so libg's own death drop (inside the damage root)
+  drops min(cubes / 3 + 1, 5) cubes, 2 at most for a trio group, as Trio Showdown does; a respawned teammate comes back
+  after 17 s (`RespawnSeconds`) with 3 s of spawn protection. `python -m showdown_check` checks it live.
 - `maenv.py` and `fair.py` copied from nbrl-env's `py/nbpc` into bulletlabels' `vendor/nbpc` (now `engine/py/nbpc`),
   so one `nbpc` package holds the host side and the environment side.
 - The game download link removed from bulletlabels' `setup.sh` (`engine/setup.sh`) (this repo's `setup.sh` downloads it instead).

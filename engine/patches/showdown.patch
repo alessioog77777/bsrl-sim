@@ -1,0 +1,162 @@
+# showdown rules (bsrl-sim issue #21): battles with teams end when one team is left; libg's own death drop is fed the cubes
+# held (character +0x874 mirrors env's count, a trio group capped at 3 = Trio Showdown's 2 cubes); a teammate respawn takes
+# the game's 17 s and comes back with 3 s of spawn protection. Applies on top of every earlier patch; paths relative to engine/.
+diff --git a/native/loader/env.c b/native/loader/env.c
+index 1c7dd3c..14fb964 100644
+--- a/native/loader/env.c
++++ b/native/loader/env.c
+@@ -7,7 +7,7 @@
+  *     the phone's drain applied them; k ticks per step, several steps per client frame; any player index.
+  *   - Showdown rules: storm damage (20 %/s of max HP, +5 %/s after 5 s, applied before the snapshot of the tick after
+  *     the check, through the damage root 0xb422d0), no regen in gas, elimination tracker / Brawlers left / native
+- *     end at <= 1 alive, power cubes (+400 HP, +10 % damage incl. the popup), damage model (P11 x2 + travel curve),
++ *     end at <= 1 alive or one team left (duo / trio), power cubes (+400 HP, +10 % damage incl. the popup), damage model (P11 x2 + travel curve),
+  *     super-charge fix, Piper's leap re-implementation + BoxOfBombs + bomb damage, skill block in the air, client
+  *     guard, alive guard, bot 'hold'/native control, local_ai.
+  *   - soft reset: StartLoading clone re-injected through 0x816ff8 with the seed (+ the B3 determinism patch).
+@@ -147,10 +147,12 @@ static void **players(void *sim, int *n) { *n = I32(sim, 0x7c); if (*n < 0 || *n
+ static int player_char_id(void *p) { int c = I32(p, 0x1e4); return c ? c : I32(p, 0x10); }
+ /* rl round, teammate respawn (duo / trio = rl team groups, div bit 31): a grouped brawler whose hit would knock it out
+  * while a teammate lives is kept (hp back to max), parked off the map at the game's own 'unplaced' spot, invulnerable,
+- * inputs and native AI off, dumped with hp 0 (= dead for every observation), and after RESP_TICKS (15 s) put at a living
++ * inputs and native AI off, dumped with hp 0 (= dead for every observation), and after RESP_TICKS (17 s) put at a living
+  * teammate's position. Its team wiped meanwhile: hp 0 -> eliminated as usual. The client libg has no respawn (server code). */
+ static uint32_t g_div_team;
+-#define RESP_TICKS 300
++#define RESP_TICKS 340     /* game_mode_variations.csv RespawnSeconds 17 (Duo / Trio Showdown) */
++#define RESP_PROTECT 60    /* spawn protection after a respawn: +0x4f0 = tick + 60 (3 s). [?] the server's respawn value is
++                            * not in the client; 60 = the post-intro protection of the battle start (0xc2806c: intro + 60) */
+ #define PARK_X (-150)
+ #define PARK_Y 150
+ static int resp_on(void) { return (int)(g_div_team >> 31); }
+@@ -188,6 +190,24 @@ static void cubes_add(int id) {
+     for (int i = 0; i < E.ncube; i++) if (E.cube_id[i] == id) { E.cube_n[i]++; return; }
+     if (E.ncube < 64) { E.cube_id[E.ncube] = id; E.cube_n[E.ncube++] = 1; }
+ }
++/* showdown round (issue #21): power cubes dropped on death. libg's own death drop runs inside the damage root 0xb422d0
++ * (from 0xb44f20) for a hero with a player whose hp reaches 0: n = min(+0x874 / 3 + 1, MaxPowerCubesToDrop) items of the
++ * variation's DroppedItemOnDeath (BattleRoyaleBuff in Showdown), tossed to free spots 300-600 u around the body (spawner
++ * 0xb55b74). The offline build never fills +0x874 (the cube count the server keeps), so a death drops 1 cube (static read); env
++ * mirrors its own count there (item_tick, respawn knock-out). The battle is Solo Showdown (variation 6, max 5) underneath;
++ * Trio Showdown's max is 2 (game_mode_variations.csv): for a player in a group of 3 the mirror is capped at 3 (3 / 3 + 1 = 2).
++ * Nothing else in the sim derives stats from +0x874 (pickup +400 HP / +10 % damage are env's); cube84_w shows the larger. */
++static int sd_group_size(int i) {
++    if (!(g_div_team >> 31) || i < 0 || i >= 10) return 1;
++    int g = (g_div_team >> (3 * i)) & 7, n = 0; if (!g) return 1;
++    for (int j = 0; j < 10; j++) n += ((g_div_team >> (3 * j)) & 7) == g;
++    return n;
++}
++static void sd_mirror_cubes(void *sim, uint8_t *ch) {   /* ch: a player's current brawler */
++    int k = cubes_of(I32(ch, 8)), ow = brawler_owner(sim, ch);
++    if (ow >= 0 && sd_group_size(ow) >= 3 && k > 3) k = 3;
++    I32(ch, 0x874) = k;
++}
+ static int tile_blocks_move(int id) {  /* SF_BLOCK (tiles.csv BlocksMovement rows) */
+     static const int rows[] = {1,2,3,4,6,9,10,11,12,13,14,15,16,18,20,21,39,40,41,42,43,44,45,46,53,54,55,56,57,58,59,60,61,62,63,65,66,69,70,71,72,73};
+     for (unsigned i = 0; i < sizeof rows / sizeof *rows; i++) if (id == 27000000 + rows[i]) return 1;
+@@ -373,10 +393,13 @@ static uint64_t my_root(void *victim, int a1, int dmg, int a3, int a4, void *att
+     if (ow >= 0 && I32(victim, 0x3c4) <= 0 && resp_mate(E.sim, ow)) {   /* knocked out while a teammate lives */
+         E.resp_at[ow] = I32(E.sim, 0x10) + RESP_TICKS; E.resp_ai[ow] = U8(victim, 0x469); E.resp_n++;
+         /* area round: it loses its power cubes (Duo Showdown: a respawned brawler starts at 0 cubes) and their +400 max HP
+-         * each; cubes0 moves with it so NbePlayer.cubes (picked up this step) stays >= 0. shortcut: they vanish (not dropped) */
++         * each; cubes0 moves with it so NbePlayer.cubes (picked up this step) stays >= 0. showdown round: the root above
++         * already ran libg's death drop (hp reached 0 inside it) with +0x874 = the cubes held: those items lie on the map,
++         * the rest are lost */
+         for (int c = 0; c < E.ncube; c++) if (E.cube_id[c] == I32(victim, 8) && E.cube_n[c] > 0) {
+             I32(victim, 0x3c8) -= 400 * E.cube_n[c]; E.cubes0[ow] -= E.cube_n[c]; E.cube_n[c] = 0;
+         }
++        I32(victim, 0x874) = 0;
+         I32(victim, 0x3c4) = I32(victim, 0x3c8); U8(victim, 0x469) = 0; I32(victim, 0x38) = PARK_X; I32(victim, 0x3c) = PARK_Y;
+     }
+     E.charge_level = saved_level;
+@@ -847,11 +870,23 @@ static void elimination_tick(void *sim) {
+         E.elim_ptr[E.eptr_n++ % NBE_MAXP] = ps[i];
+     }
+     E.alive = total - E.order_n;
+-    if (!E.end_req && E.order_n > 0 && E.alive <= 1) {     /* sdEndOnLastAlive */
++    /* showdown round (issue #21): with teams (g_div_team) the battle ends when one team is left (sdEndOnLastTeam), not
++     * one player. A player still in the battle (respawning included) keeps its team in. Solo: teams = players. */
++    int teams_left = 0, win_team = 0;
++#define SD_TEAM(k) (g_div_team ? I32(ps[k], 12) : (k))
++    for (int i = 0; i < np && i < NBE_MAXP; i++) if (present[i] && !E.elim[i]) {
++        int dup = 0; for (int j = 0; j < i; j++) if (present[j] && !E.elim[j] && SD_TEAM(j) == SD_TEAM(i)) dup = 1;
++        teams_left += !dup;
++    }
++    if (!E.end_req && E.order_n > 0 && (E.alive <= 1 || teams_left <= 1)) {     /* sdEndOnLastAlive / sdEndOnLastTeam */
+         E.end_req = 1; E.winner = -1; int surv = 0;
+-        for (int i = 0; i < np && i < NBE_MAXP; i++) if (present[i] && !E.elim[i]) { E.winner = i; surv++; }
+-        if (surv != 1) E.winner = -1;
+-        E.local_rank = li < 0 ? 0 : (E.elim[li] ? E.erank[li] : 1 + surv - (li >= 0 && !E.elim[li] ? 1 : 0));
++        /* winner: the last survivor; with a team left, its lowest-index player (MAEnv ranks the winner 1, the group rank =
++         * the best of its members, env_v5.team_ranks) */
++        for (int i = np < NBE_MAXP ? np - 1 : NBE_MAXP - 1; i >= 0; i--) if (present[i] && !E.elim[i]) { E.winner = i; surv++; }
++        if (surv != 1 && teams_left != 1) E.winner = -1;
++        win_team = E.winner >= 0 && li >= 0 && li < np && ps[li] && !E.elim[li] && SD_TEAM(li) == SD_TEAM(E.winner);
++#undef SD_TEAM
++        E.local_rank = li < 0 ? 0 : (E.elim[li] ? E.erank[li] : win_team ? 1 : surv);
+         int e4 = U8(sim, 0x4ea); U8(sim, 0x121) = 1; if (e4) U8(sim, 0xa1) = 1;
+     }
+ }
+@@ -891,7 +926,7 @@ static void item_tick(void *sim) {   /* itemTick: credit a power cube when the c
+         int pid = I32(best, 8); uint8_t *p = obj_by_id(sim, pid); if (!p) continue;   /* creditCube */
+         int mx = I32(p, 0x3c8), hp = I32(p, 0x3c4);
+         I32(p, 0x3c8) = mx + 400; I32(p, 0x3c4) = hp + 400;
+-        cubes_add(pid);
++        cubes_add(pid); sd_mirror_cubes(sim, p);   /* showdown round: libg's death drop reads +0x874 */
+     }
+     memcpy(E.items, now, nn * sizeof *now); E.nitems = nn;
+ }
+@@ -900,14 +935,14 @@ static void item_tick(void *sim) {   /* itemTick: credit a power cube when the c
+  * snapshot decoder 0xb2de2c reads from tag 0x84; the character encoder 0xb360ac writes there the simulation's cube count
+  * +0x874 (<< 1 under status 0xd5). The offline build sets sim+0x11b = (mode 1 or 2) = 0 (0x9bbbe0), so the native pickup
+  * 0xb6b8e0 never credits +0x874 and the counter never shows; env credits cubes itself (item_tick). The two `bl`s that write
+- * tag 0x84 (0xb36904 -> 0xc75a98 for variation 0x23, 0xb36924 -> 0xc75a0c) send +0x874 + env's count instead: only the
++ * tag 0x84 (0xb36904 -> 0xc75a98 for variation 0x23, 0xb36924 -> 0xc75a0c) send max(+0x874, env's count) instead: only the
+  * serialised snapshot changes, the simulation's state is untouched. x20 = the character, x9 = the 0xd5 shift there. */
+ int g_cube_counter = 1;   /* --no-cube-counter: off */
+ __asm__(".pushsection .text\n.p2align 2\ncube84_a: mov x3, x20\n mov x4, x9\n mov w5, #0\n b cube84_w\n"
+         "cube84_b: mov x3, x20\n mov x4, x9\n mov w5, #1\n b cube84_w\n.popsection\n");
+ void cube84_a(void), cube84_b(void);
+ void cube84_w(void *wr, int v, int tag, uint8_t *ch, uint64_t shift, int which) {
+-    if (I32(g_libg->base, 0x12eefb4) == 3 && ch) v = (I32(ch, 0x874) + cubes_of(I32(ch, 8))) << (shift & 1);
++    if (I32(g_libg->base, 0x12eefb4) == 3 && ch) { int a = I32(ch, 0x874), b = cubes_of(I32(ch, 8)); v = (a > b ? a : b) << (shift & 1); }   /* +0x874 mirrors env's count (showdown round) */
+     ((void (*)(void *, int, int))B(which ? 0xc75a98 : 0xc75a0c))(wr, v, tag);
+ }
+ static void cube_counter_install(void) {
+@@ -960,6 +995,9 @@ static void respawn_tick(void *sim) {
+         if (tick >= E.resp_at[i]) {
+             E.resp_at[i] = 0; E.resp_done++; I32(c, 0x38) = I32(m, 0x38); I32(c, 0x3c) = I32(m, 0x3c);
+             I32(c, 0x3c4) = I32(c, 0x3c8); U8(c, 0x469) = E.resp_ai[i]; sf_stop(c);
++            /* showdown round: spawn protection (every character tick sets +0x431 = +0x4f0 > tick, 0xb3995c; the root blocks
++             * damage while +0x431 is set) */
++            I32(c, 0x4f0) = tick + RESP_PROTECT; U8(c, 0x431) = 1;
+         } else { I32(c, 0x38) = PARK_X; I32(c, 0x3c) = PARK_Y; I32(c, 0x3c4) = I32(c, 0x3c8); U8(c, 0x469) = 0; }
+     }
+ }
+diff --git a/native/loader/nbenv_proto.h b/native/loader/nbenv_proto.h
+index b4846be..75c9325 100644
+--- a/native/loader/nbenv_proto.h
++++ b/native/loader/nbenv_proto.h
+@@ -109,7 +109,7 @@ typedef struct {
+     int32_t status;       /* 0 ok, <0 error (see err) */
+     int32_t tick, done, result, local_index, generation, alive, hud_left;
+     int32_t local_rank;   /* elimination tracker rank of the local player (0 while alive and the match runs) */
+-    int32_t winner;       /* player index of the last survivor (-1) */
++    int32_t winner;       /* player index of the last survivor; teams: the last team's lowest-index player (-1) */
+     uint32_t map_hash; int32_t map_w, map_h, map_written;
+     int32_t state_ints, rec_n, rec_lost, pix_bytes, pix_w, pix_h, obs_written;
+     int32_t cam_valid; float cam_x, cam_y;
+diff --git a/native/loader/spawnfix.c b/native/loader/spawnfix.c
+index 41820cb..4d4fed9 100644
+--- a/native/loader/spawnfix.c
++++ b/native/loader/spawnfix.c
+@@ -72,6 +72,9 @@ static int wall_code_for(uint8_t *pr) {
+     for (int i = 0; g_wall_codes[i].skin_proj; i++) if (g_wall_codes[i].skin_proj == id) return g_wall_codes[i].code;
+     return 1;
+ }
++/* The walls go again by themselves: the setter puts them on the tile map's dynamic list, and the game removes them after
++ * the tile's Lifetime (tiles.csv: 200 ticks for every Wally* wall). Sprout audit, issue #21: 13 of 13 ring tiles open
++ * again between placed + 199 and + 220. */
+ static void wall_ring(uint8_t *a, uint8_t *d) {
+     uint8_t *pr = (g_cur_proj && g_cur_tick == (g_sim ? I32(g_sim, 0x10) : -1)) ? (uint8_t *)g_cur_proj : NULL;
+     int code = wall_code_for(pr);

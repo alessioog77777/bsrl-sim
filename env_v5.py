@@ -393,7 +393,7 @@ class Env(MAEnv):
     slider_scale = 1.0
     slider_sample = "uniform"     # train --slider-sample
     slider_norm = np.ones(len(SL))   # train --slider-norm (env_v5.slider_norm)
-    dead_aids = set()   # agents respawning right now (host: duo / trio knock-out with a living mate, 15 s): dead(ids)
+    dead_aids = set()   # agents respawning right now (host: duo / trio knock-out with a living mate, 17 s): dead(ids)
     resp = {"out": 0, "back": 0, "wiped": 0}   # knock-outs into respawn, respawns, waits ended by the team's wipe
     record = False    # True: battles with cfg "native_ctl" put the native AI's action into the transition terms ("_act": BC labels)
     # sim_plan B3 (train_fast --cube-shaping K): the flat per-cube reward becomes potential shaping on the cubes held,
