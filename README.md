@@ -20,6 +20,7 @@ everything. Game files are not included: you supply them.
 | `train_ppo.py` | Behaviour cloning from the native AI, then PPO with a KL anchor, league / self-play, evals, replays. |
 | `train_fast.py` | Same trainer with environment collection split over worker processes (shared memory). |
 | `scorecard.py` | Skill metrics of a run from its logs: placement, win rate, trade, hit rate, aim lead, cube and gas stats. |
+| `super_audit.py` | Which brawlers' supers work on this host: each fires its super at one target and the effects seen are checked against the game's tables; writes a checklist (issue #6). `python -m super_audit [--only Name]`, `--check` without the host |
 | `live_check.py` | One-boot check of the host round: team reward, area effects, generated maps, teammate respawn, HUD mask. |
 | `test_fast.py` | Equality and timing of the fast paths against the reference paths on real battles. |
 | `apply_noise.py` | Writes a measured detector-noise report into `obs_v5.NOISE` (with sanity limits). |
