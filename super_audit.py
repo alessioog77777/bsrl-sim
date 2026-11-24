@@ -133,7 +133,10 @@ def expected(name):
                 if _num(r, "InnerRadius") > 0 and _num(r, "InnerRadiusDamagePercent") == 0), default=0.0)
     if cr <= 0 and not projs and alog and not charge:   # no aim range, the effect is an area at the brawler: the target stands inside it
         cr = max((_num(r, "Radius") for r in alog), default=0.0)
-    return {"skill": sk_name, "type": bt, "kind": kind, "range": cr if cr > 0 else 2600.0, "charge": charge, "ring": ring, "expect": ex,
+    # a BulletExplosion area at the brawler (Hank) spreads its children over 360 degrees from world angle 0 (spawnfix.c: no
+    # parent projectile): the target stands on angle 0, not between two children
+    east = not projs and any(r.get("Type") == "BulletExplosion" for r in alog)
+    return {"skill": sk_name, "type": bt, "kind": kind, "range": cr if cr > 0 else 2600.0, "charge": charge, "ring": ring, "east": east, "expect": ex,
             "projectiles": projs, "summons": summons, "areas": areas, "items": items, "notes": notes}
 
 
@@ -358,6 +361,7 @@ class Auditor:
         for k, (j, s, t) in enumerate(run):
             inf = self.info[j.name]; x, y, dirs = spots[k]
             dx, dy = dirs[min(j.attempt, len(dirs) - 1)]
+            if inf.get("east") and (1, 0) in dirs: dx, dy = 1, 0
             d = float(np.clip(DIST_F[min(j.attempt, 1)] * inf["range"], DIST_MIN, DIST_MAX))
             if j.attempt and len(dirs) == 1: d = float(np.clip(d * 0.6, DIST_MIN, DIST_MAX))
             tx, ty = x + dx * d, y + dy * d
