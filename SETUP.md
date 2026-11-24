@@ -43,6 +43,9 @@ Changes made to nirkt's code, all recorded in `engine/patches/`:
   `env.c` `gadget_input` tries first. It implements dash gadgets (the native charge mover, through `env.c`
   `env_dash_start`) and heal-over-time gadgets (Bibi, Byron; ticked from `env.c` `pre_snapshot`), with 3 uses per
   battle and the game's own cooldown. Every other gadget still reads as not usable.
+- `area_gadgets.patch` (issue #3, a diff on top of the patches above): `gadget.c`'s AREA kind (published as SPAWN), the
+  gadgets that only drop their area at the brawler (Barley, Poco x2, Tick, Shade, Trunk), spawned with libg's
+  `0xb35c40` after the row's ActivationDelay. `python -m super_audit --gadget` checks their effects.
 - `charge.patch` (issue #5, a diff on top of the four above): the charge supers in `native/loader/env.c`. The skill's
   ChargePushback after each contact hit (the game's knockback 0xb49834), Bull's straight lane that breaks walls and bushes
   up to the first unbreakable tile, El Primo breaking the tiles around his landing, trail areas (Stu, Berry, Trunk)
@@ -95,7 +98,7 @@ downloaded game build, default `work/`), `SIM_VENV`.
   scripts to `wsl.exe ... bash -s` on stdin.
 - **Slow start.** One boot takes 60-90 s. Batch your checks into one run.
 - **The fire head never uses most gadgets.** The game build compiles gadget activation out, and the
-  host activates only the kinds `native/loader/gadget.c` implements (dash and heal over time), so for every other
+  host activates only the kinds `native/loader/gadget.c` implements (dash, heal over time, area at the brawler), so for every other
   gadget the class stays masked. `python -m gadget_check` shows which kinds the built host publishes.
 - **The fire head never uses hypercharge.** It needs `--hyper 1` (players get their card) and a host built with
   `native/loader/hyper.c`. `python -m hyper_check` checks the built host.
