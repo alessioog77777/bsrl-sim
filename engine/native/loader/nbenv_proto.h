@@ -30,7 +30,8 @@ enum { NBE_ST_BOOT = 0, NBE_ST_READY = 1, NBE_ST_RUNNING = 2, NBE_ST_DEAD = 9 };
 
 typedef struct {
     int32_t move_dir;     /* -1 = joystick released (stop if moving), 0..15 = direction k*22.5 deg (x right, y down) */
-    int32_t fire;         /* 0 none, 1 attack (attack_angle), 2 super (super_angle + super_dist), 3 gadget (input kind 8, diversity round) */
+    int32_t fire;         /* 0 none, 1 attack (attack_angle), 2 super (super_angle + super_dist), 3 gadget (input kind 8, diversity round),
+                             4 hypercharge (hypercharge round, hyper.c; no aim) */
     float aim_deg;        /* any degrees, x right / y down */
     float super_dist;     /* (0, 1] -> leap length 2600 * dist */
 } NbeAction;
@@ -47,6 +48,9 @@ typedef struct {          /* diversity round: NbeCmd.div (RESET) */
     uint32_t setup_super_mask; /* SETUP (test harness): bit i = fill player i's super charge (player +0x54 = +0x58); bit 16+i = its hypercharge (+0x98 = +0x9c) */
     uint32_t setup_unprotect_mask; /* SETUP (test harness): bit i = clear player i's spawn protection (char +0x4f0 end tick = 0) */
     int32_t reserved[2];
+    /* hypercharge round (bsrl-sim issue #4, appended): bit i = put player i's brawler's hypercharge card (cards.csv MetaType 6)
+     * in its config (+0x28), so NbeAction.fire 4 can activate it (hyper.c); 0 = none (as before). A brawler without one gets none */
+    uint32_t hyper_mask;
 } NbeDiv;
 #define NBE_DIV_MAGIC 0x31564944u   /* 'DIV1' in NbeHdr.reserved[0]: this game host understands NbeCmd.div / NbeResp.div_* */
 
@@ -144,6 +148,17 @@ typedef struct {
     int32_t gad_charges[NBE_MAXP];    /* uses left this battle */
     int32_t gad_cd[NBE_MAXP];         /* ticks until it can be used again (0 = now) */
     int32_t gad_used[NBE_MAXP];       /* activations so far this battle */
+    /* hypercharge round (bsrl-sim issue #4, appended): the host's hypercharge (hyper.c: libg's activation, the host's drain,
+     * expiry and buffs). The charge and its max are NbePlayer.reserved[0] / [1]. A host without it leaves all 0 (hyp_valid 0).
+     * Per player index: */
+    int32_t hyp_valid;                /* 1 = written by a host with hyper.c (every response) */
+    int32_t hyp_card[NBE_MAXP];       /* cards.csv data id of the equipped hypercharge card (0 = none: cannot hypercharge) */
+    int32_t hyp_left[NBE_MAXP];       /* ticks of hypercharge left (0 = not active) */
+    int32_t hyp_used[NBE_MAXP];       /* activations so far this battle */
+    int32_t hyp_damage_pct[NBE_MAXP], hyp_speed_pct[NBE_MAXP], hyp_shield_pct[NBE_MAXP];   /* buffs while active (characters.csv) */
+    /* hypercharged supers (appended): supers cast while hypercharged so far, and the SkillData data id the last one used
+     * (the brawler's OverchargedUltimateSkill where characters.csv has one, else its UltimateSkill) */
+    int32_t hyp_supers[NBE_MAXP], hyp_super_id[NBE_MAXP];
 } NbeResp;
 /* NbeResp.gad_kind: what an activation does (one re-implementation per kind, from the gadget's own data rows) */
 #define NBE_GAD_NONE 0

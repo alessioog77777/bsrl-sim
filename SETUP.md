@@ -48,6 +48,16 @@ Changes made to nirkt's code, all recorded in `engine/patches/`:
   Ollie, Damian), and env zones for the two area types the client never applies: Berry's paint (damage to enemies,
   heal to allies) and Damian's arena edge (knockback toward the side an enemy started on). `--native-charge 2` keeps
   only the movement.
+- `hypercharge.patch` (issue #4, a diff on top of `gadgets.patch`): the hypercharge card on request (`NbeDiv.hyper_mask`,
+  put in the player config by `offline.c`), activation by `NbeAction.fire` 4 through libg's own activation, and in
+  `native/loader/hyper.c` the parts the client build lacks: the drain to 0 over 5 s, the end, and the speed / damage /
+  shield buffs from `characters.csv` (`env.c` `rec_move` / `my_root`). State in `NbeResp` `hyp_*`, mirrored in `nbpc/proto.py`.
+- `hypercharged_supers.patch` (a diff on top of `hypercharge.patch`): libg's `Character::isOvercharged` (0xb35bf0, a
+  `return false` in the client build) answers true while a brawler's hypercharge is on, so the game's own skill code uses
+  the `Overcharged*` columns of `skills.csv`; where `characters.csv` has an `OverchargedUltimateSkill` (7 brawlers; the
+  game builds it as the brawler's third skill instance) it takes the super's place while hypercharged (`hyper.c`
+  `swap_ulti` / `hyper_unswap`). Meg's mech takes Meg's card. `NbeResp` `hyp_supers` / `hyp_super_id` count the supers cast
+  while hypercharged (`python -m super_audit --hyper`).
 - `maenv.py` and `fair.py` copied from nbrl-env's `py/nbpc` into bulletlabels' `vendor/nbpc` (now `engine/py/nbpc`),
   so one `nbpc` package holds the host side and the environment side.
 - The game download link removed from bulletlabels' `setup.sh` (`engine/setup.sh`) (this repo's `setup.sh` downloads it instead).
@@ -67,9 +77,13 @@ downloaded game build, default `work/`), `SIM_VENV`.
 - **Variables come out empty.** `env.sh` must have LF line endings (CRLF breaks every variable). From Windows, pass
   scripts to `wsl.exe ... bash -s` on stdin.
 - **Slow start.** One boot takes 60-90 s. Batch your checks into one run.
-- **The fire head never uses gadgets or hypercharge.** The game build compiles gadget activation out, and the host
-  activates only the kinds `native/loader/gadget.c` implements (none yet), so the gadget class stays masked. Hypercharge
-  has no fire class yet (issue #4). `python -m gadget_check` shows which kinds the built host publishes.
-- **`gadget_check` says the host publishes no gadget state.** `setup.sh` builds the host only when
+- **The fire head never uses gadgets.** The game build compiles gadget activation out, and the host activates only the
+  kinds `native/loader/gadget.c` implements (none yet), so the gadget class stays masked. `python -m gadget_check` shows
+  which kinds the built host publishes.
+- **The fire head never uses hypercharge.** It needs `--hyper 1` (players get their card) and a host built with
+  `native/loader/hyper.c`. `python -m hyper_check` checks the built host.
+- **Every boot crashes at "loading 45%".** A game file is a Git LFS pointer, not the file (seen with `assets/sc/ui.sc`
+  from a git clone of the game files): run `git lfs pull` in that clone.
+- **`gadget_check` / `hyper_check` say the host publishes no gadget / hypercharge state.** `setup.sh` builds the host only when
   `native/loader/nbhost_rl` is missing: after a change in `engine/native/loader`, delete it and rerun
   `./setup.sh --no-apt --no-python`.

@@ -2,7 +2,7 @@
 same RNG state: the random draws are obs_v5.ObsV5.build's code unchanged, in the same order.
 
     ob = FastObsV5(noise=O.NOISE, seed=0)          # drop-in for obs_v5.ObsV5
-    o = ob.build(vec, grid, meta, ids, who=who, gadget=gadget)   # who / gadget as ObsV5.build's
+    o = ob.build(vec, grid, meta, ids, who=who, gadget=gadget, hyper=hyper)   # who / gadget / hyper as ObsV5.build's
     pv = priv_fast(env, ids)                         # == train_ppo.priv(env, ids)
 
 * velocity matching: one (B, N_ENT, N_ENT) distance block instead of a loop over agents;
@@ -42,8 +42,8 @@ class FastObsV5(O.ObsV5):
                 for k in list(self.ep)[:2048]: self.unfree.append(self.ep.pop(k)[10])
         return e
 
-    def build(self, vec, grid, meta, ids, cmd=None, who=None, gadget=None):
-        o = from_state2(vec, grid, meta, who, derived=self.noise is None or not len(ids), gadget=gadget)
+    def build(self, vec, grid, meta, ids, cmd=None, who=None, gadget=None, hyper=None):
+        o = from_state2(vec, grid, meta, who, derived=self.noise is None or not len(ids), gadget=gadget, hyper=hyper)
         if self.noise is None or not len(ids):
             return o
         r, B = self.rng, len(ids)
@@ -167,7 +167,8 @@ def _check(steps=300):
         cmd = rng.normal(size=(int(pick.sum()), 2)).astype(np.float32) * 0.12 if t % 2 else None   # A2 path every other poll
         w = bw[pick] if t % 3 else None                  # identities given on 2 of 3 polls
         gd = (rng.random(len(ids2)) < 0.5).astype(np.float32) if t % 4 else None   # gadget ready (self 3, v5.7) on 3 of 4
-        oa, ob = a.build(*[y.copy() for y in x], cmd=cmd, who=w, gadget=gd), b.build(*[y.copy() for y in x], cmd=cmd, who=w, gadget=gd)
+        hy = (rng.random(len(ids2)) < 0.5).astype(np.float32) if t % 3 else None   # hypercharge ready (self 4, v5.8) on 2 of 3
+        oa, ob = (m.build(*[y.copy() for y in x], cmd=cmd, who=w, gadget=gd, hyper=hy) for m in (a, b))
         assert same(oa, ob), t
         n_id += int(oa["ent"][..., O.ID_KNOWN].sum()); n_gad += int(oa["self"][:, 3].sum())
     assert n_id > 1000 and n_gad > 100, (n_id, n_gad)    # the identity path ran (known rows, wrong picks, links), self 3 set

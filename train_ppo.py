@@ -61,6 +61,9 @@
   observation's self 3 = env_v5.Env.gadget (the host's gadget state: usable now); the fire head's gadget class
   (model.mask_fire) is allowed only then. Off: self 3 = 0, the class stays masked. fire_hist has one bin per
   obs_v5.FIRE class.
+* Hypercharge (--hyper 1, default 0 = off; obs v5.8, issue #4): every battle but the hard scenarios equips each player's
+  hypercharge card (env_v5.with_hyper, no draw) and self 4 = env_v5.Env.hyper (the host's state: can activate now); the
+  fire head's hypercharge class is allowed only then. Off: self 4 = 0, the class stays masked.
 shortcut: no exploiters (a second learner trained only to beat this one); add them if b_rank flattens again with PFSP.
 """
 import argparse, glob, json, os, shutil, signal, sys, time
@@ -577,6 +580,11 @@ def _check():
     sum(x.float().sum() for x in p7).backward(); o7.step(); assert o7.state[p7[-1]]["step"] == 1 and o7.state[p7[0]]["step"] == 2
     o8 = torch.optim.Adam(p7[:-3]); load_opt(o8, sd6)                                                  # fewer parameters: fresh
     assert not o8.state
+    sd7 = o7.state_dict(); L = len(p7)                                                               # a v5.7 run's Adam: one fire_x row
+    sd7["state"][L - 2] = {**sd7["state"][L - 2], **{k: v[:1] for k, v in sd7["state"][L - 2].items() if torch.is_tensor(v) and v.dim()}}
+    sd7["state"][L - 1] = {**sd7["state"][L - 1], **{k: v[:1] for k, v in sd7["state"][L - 1].items() if torch.is_tensor(v) and v.dim()}}
+    o9 = torch.optim.Adam(p7); load_opt(o9, sd7, net=n7); m9 = o9.state[p7[-2]]["exp_avg"]            # v5.8: the hypercharge row padded
+    assert M.N_FX == 2 and m9.shape == p7[-2].shape and torch.equal(m9[:1], o7.state[p7[-2]]["exp_avg"][:1]) and not m9[1].any()
     import intent as I                                   # replay frame "i", progress intent fields
     o = {"intent": I.encode([0, 5], [0, 3.0], [0, -1.0], [0, 1.0], [0, 0.5])}
     x = np.zeros(O.F_ENT, np.float32); assert id_name(x) == []
@@ -632,6 +640,7 @@ def main():
     ap.add_argument("--opp-slots", type=int, default=3); ap.add_argument("--opp-hold", type=int, default=2)
     ap.add_argument("--pfsp-p", type=float, default=2.0)
     ap.add_argument("--gadgets", type=int, default=0, help="1 = players carry a gadget, the policy sees it ready (self 3) and may use it (obs v5.7, issue #3; needs a host that activates its kind)")
+    ap.add_argument("--hyper", type=int, default=0, help="1 = players carry their hypercharge card, the policy sees it ready (self 4) and may activate it (obs v5.8, issue #4; needs a host with hyper.c)")
     a = ap.parse_args()
     if a.smoke: a.n, a.rollout, a.chunks, a.bc_updates, a.eval_episodes, a.evalb_episodes, a.hours, a.scenario_seeds = 2, 2048, 64, 1, 4, 4, 0.2, 1
     torch.manual_seed(a.seed); np.random.seed(a.seed)
@@ -669,7 +678,8 @@ def main():
 
     def battle_fn(rng, i):
         cfg = battle_cfg(rng, i)                         # --gadgets: MAEnv's rng, so rng_b's draws stay the same
-        return E.with_gadgets(cfg, rng) if a.gadgets and "scenario" not in cfg else cfg   # scenarios: as set up
+        cfg = E.with_gadgets(cfg, rng) if a.gadgets and "scenario" not in cfg else cfg   # scenarios: as set up
+        return E.with_hyper(cfg) if a.hyper and "scenario" not in cfg else cfg         # --hyper: no draw
 
     def battle_cfg(rng, i):
         tag = {"loc": loc, "chr": [a.brawler] * 10, "team_size": 1, "groups": [0] * 10}
@@ -749,7 +759,7 @@ def main():
                 for aid in env.dropped: pending.pop(aid, None); hid.pop(aid, None)
                 env.dropped = []
                 if not len(ids): continue
-                tq = time.perf_counter(); o = ob.build(obs["vec"], obs["grid"], env.last_meta, ids, who=env.last_who, gadget=env.gadget(ids) if a.gadgets else None); tm[1] += time.perf_counter() - tq
+                tq = time.perf_counter(); o = ob.build(obs["vec"], obs["grid"], env.last_meta, ids, who=env.last_who, gadget=env.gadget(ids) if a.gadgets else None, hyper=env.hyper(ids) if a.hyper else None); tm[1] += time.perf_counter() - tq
                 s = policy_s(env, ids, o); h = np.stack([hid.get(int(x), z) for x in ids])
                 pv = priv(env, ids); B = len(ids); kind = np.array([t["kind"] for t in env.last_tags])
                 isev = np.char.startswith(kind, "eval"); opp = np.array([int(x) & 15 in t.get("opp", ()) for x, t in zip(ids, env.last_tags)], bool)
