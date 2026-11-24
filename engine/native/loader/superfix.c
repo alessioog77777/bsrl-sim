@@ -87,8 +87,10 @@ int superfix_heal_own(void *pdata, uint8_t *p, uint8_t *owner, int slot) {   /* 
     uint8_t *sim = owner ? ((getp_t)B(0xb6a378))(owner) : NULL; int t = sim ? I32(sim, 0x10) : -1;
     if (owner && (!((geti_t)B(0xafaa08))(pdata) || owner != last_owner || t != last_tick)) {
         last_owner = owner; last_tick = t;
+        int hp_a = I32(owner, 0x3c4);
         ((void (*)(void *, int, int, int, void *, int, int, int, long, long))B(0xb41554))(owner, ((geti_t)B(0xb6a754))(p), amount, 1, pdata, I32(p, 0x418), 0, 0, 0, 0);
         g_nheal_self++;
+        if (g_superfix_dbg) LOG("[superfix] heal own: owner hp %d -> %d (max %d)\n", hp_a, I32(owner, 0x3c4), I32(owner, 0x3c8));
     }
     if (g_superfix_dbg) LOG("[superfix] heal own: projectile %p %d %% of %d -> %d, owner %p\n", p, pct, I32(p, 0xd4), amount, owner);
     return pct;
