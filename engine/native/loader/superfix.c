@@ -108,6 +108,10 @@ void superfix_install(void) {
     if (*(uint32_t *)B(0xb4de4c) == 0xaa1503e0 && (*(uint32_t *)B(0xb4de50) & 0xfc000000) == 0x94000000)   /* mov x0, x21; bl */
         hook_bl(g_libg, 0xb4de50, (void *)superfix_heal_thunk);
     LOG("[superfix] installed (spawnAreaEffect, delayed damage, heal own)\n");
+    extern void superfix_items_install(void) __attribute__((weak)); if (superfix_items_install) superfix_items_install();
+    extern void superfix_moves_install(void) __attribute__((weak)); if (superfix_moves_install) superfix_moves_install();
 }
 void superfix_status(void) { LOG("[superfix] areas spawned %ld, skipped %ld; delayed damage %ld; heal own %ld projectiles, %ld owners\n",
-                                 g_narea, g_narea_skip, g_ndelayed, g_nheal, g_nheal_self); }
+                                 g_narea, g_narea_skip, g_ndelayed, g_nheal, g_nheal_self);
+    extern void superfix_items_status(void) __attribute__((weak)); if (superfix_items_status) superfix_items_status();
+    extern void superfix_moves_status(void) __attribute__((weak)); if (superfix_moves_status) superfix_moves_status(); }
