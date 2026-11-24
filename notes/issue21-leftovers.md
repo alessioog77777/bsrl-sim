@@ -36,4 +36,4 @@ Branch claude/project-thread-y36m53 from main fe49fe2. Other sessions own gadget
 - Bush mapping: no live trigger (Rosa's Grow Light is not in gadget.c's AREA kind yet); static only.
 
 ## State
-- PR #35 open (subscribed). All host checks passed; see PR body.
+- Merged in #35. All host checks passed; see the PR body.

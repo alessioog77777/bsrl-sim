@@ -1,6 +1,6 @@
 # Issue #5 (charge supers): running notes
 
-State: PR #14 open (branch claude/project-thread-nfu3i0), clean, no CI on the repo. Waiting on review.
+State: merged in #14 (branch claude/project-thread-nfu3i0).
 
 ## Done
 - Host (engine/native/loader/env.c, recorded in engine/patches/charge.patch): ChargePushback via knockback 0xb49834,
