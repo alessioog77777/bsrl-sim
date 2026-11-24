@@ -456,20 +456,137 @@ static void sf_spawn_box(void *sim, void *itemData, int x, int y, int owner) {
  * character moves along its path (+0x388 xs, +0x398 ys, +0x394 n, +0x41c length) between ticks +0x28 and +0x2c with the
  * per-type height curve of 0xb4aad0 (type +0x508), and the character tick 0xb3ae74 runs the charge's effects. The start lays
  * the path with the native mover 0xb4790c(char, tx, ty, useSpeed 1, speed u/s, 0, 0) (end tick = start + length*20/speed),
- * then sets the charge flag and type. [?] fields the real start sets beyond these are unknown (NOTES). */
+ * then sets the charge flag and type. [?] fields the real start sets beyond these are unknown (NOTES).
+ * Start args (live probe, 0xb7c300 call site): x3 = x4 = Damage, x5 = ChargePushback, x6 = ChargeSpeed, stack [0] ChargeType,
+ * [1] AreaEffectObject (resolved area data), [2] SpawnedItem, [8] AreaEffectObject2 when not at the end, [9] the end-of-charge
+ * area (AreaEffectObject2 with AreaEffect2AtEndOfCharge). */
 int g_native_charge = 1; static long g_native_charges;
 /* env charge contact (RE-IMPLEMENTED, not the game's code): the native start state for the charge's own hit processing is not
  * known, so env applies the charge skill's Damage once to every living enemy character (brawlers, summons, boxes) the charger
- * passes within CHARGE_HIT_R, through the damage root like the leap bombs (x2 power level, +10 % per cube). No pushback,
- * no wall breaking, no per-type extras. --native-charge 2 = movement only (no env contact damage). */
+ * passes within CHARGE_HIT_R, through the damage root like the leap bombs (x2 power level, +10 % per cube), then the skill's
+ * ChargePushback with the game's knockback. The charge's areas and Bull's wall breaking are env's too (charge_end, below).
+ * --native-charge 2 = movement only (no env contact damage, pushback, areas or wall breaking). */
 #define CHARGE_HIT_R 250
-typedef struct { int id, owner, dmg, start_tick, nhit, ulti; int hit[32]; } ChargeJob;
-static ChargeJob g_cj[NBE_MAXP]; static int g_ncj; static long g_charge_hits;
+#define CHARGE_WALL_R 200    /* Bull: tiles within 200 u of his centre break (1 tile wide lane; [?] the server's radius is unknown) */
+#define CHARGE_LAND_WALL_R 300   /* El Primo: tiles around the landing point ([?] radius unknown; one tile ring) */
+typedef struct { int id, owner, dmg, start_tick, nhit, ulti, type, push, tx, ty; void *area1, *area_end, *old550; int hit[32]; } ChargeJob;
+static ChargeJob g_cj[NBE_MAXP]; static int g_ncj; static long g_charge_hits, g_charge_pushes, g_charge_areas, g_charge_walls;
+/* knockback 0xb49834(victim, srcX, srcY, strength, a4..a7, 10 stack slots, the last = pusher's owner index): pushes the victim
+ * 6 * strength u away from (srcX, srcY) over 10 ticks (half for CollisionRadius >= 150), the call the game's own charge sweep
+ * makes after each hit (0xb5afd4, strength char+0x504) */
+typedef uint64_t (*fn_kb)(void *, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int);
+#define KNOCKBACK(v, sx, sy, s, owner) ((fn_kb)B(0xb49834))(v, sx, sy, s, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, owner)
+/* circle tile destroy 0xa53b60(tilemap, x, y, radius, normalWeaponOnly, ownerIdx, team, tileDamage, [sp] onlyBushes, [sp+8]
+ * objMgr): the call the area apply makes for DestroysEnvironment areas (0xb2a834); sets the cells Open in the sim map */
+typedef int (*fn_circ)(void *, int, int, int, int, int, int, int, int, void *);
 int g_area_dot = 1;   /* diversity round: --area-dot 0 = the shipped whitelist */
-static void native_charge_start(uint8_t *ch, int tx, int ty, int speed, int type, int dmg) {
+static int charge_ground_ok(void *sim, int x, int y) {   /* Bull's lane: open, or a wall / bush that can be destroyed */
+    void *m = PTR(sim, 0x68); if (!m) return 1;
+    int W = I32(m, 0xc4), Hh = I32(m, 0xc8), tx = (int)floor(x / 300.0), ty = (int)floor(y / 300.0);
+    if (tx < 1 || ty < 1 || tx >= W - 1 || ty >= Hh - 1) return 0;   /* the border ring never breaks */
+    void *t = ((void **)PTR(m, 0x20))[tx + W * ty]; if (!t) return 1;
+    uint8_t *d = PTR(t, 0); if (!d) return 1;   /* live tile data (+0; +8 is the battle-start one) */
+    return !U8(d, 0x56) || U8(d, 0x52);         /* BlocksMovement (0xb20cdc) -> IsDestructible (0xb20cec) */
+}
+/* env charge zones (RE-IMPLEMENTED, not the game's code): the area apply 0xb29494 leaves area types HotAndDot (35, Berry's
+ * paint) and EdgeCrossing (56, Damian's arena) out of its type mask (0xb29600..0xb29624; types >= 53 are cut by the cmp at
+ * 0xb29604), and no other client code applies them, so the areas exist (snapshot, timer) but act on nobody. env keeps a zone
+ * per such area of a charge, with the values of the area data (+0x118 Type, +0x124 TimeMs, +0x12c Radius, +0x134 Damage,
+ * +0x13c CustomValue, +0x154 PushbackStrength, +0x1b8 InnerRadius; live dump):
+ *   HotAndDot: once a second (SameAreaEffectCanNotDamageMs 1000, DelayFirstTick), Damage x2 (the power-level scale of the
+ *     charge contact) to every enemy inside, and CustomValue % of that as a heal to every ally inside (the charger too), at
+ *     most once a second per character over all of one owner's zones. [?] the server's heal formula is not in the client.
+ *   EdgeCrossing: an enemy inside at spawn that reaches the edge is knocked back toward the centre, one outside is knocked
+ *     away from it (PushbackStrength 70 -> 420 u), at most every 10 ticks (the knockback's length); nobody crosses.
+ * --native-charge 2 = no zones. */
+#define ZONE_MAX 64
+#define ZONE_EDGE 150   /* EdgeCrossing: the knockback starts this far inside the ring (one knockback tick is ~42 u) */
+typedef struct { int kind, owner, team, x, y, r, start, until, dmg, heal, push, nside, side_id[16], side[16], next[16]; } Zone;
+static Zone g_zone[ZONE_MAX]; static int g_nzone; static long g_zone_hits, g_zone_heals, g_zone_pushes;
+typedef struct { int owner, cid, tick; } ZoneHit;   /* HotAndDot: last tick a character was hit / healed by an owner's zones */
+static ZoneHit g_zh[64]; static int g_nzh;
+static void zone_add(void *sim, uint8_t *ch, void *data, int x, int y) {
+    if (!data || !ch || g_native_charge != 1) return;
+    int t = I32(data, 0x118); if (t != 35 && t != 56) return;
+    if (g_nzone >= ZONE_MAX) memmove(g_zone, g_zone + 1, --g_nzone * sizeof *g_zone);   /* the oldest goes */
+    int now = I32(sim, 0x10), d = jround(I32(data, 0x134) * 2.0 * (1 + 0.10 * cubes_of(I32(ch, 8))));
+    g_zone[g_nzone++] = (Zone){t, I32(ch, 0x80), I32(ch, 0x84), x, y, I32(data, 0x12c), now, now + I32(data, 0x124) / 50,
+                               d, jround(d * I32(data, 0x13c) / 100.0), I32(data, 0x154), 0, {0}, {0}, {0}};
+}
+static int zone_seen(int owner, int cid, int now) {   /* HotAndDot: 1 = this owner's zones already acted on cid this second */
+    for (int i = 0; i < g_nzh; i++) if (g_zh[i].owner == owner && g_zh[i].cid == cid) {
+        if (now - g_zh[i].tick < 20 && now >= g_zh[i].tick) return 1; g_zh[i].tick = now; return 0; }
+    if (g_nzh >= 64) g_nzh = 0;
+    g_zh[g_nzh++] = (ZoneHit){owner, cid, now}; return 0;
+}
+static void zone_tick(void *sim) {   /* pre-snapshot, once per tick */
+    int now = I32(sim, 0x10), n; void **v = objvec(sim, &n);
+    for (int k = 0; k < g_nzone; k++) {
+        Zone *z = &g_zone[k];
+        if (now < z->start || now > z->until) { g_zone[k--] = g_zone[--g_nzone]; continue; }   /* over, or a new episode */
+        if (z->kind == 35 && ((now - z->start) % 20 || now == z->start)) continue;
+        int np_; void **ps_ = players(sim, &np_); uint8_t *pl_ = z->owner >= 0 && z->owner < np_ ? ps_[z->owner] : NULL;
+        for (int i = 0; i < n; i++) {
+            uint8_t *c = v[i]; if (!c || VTOF(c) != VT_CHAR || I32(c, 0x3c4) <= 0) continue;
+            int ally = I32(c, 0x84) == z->team, cid = I32(c, 8);
+            long dx = I32(c, 0x38) - z->x, dy = I32(c, 0x3c) - z->y; double dist = sqrt((double)(dx * dx + dy * dy));
+            if (z->kind == 35) {
+                if (dist > z->r || zone_seen(z->owner, cid, now)) continue;
+                int hp0 = I32(c, 0x3c4);
+                if (ally) { int mx = I32(c, 0x3c8); if (z->heal > 0 && hp0 < mx) { I32(c, 0x3c4) = hp0 + z->heal < mx ? hp0 + z->heal : mx; g_zone_heals++; } }
+                else if (z->dmg > 0) {
+                    uint8_t *atk = NULL; for (int q = 0; q < n && !atk; q++) { uint8_t *o = v[q];
+                        if (o && VTOF(o) == VT_CHAR && I32(o, 0x80) == z->owner && I32(o, 0x3c4) > 0) atk = o; }
+                    if (!atk) continue;   /* the painter is gone: no attacker for the damage root */
+                    int charge0 = pl_ ? I32(pl_, 0x54) : 0; E.in_own_call = 3;
+                    o_root(c, z->owner, z->dmg, z->dmg, 0, atk, NULL, 1, z->x, z->y, NULL, 0, 0, 0, 1, 0, 0, 0);
+                    if (pl_) I32(pl_, 0x54) = charge0;   /* a super's hits do not recharge that super */
+                    E.in_own_call = 0; record_event(c, atk, hp0, I32(c, 0x3c4)); g_zone_hits++; v = objvec(sim, &n);
+                }
+            } else if (!ally) {   /* EdgeCrossing */
+                int s; for (s = 0; s < z->nside && z->side_id[s] != cid; s++) {}
+                if (s == z->nside) { if (s >= 16) continue; z->nside++; z->side_id[s] = cid; z->side[s] = dist < z->r; z->next[s] = now; continue; }
+                if (now < z->next[s]) continue;
+                int in = z->side[s], hit = in ? dist >= z->r - ZONE_EDGE : dist <= z->r + ZONE_EDGE;
+                if (!hit || dist < 1) continue;
+                /* knockback pushes away from its source: a point beyond the victim on the ray from the centre pushes it in */
+                int sx = in ? jround(z->x + dx * 2.0) : z->x, sy = in ? jround(z->y + dy * 2.0) : z->y;
+                KNOCKBACK(c, sx, sy, z->push, z->owner); z->next[s] = now + 10; g_zone_pushes++;
+            }
+        }
+    }
+}
+/* area create + place 0xb2aefc(areaData, ownerChar, x, y, z, kind 2 = super, extraDmg) -> area (team, owner, skin, damage),
+ * then world add 0xb63198 and the area apply 0xb29494 (spawnfix's hook gives a BulletExplosion its child projectiles), the
+ * sequence of every client spawn (0xb47360 for the trail) */
+static void charge_area(void *sim, uint8_t *ch, void *data, int x, int y) {
+    if (!data || !ch) return;
+    void *a = ((void *(*)(void *, void *, int, int, int, int, int))B(0xb2aefc))(data, ch, x, y, 0, 2, 0); if (!a) return;
+    void *w = PTR(ch, 0x20) ? PTR(ch, 0x20) : PTR(sim, 0);
+    ((void (*)(void *, void *))B(0xb63198))(w, a); ((void (*)(void *))B(0xb29494))(a); I32(ch, 0x700) = 0;
+    g_charge_areas++; zone_add(sim, ch, data, x, y);
+}
+static void charge_break(void *sim, uint8_t *ch, int x, int y, int r) {
+    void *m = PTR(sim, 0x68); if (!m) return;
+    ((fn_circ)B(0xa53b60))(m, x, y, r, 0, I32(ch, 0x80), I32(ch, 0x84), 0, 0, PTR(ch, 0x20)); g_charge_walls++;
+}
+static void native_charge_start(uint8_t *ch, int tx, int ty, int speed, int type, int dmg, int push, void *area1, void *area_end) {
     if (!ch || I32(ch, 0x3c4) <= 0 || speed <= 0) return;
     if (type == 22) return;   /* Digger's dive: the character tick crashes on start state we do not set (0xb6a384 <- 0xb3eaec) */
+    void *sim = E.sim; int full = g_native_charge == 1, x0 = I32(ch, 0x38), y0 = I32(ch, 0x3c);
+    if (full && type == 1) {   /* Bull: a straight lane through walls and bushes, cut before the first tile that cannot break */
+        double L = hypot(tx - x0, ty - y0); int lx = x0, ly = y0;
+        for (double t = 50; t <= L; t += 50) { int px = jround(x0 + (tx - x0) * t / L), py = jround(y0 + (ty - y0) * t / L);
+            if (!charge_ground_ok(sim, px, py)) break; lx = px; ly = py; }
+        if (L >= 50 && hypot(tx - lx, ty - ly) < 50) { lx = tx; ly = ty; }
+        tx = lx; ty = ly;
+    }
+    /* the mover lays a straight two-point path (0xb512e0, no wall test) when 0xb5110c and 0xb51200 hold (char+0x98d, +0x98e),
+     * else it pathfinds around walls (0xb51550): Bull sets both for the call, everyone else keeps the pathfinder */
+    uint8_t s98d = U8(ch, 0x98d), s98e = U8(ch, 0x98e);
+    if (full && type == 1) { U8(ch, 0x98d) = 1; U8(ch, 0x98e) = 1; }
     ((void (*)(void *, int, int, uint64_t, unsigned, unsigned, int))B(0xb4790c))(ch, tx, ty, 1, (unsigned)speed, 0, 0);
+    U8(ch, 0x98d) = s98d; U8(ch, 0x98e) = s98e;
     if (I32(ch, 0x41c) <= 0) return;
     U8(ch, 0x490) = 1; I32(ch, 0x508) = type;
     /* the active skill (+0x6d8: 1 = slot 0, 2 = slot 1): the character tick runs the charge's hit processing 0xb46ca4 ->
@@ -477,18 +594,40 @@ static void native_charge_start(uint8_t *ch, int tx, int ty, int speed, int type
     { uint8_t **sk = PTR(ch, 0x458); int n = I32(ch, 0x464);
       for (int k = 1; k >= 0; k--) if (sk && k < n && sk[k]) { uint8_t *d = ((uint8_t *(*)(void *, int))B(0xb7adfc))(sk[k], 0);
           if (d && I32(d, 0x1a8) == 2) { I32(ch, 0x6d8) = k + 1; break; } } }
-    if (g_native_charge == 1 && dmg > 0 && g_ncj < NBE_MAXP) {
+    if (full && g_ncj < NBE_MAXP) {
         int id = I32(ch, 8), k; for (k = 0; k < g_ncj && g_cj[k].id != id; k++) {}
-        if (k == g_ncj) g_ncj++;
-        g_cj[k] = (ChargeJob){id, I32(ch, 0x80), dmg, I32(E.sim, 0x10), 0, I32(ch, 0x6d8) == 2, {0}};
+        if (k == g_ncj) g_ncj++; else if (g_cj[k].type) PTR(ch, 0x550) = g_cj[k].old550;   /* a charge restarted mid-charge */
+        g_cj[k] = (ChargeJob){id, I32(ch, 0x80), dmg, I32(sim, 0x10), 0, I32(ch, 0x6d8) == 2, type, push, -1000000, -1000000,
+                              area1, area_end, PTR(ch, 0x550), {0}};
+        /* trail (Stu's fire, Berry's paint, Trunk's ants): while +0x490 is set and +0x550 holds area data, the character tick
+         * spawns it through 0xb47360 each time the charger is farther than the area's Radius (+0x12c) from the last spawn point
+         * (+0xc98/+0xc9c); the far point makes the first one land at the start. Only the client constructor writes +0x550. */
+        if (area1 && type != 2 && type != 16) { PTR(ch, 0x550) = area1; I32(ch, 0x558) = 0; I32(ch, 0xc98) = -1000000; I32(ch, 0xc9c) = -1000000; }
+        if (area1 && type == 2) charge_area(sim, ch, area1, x0, y0);   /* Crow: knives at take-off (and at landing) */
     }
-    if (g_native_charges++ < 20) LOG("[env] native charge type %d: path %d u, ticks %d..%d\n", type, I32(ch, 0x41c), I32(ch, 0x28), I32(ch, 0x2c));
+    if (g_native_charges++ < 20) LOG("[env] native charge type %d: path %d u (%d points), ticks %d..%d, push %d, areas %p %p\n", type,
+        I32(ch, 0x41c), I32(ch, 0x394), I32(ch, 0x28), I32(ch, 0x2c), push, area1, area_end);
+}
+static void charge_end(void *sim, ChargeJob *j, uint8_t *ch) {   /* the charge flag dropped: landing / end of the dash */
+    if (j->area1 && j->type != 2 && j->type != 16) PTR(ch, 0x550) = j->old550;
+    if (I32(ch, 0x3c4) <= 0) return;
+    int x = I32(ch, 0x38), y = I32(ch, 0x3c);
+    if (j->type == 3) charge_break(sim, ch, x, y, CHARGE_LAND_WALL_R);
+    if (j->area1 && j->type == 2) charge_area(sim, ch, j->area1, x, y);
+    if (j->area_end) charge_area(sim, ch, j->area_end, x, y);   /* AreaEffect2AtEndOfCharge: Bull's slow, Nori, Ollie, Damian */
+    static int nlog; if (nlog++ < 20) LOG("[env] charge end type %d at %d,%d: hits %ld, pushes %ld, areas %ld, wall calls %ld, zones %d (zone hits %ld, heals %ld, pushes %ld) (totals)\n",
+        j->type, x, y, g_charge_hits, g_charge_pushes, g_charge_areas, g_charge_walls, g_nzone, g_zone_hits, g_zone_heals, g_zone_pushes);
 }
 static void charge_contact_tick(void *sim) {   /* pre-snapshot, once per tick */
     for (int k = 0; k < g_ncj; k++) {
         ChargeJob *j = &g_cj[k]; uint8_t *ch = obj_by_id(sim, j->id);
-        if (!ch || I32(ch, 0x3c4) <= 0 || !U8(ch, 0x490) || I32(sim, 0x10) - j->start_tick > 200) { g_cj[k--] = g_cj[--g_ncj]; continue; }
+        if (!ch) { g_cj[k--] = g_cj[--g_ncj]; continue; }
+        if (I32(ch, 0x3c4) <= 0 || !U8(ch, 0x490) || I32(sim, 0x10) - j->start_tick > 200) { charge_end(sim, j, ch); g_cj[k--] = g_cj[--g_ncj]; continue; }
         int x = I32(ch, 0x38), y = I32(ch, 0x3c), n; void **v = objvec(sim, &n);
+        if (j->type == 1) charge_break(sim, ch, x, y, CHARGE_WALL_R);   /* Bull breaks the walls and bushes of his lane */
+        if (j->area1 && PTR(ch, 0x550) == j->area1 && (I32(ch, 0xc98) != j->tx || I32(ch, 0xc9c) != j->ty) && I32(ch, 0xc98) > -1000000) {
+            j->tx = I32(ch, 0xc98); j->ty = I32(ch, 0xc9c); zone_add(sim, ch, j->area1, j->tx, j->ty); }   /* the game spawned a trail area */
+        if (j->dmg <= 0 && j->push <= 0) continue;
         for (int i = 0; i < n; i++) {
             uint8_t *c = v[i]; if (!c || c == ch || VTOF(c) != VT_CHAR || I32(c, 0x3c4) <= 0) continue;
             if (I32(c, 0x80) == j->owner && j->owner >= 0) continue;
@@ -501,8 +640,11 @@ static void charge_contact_tick(void *sim) {   /* pre-snapshot, once per tick */
             /* a super's hits do not recharge that super (as the leap bombs: sf_explode restores the owner's charge) */
             int np_; void **ps_ = players(sim, &np_); uint8_t *pl_ = j->owner >= 0 && j->owner < np_ ? ps_[j->owner] : NULL;
             int charge0 = pl_ ? I32(pl_, 0x54) : 0;
-            o_root(c, j->owner, d, d, 0, ch, NULL, 1, x, y, NULL, 0, 0, 0, 1, 0, 0, 0);
+            if (j->dmg > 0) o_root(c, j->owner, d, d, 0, ch, NULL, 1, x, y, NULL, 0, 0, 0, 1, 0, 0, 0);
             if (pl_ && j->ulti) I32(pl_, 0x54) = charge0;
+            /* ChargePushback (Bull / El Primo 130 -> 780 u, Darryl 70, Surge / Stu 100), away from the charger as at 0xb5afd4;
+             * not after a knock-out (the victim is parked or gone) */
+            if (j->push > 0 && I32(c, 0x3c4) > 0) { KNOCKBACK(c, x, y, j->push, j->owner); g_charge_pushes++; }
             E.in_own_call = 0; record_event(c, ch, hp0, I32(c, 0x3c4)); g_charge_hits++;
             v = objvec(sim, &n);
         }
@@ -519,7 +661,7 @@ static void sf_start_hook(uint64_t *ctx) {   /* 0xb475cc (the one-instruction re
     uint64_t *sp = (uint64_t *)((uint8_t *)ctx + 160); int type = (int)sp[0]; void *item = (void *)sp[2];
     if (type != 6) {   /* diversity round: every other charge (Bull, Darryl, El Primo, ...) through the native per-tick charge code */
         E.sf_ignored++;
-        if (g_native_charge) native_charge_start(ch, tx, ty, speed, type, dmg);
+        if (g_native_charge) native_charge_start(ch, tx, ty, speed, type, dmg, (int)ctx[5], (void *)sp[1], (void *)sp[9]);
         return;
     }
     void *sim = E.sim; int W, Hh; if (!map_wh(sim, &W, &Hh)) return; W *= 300; Hh *= 300;
@@ -803,6 +945,7 @@ static void pre_snapshot(void *sim) {   /* 0xb63b0c, once per tick: storm hits, 
     E.ngq = 0;
     if (E.njobs) sf_tick(sim);
     if (g_ncj) charge_contact_tick(sim);   /* diversity round: env charge contact (only after a native charge start) */
+    if (g_nzone) zone_tick(sim);
     int ntj = E.ntj; TickJob tj[64]; memcpy(tj, E.tj, ntj * sizeof *tj); E.ntj = 0;
     for (int i = 0; i < ntj; i++) {
         if (tj[i].kind == 1) sf_spawn_box(sim, tj[i].p, tj[i].a, tj[i].b, tj[i].c);
