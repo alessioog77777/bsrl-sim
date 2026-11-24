@@ -28,9 +28,10 @@
  * ty, areaLeave, areaEnter, scaled damage, Damage, ...) (`ret`; 5 callers). Only its two Blink call sites are taken here
  * (return address 0xb804a8 / 0xb80334; the projectile / component callers 0xb7495c, 0xb75dc0, 0xb9beb0 keep the stub):
  * the leave area is spawned at the start, the brawler is moved to the target (pulled back along the line to a walkable
- * tile: ForceValidTile), the enter area is spawned there, and when the enter area does not deal damage itself (an
- * Effect area: DaredevilUltiNoDamageEnter; the overcharged DaredevilOverchargedUltiDamage is a Damage area and does)
- * every living enemy character within its radius is hit once for the scaled damage through the damage root. A
+ * tile: ForceValidTile), the enter area is spawned there, a Damage area (the overcharged DaredevilOverchargedUltiDamage,
+ * no Damage of its own) with the scaled damage as its extra damage, so libg's area apply deals it; for an Effect area
+ * (DaredevilUltiNoDamageEnter) every living enemy character within its radius is hit once for the scaled damage
+ * through the damage root. A
  * BlinkReturn skill (type 23, the swapped-in DaredevilUltiReturn) teleports back to where the last Blink started.
  *
  * ChangeCharacter (Bonnie's CannonGirlSmall, Moe's DiggerDrill, Meg's MechaDude ulti, type 11 via 0xb7bb58; also the
@@ -71,7 +72,7 @@ static uint8_t *skill_data(void *sk) { return sk ? ((uint8_t *(*)(void *, int))B
 static int area_radius(uint8_t *ad) { int r = ad ? I32(ad, 0x12c) : 0; return r > 0 && r < 5000 ? r : 0; }   /* AreaEffectData Radius (+300, getter a97bb4; +292 is TimeMs) */
 /* the shipped helper 0xb35c40(owner, data, x, y, extra damage, kind, modifiers): create 0xb2aefc, add 0xb63198, start
  * 0xb29494; kind 2 = what the skill execute passes (0xb7bebc). The area's damage word is extra + the data's own Damage
- * (0xb2b0b4), so extra is 0 here, as at every shipped caller. */
+ * (0xb2b0b4), so extra is 0 here, as at every shipped caller, but for the Blink enter area that has no Damage. */
 static void *spawn_area(uint8_t *owner, void *data, int x, int y, int dmg, int kind) {
     if (!owner || !data || !PTR(owner, 0x20)) return NULL;
     return ((void *(*)(void *, void *, int, int, int, int, void *))B(0xb35c40))(owner, data, x, y, dmg, kind, NULL);
@@ -225,7 +226,7 @@ static void blink_start(uint64_t *ctx) {   /* enter 0xb4ffe0(char, tx, ty, areaL
     if (aLeave) spawn_area(ch, aLeave, x0, y0, 0, 2);
     stop_mover(ch);
     ((void (*)(void *, int, int, int))B(0xb6a61c))(ch, lx, ly, 0);
-    if (aEnter) spawn_area(ch, aEnter, lx, ly, 0, 2);
+    if (aEnter) spawn_area(ch, aEnter, lx, ly, type != 23 && I32(aEnter, 0x118) == 0 ? dmg : 0, 2);   /* a Damage area: the scaled damage */
     int r = area_radius(aEnter), hits = 0;
     if (type != 23 && dmg > 0 && r > 0 && (!aEnter || I32(aEnter, 0x118) != 0)) {   /* the enter area does not hit (not Damage) */
         int n; void **v = objs(sim, &n);

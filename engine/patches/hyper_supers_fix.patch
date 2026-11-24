@@ -1,0 +1,268 @@
+# hypercharged supers that failed only hypercharged (bsrl-sim issue #32 item 3, #6), a diff on top of hypercharged_supers.patch.
+# hyper.c: homing projectiles (TravelType 4) steered by the host (on_travel, enter hook on the travel step 0xb709e4; the
+# compiled-out steer code left their target position at 0,0), AttackPattern 11's per-attack projectile from the overcharged
+# list (hyper_proj_site at 0xb4b978, Lumi), the Attack handler's summon from OverchargedSummonedCharacters (hyper_summon_bl,
+# Pam), a hypercharged brawler's Heal-type areas heal its team once (oc_heal_areas, Pam). superfix_moves.c: Blink's Damage
+# enter area gets the scaled damage (Gigi). Paths relative to engine/.
+diff --git a/native/loader/hyper.c b/native/loader/hyper.c
+index 7c43bdd..4b93442 100644
+--- a/native/loader/hyper.c
++++ b/native/loader/hyper.c
+@@ -22,17 +22,22 @@
+  * `return false`. Here it returns true for a brawler while its hypercharge is active (hyper_install), so the game's own
+  * code runs every Overcharged* column of skills.csv: OverchargedVersion (3 supers and ~25 main attacks in this table),
+  * OverchargedProjectiles, OverchargedChainProjectile, OverchargedSummonedCharacters, OverchargedAreaEffectObject/2,
+- * OverchargedSpawnedItem and the Overcharged*Effect visuals. Seven brawlers (Jester, Beamer, Twins, Skater, Domain, Dancer,
++ * OverchargedSpawnedItem and the Overcharged*Effect visuals; two reads of a normal list that ignore it (AttackPattern 11's
++ * per-attack projectile, the Attack handler's summon) take the overcharged list here (hyper_proj_site, hyper_summon_bl),
++ * and a hypercharged brawler's Heal area heals here (oc_heal_areas). Seven brawlers (Jester, Beamer, Twins, Skater, Domain, Dancer,
+  * MechaDudeBig) have a separate super instead (characters.csv OverchargedUltimateSkill): the game builds it as the brawler's
+  * third skill instance (char+0x458[2], 0xb34560) but what picks it for a super cast is compiled out; here instances 1
+  * (the super) and 2 are swapped while hypercharged, so the game's own super code casts it, and swapped back once the
+  * hypercharge ended and that super is idle (hyper_unswap). Meg's mech (MechaDudeBig, what MechaDude's super turns into)
+  * takes Meg's card. NbeResp hyp_supers / hyp_super_id count the supers cast while hypercharged and name the SkillData of
+  * the last one (hyper_super_data, from env.c fire_input_now).
+- * The visual effects (client side) are whatever the client draws from +0xa0 and the overcharged skill data. */
++ * The visual effects (client side) are whatever the client draws from +0xa0 and the overcharged skill data.
++ * Also here: the steering of homing projectiles (on_travel), which Belle's and Hank's hypercharged supers need; it applies
++ * to every TravelType 4 projectile, hypercharged or not. NBHOST_HYPER_TRACE=1 logs each libg call site of isOvercharged. */
+ #include "nbhost.h"
+ #include "nbenv_proto.h"
+ #include <string.h>
++#include <stdlib.h>
+ 
+ #define I32(p, o) (*(int32_t *)((uint8_t *)(p) + (o)))
+ #define U8(p, o) (*(uint8_t *)((uint8_t *)(p) + (o)))
+@@ -41,6 +46,8 @@ extern Module *g_libg;
+ #define B(off) ((uint8_t *)g_libg->base + (off))
+ void *div_data(int id);   /* env.c: data row by global id, NULL unless the table has it */
+ void *hook_replace(Module *m, uint64_t off, void *repl);
++void hook_enter(Module *m, uint64_t off, void (*fn)(uint64_t *ctx));
++void hook_bl(Module *m, uint64_t off, void *fn);
+ 
+ #define DRAIN_DEFAULT 40   /* +0xa4 that 0xc42584 sets without a duration modifier (4000 max / 40 = 100 ticks = 5 s) */
+ 
+@@ -90,21 +97,168 @@ static Hyp g_hyp[NBE_MAXP];
+ static uint8_t *g_oc[NBE_MAXP];   /* player i's brawler while its hypercharge is active (what isOvercharged answers for) */
+ static uint8_t *g_sw[NBE_MAXP];   /* player i's brawler whose skill instances 1 / 2 are swapped (OverchargedUltimateSkill) */
+ 
+-void hyper_clear(void) { memset(g_hyp, 0, sizeof g_hyp); memset(g_oc, 0, sizeof g_oc); memset(g_sw, 0, sizeof g_sw); }
++static int g_heal_seen[32], g_nheal_seen; static long g_oc_heals;   /* oc_heal_areas: area ids already applied */
++static void hyper_heal_clear(void) { memset(g_heal_seen, 0xff, sizeof g_heal_seen); g_nheal_seen = 0; }
++void hyper_clear(void) { memset(g_hyp, 0, sizeof g_hyp); memset(g_oc, 0, sizeof g_oc); memset(g_sw, 0, sizeof g_sw); hyper_heal_clear(); }
+ 
+ /* Character::isOvercharged 0xb35bf0 (a bare `mov w0, wzr; ret` in this build): true for a brawler whose hypercharge is on.
+  * Only the brawlers hyper_use activated answer true (not a read of char+0x68: some call sites may pass other objects). */
+-static int my_is_oc(void *ch) {
++static int is_oc_char(void *ch) {
+     if (!ch) return 0;
+     for (int i = 0; i < NBE_MAXP; i++) if (g_oc[i] == ch && U8(ch, 0x68)) return 1;
+     return 0;
+ }
++static int my_is_oc(void *ch) {
++    int r = is_oc_char(ch);
++    static int tr = -1; if (tr < 0) tr = getenv("NBHOST_HYPER_TRACE") != NULL;
++    if (tr) {   /* debug: each call site once per (site, answer), and the object's first words */
++        int any = 0; for (int i = 0; i < NBE_MAXP; i++) any |= g_oc[i] != NULL;
++        static uint64_t seen[256]; static int ns; uint64_t lr = (uint64_t)__builtin_return_address(0) - (uint64_t)g_libg->base;
++        uint64_t key = lr << 1 | r; int k = 0; while (k < ns && seen[k] != key) k++;
++        if (any && k == ns && ns < 256) { seen[ns++] = key;
++            LOG("[hyper-trace] site 0x%llx obj %p -> %d (vt 0x%llx, +8 %d)\n", (unsigned long long)lr, ch, r,
++                ch ? (unsigned long long)((uint64_t)PTR(ch, 0) - (uint64_t)g_libg->base) : 0ULL, ch ? I32(ch, 8) : 0); }
++    }
++    return r;
++}
++
++/* Homing projectiles (projectiles_logic TravelType 4 with SteerStrength: Belle's and Hank's hypercharged supers, Gus's super,
++ * Piper's homing shots, ...). The projectile update 0xb70408 calls the travel step 0xb709e4, which for a steering projectile
++ * (0xb7634c, the SteerStrength with status modifiers, >= 1; TravelType 0xb7625c != 8) skips the straight-line position
++ * 0xb76488 and moves the projectile to proj +0x94 / +0x98, a position only the compiled-out steer code writes: it stayed 0,
++ * so the projectile was swept towards world (0, 0) on its first tick and ended there without a hit. Here an enter hook on
++ * 0xb709e4 writes that position: Speed (proj +0x14c, units/s) / 20 per tick along a heading that starts at the aim
++ * (+0xb0 start -> +0xb8 target) and, from SteerIgnoreTicks (data +0x224) on, turns by at most SteerStrength degrees per tick
++ * towards the nearest live enemy character within HomeDistance (data +0x228) x 100 units of the projectile. The game's own
++ * code then sweeps to that position (walls, hits, damage) and ends the flight at SteerLifeTime (its end tick +0x2c). */
++#define STEER_MAX 64
++static struct { uint8_t *pr; int start, last, heading; } g_steer[STEER_MAX];
++static long g_nsteer, g_nsteer_turn;
++static int sin1024(int deg) { return ((int (*)(int))B(0xd005e0))(deg); }   /* sin x 1024, degrees */
++static int angle_to(int dx, int dy) { return (dx | dy) ? ((int (*)(int, int))B(0xd00960))(dx, dy) : 0; }   /* degrees */
++/* nearest live enemy character of projectile pr within r of (x, y) (the object list and tests of spawnfix.c nearest_enemy) */
++static uint8_t *steer_target(uint8_t *pr, int x, int y, int r) {
++    uint8_t *mgr = PTR(pr, 0x20); void **arr = mgr ? PTR(mgr, 0x28) : NULL; int cnt = mgr ? I32(mgr, 0x34) : 0;
++    if (!arr || cnt < 1 || cnt > 512) return NULL;
++    uint8_t *best = NULL; long bd = (long)r * r;
++    for (int i = 0; i < cnt; i++) {
++        uint8_t *o = arr[i]; void **vt = o && o != pr ? *(void ***)o : NULL;
++        if (!vt || o == PTR(pr, 0xe0) || I32(o, 0x88) != I32(pr, 0x88) || I32(o, 0x84) == I32(pr, 0x84)) continue;
++        if (!(((uint64_t (*)(void *))vt[0x68 / 8])(o) & 1) || !(((uint64_t (*)(void *))B(0xc70134))(o) & 1)) continue;
++        long dx = I32(o, 0x38) - x, dy = I32(o, 0x3c) - y, d2 = dx * dx + dy * dy;
++        if (d2 < bd) { bd = d2; best = o; }
++    }
++    return best;
++}
++static void on_travel(uint64_t *c) {
++    uint8_t *pr = (uint8_t *)c[0], *d = pr ? PTR(pr, 0x10) : NULL;
++    if (!d || ((int (*)(void *))B(0xb7625c))(pr) == 8) return;
++    int str = ((int (*)(void *))B(0xb7634c))(pr); if (str < 1) return;
++    int now = I32(pr, 0x410) + ((int (*)(void *))B(0xc26bd8))(((void *(*)(void *))B(0xb6a378))(pr)), start = I32(pr, 0x28);
++    int k = 0, fr = -1;
++    for (; k < STEER_MAX && !(g_steer[k].pr == pr && g_steer[k].start == start); k++)
++        if (fr < 0 && (!g_steer[k].pr || now - g_steer[k].last > 200)) fr = k;   /* free, or stale (the object is long gone) */
++    if (k == STEER_MAX) {
++        if (fr < 0) return;
++        k = fr; g_steer[k].pr = pr; g_steer[k].start = g_steer[k].last = start; g_nsteer++;
++        g_steer[k].heading = angle_to(I32(pr, 0xb8) - I32(pr, 0xb0), I32(pr, 0xbc) - I32(pr, 0xb4));
++        if (g_nsteer <= 10) LOG("[hyper] homing projectile %d (data %d): heading %d, steer %d, ignore %d, home %d, end tick %d\n", I32(pr, 8),
++                                I32(d, 0x20), g_steer[k].heading, str, I32(d, 0x224), I32(d, 0x228), I32(pr, 0x2c));
++    }
++    int x = I32(pr, 0x38), y = I32(pr, 0x3c), step = I32(pr, 0x14c) / 20, h = g_steer[k].heading;
++    for (int t = g_steer[k].last + 1; t <= now && t <= g_steer[k].last + 8; t++) {   /* one step per tick (the first call: none) */
++        uint8_t *tg = t - start >= I32(d, 0x224) ? steer_target(pr, x, y, I32(d, 0x228) * 100) : NULL;
++        if (tg) {
++            int want = angle_to(I32(tg, 0x38) - x, I32(tg, 0x3c) - y), diff = ((want - h) % 360 + 540) % 360 - 180;
++            h += diff > str ? str : diff < -str ? -str : diff; h = (h % 360 + 360) % 360; g_nsteer_turn++;
++        }
++        x += (sin1024(h + 90) * step) >> 10; y += (sin1024(h) * step) >> 10;
++    }
++    if (now > g_steer[k].last) g_steer[k].last = now;
++    g_steer[k].heading = h; I32(pr, 0x94) = x; I32(pr, 0x98) = y;
++}
++/* Two places that read the normal list where the overcharged one applies (both only for a skill instance whose +0x31
++ * overcharged latch is set, sk = the skill instance, sd = its SkillData):
++ * - AttackPattern 11 (Lumi: a different projectile per attack): the character's attack tick picks SkillData Projectiles
++ *   (+0x58, count +0x64)[attack % count] at 0xb4b978 (`ldr x9, [x25, #88]`; x19 char, x20 skill instance or 0, x25 data).
++ *   hyper_proj_site replaces that load: the OverchargedProjectiles list (+0x68, count +0x74) when it is as long.
++ * - SummonedCharacters (Pam's station): the Attack handler of the skill execute 0xb7b268 (x19 skill instance, x21 its data)
++ *   reads getSummonedCharacter 0xb0ddf8(data, 0) at 8 `bl`s (HP / level / the setSummon 0xb5a6b4 at 0xb7ef1c);
++ *   hyper_summon_bl answers the first OverchargedSummonedCharacters (+0x90, count +0x9c) instead. */
++static int sk_oc(uint8_t *sk, uint8_t *sd) {
++    uint8_t *d = sk ? PTR(sk, 0) : NULL;
++    return d && U8(sk, 0x31) && (d == sd || ((void *(*)(void *))B(0xb0def8))(d) == sd);   /* data or its OverchargedVersion */
++}
++uint64_t g_hyper_proj_next;   /* libg 0xb4b97c */
++__attribute__((target("general-regs-only"))) void *hyper_proj_list(uint8_t *ch, uint8_t *sk, uint8_t *sd) {
++    (void)ch;
++    return sk_oc(sk, sd) && I32(sd, 0x74) == I32(sd, 0x64) && PTR(sd, 0x68) ? PTR(sd, 0x68) : PTR(sd, 0x58);
++}
++__attribute__((target("general-regs-only"))) void *hyper_summon_data(uint8_t *sd, int i, uint8_t *sk) {
++    if (sd && sk_oc(sk, sd) && I32(sd, 0x9c) > 0 && ((void **)PTR(sd, 0x90))[0]) return ((void **)PTR(sd, 0x90))[0];
++    return ((void *(*)(void *, int))B(0xb0ddf8))(sd, i);
++}
++/* (global symbols: each gets its own GOT slot) entered from hook_replace's stub at 0xb4b978 (every register as at the site but x16): x9 = the list, back at 0xb4b97c;
++ * x0-x18 (but x9) and x30 kept; the flags are not live there */
++__asm__(".pushsection .text\n.p2align 2\n.globl hyper_proj_site\n.type hyper_proj_site, %function\nhyper_proj_site:\n"
++        " sub sp, sp, #160\n stp x0, x1, [sp]\n stp x2, x3, [sp, #16]\n stp x4, x5, [sp, #32]\n stp x6, x7, [sp, #48]\n"
++        " stp x8, x10, [sp, #64]\n stp x11, x12, [sp, #80]\n stp x13, x14, [sp, #96]\n stp x15, x17, [sp, #112]\n"
++        " stp x18, x30, [sp, #128]\n mov x0, x19\n mov x1, x20\n mov x2, x25\n bl hyper_proj_list\n mov x9, x0\n"
++        " ldp x0, x1, [sp]\n ldp x2, x3, [sp, #16]\n ldp x4, x5, [sp, #32]\n ldp x6, x7, [sp, #48]\n ldp x8, x10, [sp, #64]\n"
++        " ldp x11, x12, [sp, #80]\n ldp x13, x14, [sp, #96]\n ldp x15, x17, [sp, #112]\n ldp x18, x30, [sp, #128]\n"
++        " add sp, sp, #160\n adrp x16, g_hyper_proj_next\n ldr x16, [x16, :lo12:g_hyper_proj_next]\n br x16\n"
++        ".globl hyper_summon_bl\n.type hyper_summon_bl, %function\nhyper_summon_bl:\n mov x2, x19\n b hyper_summon_data\n.popsection\n");
++void hyper_proj_site(void); void hyper_summon_bl(void);
++
++/* A Heal area (area_effects_logic Type Heal, enum 3) of a hypercharged brawler, e.g. Pam's MinigunOverchargedInstantHeal
++ * ("Pam's turret heals on deploy", TID_MINIGUN_DUDE_OVERCHARGE_DESC): the area apply 0xb29494 acts on a Heal area only
++ * for a positive amount (0xb29628..0xb29670) and no client code heals with it. Here, after each tick (hyper_tick_player),
++ * each new Heal area the hypercharged brawler owns (area +0x108) heals every living character of its team (+0x84) within
++ * Radius (+0x12c) once, up to max HP (the hypercharge's overheal shield is not modelled), by the area's damage word +0xe8
++ * negated, or where that is not negative by the DamageScaleType 2 amount of the area create 0xb2b124: the owner's max HP
++ * +0x3c8 x Damage (+0x134) / 100. */
++static void oc_heal_areas(uint8_t *ch) {
++    void *sim = ((void *(*)(void *))B(0xb6a378))(ch), *h = sim ? PTR(sim, 0) : NULL;
++    int n = h ? I32(h, 0xc) : 0; void **v = h ? PTR(h, 0) : NULL;
++    for (int i = 0; v && i < n && i < 4096; i++) {
++        uint8_t *a = v[i], *d = a ? PTR(a, 0x10) : NULL;
++        if (!d || I32(d, 0x20) / 1000000 != 17 || I32(d, 0x118) != 3 || PTR(a, 0x108) != ch) continue;
++        int id = I32(a, 8), k = 0; while (k < 32 && g_heal_seen[k] != id) k++;
++        if (k < 32) continue;
++        g_heal_seen[g_nheal_seen++ & 31] = id;
++        int heal = I32(a, 0xe8) < 0 ? -I32(a, 0xe8) : (I32(d, 0x138) == 2 ? -I32(ch, 0x3c8) * I32(d, 0x134) / 100 : 0);
++        int r = I32(d, 0x12c), team = I32(ch, 0x84), healed = 0;
++        for (int q = 0; heal > 0 && q < n && q < 4096; q++) {
++            uint8_t *c = v[q];
++            if (!c || PTR(c, 0) != B(0x1209020) || I32(c, 0x3c4) <= 0 || I32(c, 0x84) != team) continue;   /* a living ally */
++            long dx = I32(c, 0x38) - I32(a, 0x38), dy = I32(c, 0x3c) - I32(a, 0x3c);
++            int hp = I32(c, 0x3c4), mx = I32(c, 0x3c8);
++            if (dx * dx + dy * dy > (long)r * r || hp >= mx) continue;
++            I32(c, 0x3c4) = hp + heal < mx ? hp + heal : mx; healed++; g_oc_heals++;
++        }
++        static int nlog; if (nlog++ < 20) LOG("[hyper] heal area %d (word %d) at %d,%d r %d: %d hp to %d characters\n", I32(d, 0x20),
++                                              I32(a, 0xe8), I32(a, 0x38), I32(a, 0x3c), r, heal, healed);
++    }
++}
++
+ void hyper_install(void) {
++    hook_enter(g_libg, 0xb709e4, on_travel);   /* homing projectiles (above) */
+     uint32_t *f = (uint32_t *)B(0xb35bf0);
+     if (f[0] != 0x2a1f03e0 || f[1] != 0xd65f03c0) {   /* mov w0, wzr ; ret */
+         LOG("[hyper] isOvercharged 0xb35bf0: unexpected bytes %08x %08x, hypercharged skills off\n", f[0], f[1]); return;
+     }
+     hook_replace(g_libg, 0xb35bf0, (void *)my_is_oc);
++    if (*(uint32_t *)B(0xb4b978) == 0xf9402f29) {   /* ldr x9, [x25, #88] */
++        g_hyper_proj_next = (uint64_t)B(0xb4b97c); hook_replace(g_libg, 0xb4b978, (void *)hyper_proj_site);
++    } else LOG("[hyper] 0xb4b978: unexpected bytes, AttackPattern 11 keeps the normal projectiles\n");
++    static const uint32_t sbl[] = {0xb7eac0, 0xb7eadc, 0xb7eaf0, 0xb7eb04, 0xb7eb1c, 0xb7ec54, 0xb7eda8, 0xb7eef4};
++    for (unsigned k = 0; k < sizeof sbl / sizeof *sbl; k++) {
++        uint32_t *c = (uint32_t *)B(sbl[k]);   /* mov x0, x21 ; mov w1, wzr ; bl 0xb0ddf8 */
++        if (c[-2] != 0xaa1503e0 || c[-1] != 0x2a1f03e1 || (uint8_t *)c + (((int32_t)(c[0] << 6)) >> 4) != B(0xb0ddf8)) {
++            LOG("[hyper] 0x%x: unexpected bytes, the normal summon stays\n", sbl[k]); continue;
++        }
++        hook_bl(g_libg, sbl[k], (void *)hyper_summon_bl);
++    }
+ }
+ 
+ /* The OverchargedUltimateSkill is the brawler's third skill instance (char+0x458[2]); the game's super code uses instance 1.
+@@ -119,7 +273,7 @@ static int has_oc_ulti(uint8_t *ch) {
+ }
+ /* the super player i casts now (sd = its SkillData, SKILL_SUPER): counted in hyp_supers / hyp_super_id while hypercharged */
+ void *hyper_super_data(int i, uint8_t *ch, void *sd) {
+-    if (i < 0 || i >= NBE_MAXP || !sd || !my_is_oc(ch)) return sd;
++    if (i < 0 || i >= NBE_MAXP || !sd || !is_oc_char(ch)) return sd;
+     g_hyp[i].supers++; g_hyp[i].super_id = I32(sd, 0x20);
+     static int nlog; if (nlog++ < 40) LOG("[hyper] player %d hypercharged super: data %d%s\n", i, I32(sd, 0x20), g_sw[i] == ch ? " (OverchargedUltimateSkill)" : "");
+     return sd;
+@@ -162,6 +316,7 @@ int hyper_use(int i, void *p, uint8_t *ch) {
+ /* after every tick, per player i (ch = its brawler or NULL): drain the charge; -> 1 if the hypercharge ended at this tick */
+ int hyper_tick_player(int i, void *p, uint8_t *ch, int alive) {
+     if (!p || !U8(p, 0xa0)) return 0;
++    if (ch && alive) oc_heal_areas(ch);
+     int drain = I32(p, 0xa4) > 0 ? I32(p, 0xa4) : DRAIN_DEFAULT, c = I32(p, 0x98) - drain;
+     if (c > 0 && alive) { I32(p, 0x98) = c; return 0; }
+     I32(p, 0x98) = alive ? 0 : (c > 0 ? c : 0); U8(p, 0xa0) = 0;   /* ended (charge used up, or the brawler died) */
+diff --git a/native/loader/superfix_moves.c b/native/loader/superfix_moves.c
+index f8ddb69..d15b3e2 100644
+--- a/native/loader/superfix_moves.c
++++ b/native/loader/superfix_moves.c
+@@ -28,9 +28,10 @@
+  * ty, areaLeave, areaEnter, scaled damage, Damage, ...) (`ret`; 5 callers). Only its two Blink call sites are taken here
+  * (return address 0xb804a8 / 0xb80334; the projectile / component callers 0xb7495c, 0xb75dc0, 0xb9beb0 keep the stub):
+  * the leave area is spawned at the start, the brawler is moved to the target (pulled back along the line to a walkable
+- * tile: ForceValidTile), the enter area is spawned there, and when the enter area does not deal damage itself (an
+- * Effect area: DaredevilUltiNoDamageEnter; the overcharged DaredevilOverchargedUltiDamage is a Damage area and does)
+- * every living enemy character within its radius is hit once for the scaled damage through the damage root. A
++ * tile: ForceValidTile), the enter area is spawned there, a Damage area (the overcharged DaredevilOverchargedUltiDamage,
++ * no Damage of its own) with the scaled damage as its extra damage, so libg's area apply deals it; for an Effect area
++ * (DaredevilUltiNoDamageEnter) every living enemy character within its radius is hit once for the scaled damage
++ * through the damage root. A
+  * BlinkReturn skill (type 23, the swapped-in DaredevilUltiReturn) teleports back to where the last Blink started.
+  *
+  * ChangeCharacter (Bonnie's CannonGirlSmall, Moe's DiggerDrill, Meg's MechaDude ulti, type 11 via 0xb7bb58; also the
+@@ -71,7 +72,7 @@ static uint8_t *skill_data(void *sk) { return sk ? ((uint8_t *(*)(void *, int))B
+ static int area_radius(uint8_t *ad) { int r = ad ? I32(ad, 0x12c) : 0; return r > 0 && r < 5000 ? r : 0; }   /* AreaEffectData Radius (+300, getter a97bb4; +292 is TimeMs) */
+ /* the shipped helper 0xb35c40(owner, data, x, y, extra damage, kind, modifiers): create 0xb2aefc, add 0xb63198, start
+  * 0xb29494; kind 2 = what the skill execute passes (0xb7bebc). The area's damage word is extra + the data's own Damage
+- * (0xb2b0b4), so extra is 0 here, as at every shipped caller. */
++ * (0xb2b0b4), so extra is 0 here, as at every shipped caller, but for the Blink enter area that has no Damage. */
+ static void *spawn_area(uint8_t *owner, void *data, int x, int y, int dmg, int kind) {
+     if (!owner || !data || !PTR(owner, 0x20)) return NULL;
+     return ((void *(*)(void *, void *, int, int, int, int, void *))B(0xb35c40))(owner, data, x, y, dmg, kind, NULL);
+@@ -225,7 +226,7 @@ static void blink_start(uint64_t *ctx) {   /* enter 0xb4ffe0(char, tx, ty, areaL
+     if (aLeave) spawn_area(ch, aLeave, x0, y0, 0, 2);
+     stop_mover(ch);
+     ((void (*)(void *, int, int, int))B(0xb6a61c))(ch, lx, ly, 0);
+-    if (aEnter) spawn_area(ch, aEnter, lx, ly, 0, 2);
++    if (aEnter) spawn_area(ch, aEnter, lx, ly, type != 23 && I32(aEnter, 0x118) == 0 ? dmg : 0, 2);   /* a Damage area: the scaled damage */
+     int r = area_radius(aEnter), hits = 0;
+     if (type != 23 && dmg > 0 && r > 0 && (!aEnter || I32(aEnter, 0x118) != 0)) {   /* the enter area does not hit (not Damage) */
+         int n; void **v = objs(sim, &n);

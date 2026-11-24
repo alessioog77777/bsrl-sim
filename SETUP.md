@@ -68,6 +68,11 @@ Changes made to nirkt's code, all recorded in `engine/patches/`:
   game builds it as the brawler's third skill instance) it takes the super's place while hypercharged (`hyper.c`
   `swap_ulti` / `hyper_unswap`). Meg's mech takes Meg's card. `NbeResp` `hyp_supers` / `hyp_super_id` count the supers cast
   while hypercharged (`python -m super_audit --hyper`).
+- `hyper_supers_fix.patch` (issue #32 item 3, a diff on top of `hypercharged_supers.patch`): `hyper.c` steers homing
+  projectiles (TravelType 4: the client build leaves their target position at 0,0; this changes every homing shot, not only
+  hypercharged ones), takes the overcharged list for AttackPattern 11's per-attack projectile (Lumi) and the Attack
+  handler's summon (Pam), and heals with a hypercharged brawler's Heal areas (Pam); `superfix_moves.c` gives Blink's
+  Damage enter area the scaled damage (Gigi).
 - `showdown.patch` (issue #21, a diff on top of the others): Showdown rules the client build lacks. `native/loader/env.c`
   `elimination_tick` ends a battle with teams when one team is left (`NbeResp.winner` = that team's lowest-index player);
   `env.c` mirrors each brawler's power cubes into character `+0x874`, so libg's own death drop (inside the damage root)
