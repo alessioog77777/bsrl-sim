@@ -9,7 +9,9 @@ players 0-4 shoot in phase A, players 5-9 in phase B; in each phase every shoote
 wide corridor of open tiles in at least two directions, spots >= SPACING apart; A and B use different spots) with one
 enemy target at distance d along a corridor. Per phase: teleport + heal everyone and end spawn protection; the target fires
 one normal attack at the shooter (so a self-heal is visible); fill the shooters' supers; fire the super (fire 2, aim at the
-target, super_dist = d / CastingRange, a charge aims ~1 tile past the target); watch WATCH ticks.
+target, super_dist = d / CastingRange, a charge aims ~1 tile past the target); watch WATCH ticks. A super the player steers
+while it runs (FlyJump, Ww) has its shooter walk towards the target once its CastingTime is over (moves sent while it
+casts are dropped), so its "move" is plain walking.
 Measured per shooter (state2 dump each step, attributed by owner player index): super consumed (charge < half of max),
 damage = target HP lost (or the shooter's NbeResp damage_dealt summed over the watch steps: the host reports it per step), own max displacement (dash / jump / charge; host `leaping` flag), target max
 displacement (pushback / pull), own HP gain (only when the pre-damage hit), new projectiles / summons / area effects
@@ -133,7 +135,8 @@ def expected(name):
                 if _num(r, "InnerRadius") > 0 and _num(r, "InnerRadiusDamagePercent") == 0), default=0.0)
     if cr <= 0 and not projs and alog and not charge:   # no aim range, the effect is an area at the brawler: the target stands inside it
         cr = max((_num(r, "Radius") for r in alog), default=0.0)
-    return {"skill": sk_name, "type": bt, "kind": kind, "range": cr if cr > 0 else 2600.0, "charge": charge, "ring": ring, "expect": ex,
+    steer = bt in ("FlyJump", "Ww")   # the brawler moves under its player's control while the super runs: walk it to the target
+    return {"skill": sk_name, "type": bt, "kind": kind, "range": cr if cr > 0 else 2600.0, "charge": charge, "ring": ring, "steer": steer, "cast": _num(s, "CastingTime"), "expect": ex,
             "projectiles": projs, "summons": summons, "areas": areas, "items": items, "notes": notes}
 
 
@@ -421,7 +424,12 @@ class Auditor:
                         if min(np.hypot(row[3] - m["tx0"], row[4] - m["ty0"]), np.hypot(row[3] - m["x0"], row[4] - m["y0"])) < 2000:
                             m["foreign_near"] = True
             if n >= WATCH: break
-            r = stp(); n += STEP
+            acts = dict(idle)
+            for j, s, t in run:   # steered supers (FlyJump, Ww): once cast, the shooter walks to the target (16 joystick directions)
+                p, q = r.pl[s], r.pl[t]; inf = self.info[j.name]
+                if inf.get("steer") and n * 50 > inf.get("cast", 0) + 100 and q.alive and np.hypot(q.x - p.x, q.y - p.y) > 150:
+                    acts[s] = (int(round(np.degrees(np.arctan2(q.y - p.y, q.x - p.x)) / 22.5)) % 16, 0, 0.0, 0.0)
+            r = stp(acts); n += STEP
         out = []
         for j, s, t in run:
             m = M[j]
