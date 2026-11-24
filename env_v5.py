@@ -35,6 +35,9 @@ Gadgets (obs v5.7, issue #3, off by default): make_battle_fn(gadgets=True) / wit
 every player one of its brawler's gadget cards; Env.gadget(ids) = whether the agent's gadget can be used now, from the
 host's gadget state (NbeResp gad_*), for obs_v5's self 3 (ObsV5.build(..., gadget=)). The native AI's gadget use is not
 in the BC labels (the controller records have no gadget calls).
+Hypercharge (obs v5.8, issue #4, off by default): make_battle_fn(hyper=True) / with_hyper (trainer --hyper 1) equip every
+player's hypercharge card (a brawler without one gets none); Env.hyper(ids) = whether the agent can activate it now, from
+the host's hypercharge state (NbeResp hyp_*, native/loader/hyper.c), for obs_v5's self 4 (ObsV5.build(..., hyper=)).
 """
 import argparse, functools, json, os, sys, time
 import numpy as np
@@ -84,6 +87,19 @@ def with_gadgets(cfg, rng):
     return {**cfg, "div": div}
 
 
+def with_hyper(cfg):
+    """battle cfg -> the same cfg, every player (tag "chr") with its brawler's hypercharge card (the host looks the card up;
+    a brawler without one gets none). No random draw."""
+    return {**cfg, "div": {**cfg["div"], "hyper": list(range(len(cfg["tag"]["chr"])))}}
+
+
+@functools.lru_cache(None)
+def hyper_brawlers():
+    """brawlers (characters.csv Name) with a hypercharge card (cards.csv MetaType 6, Target = the brawler)"""
+    return frozenset(r["Target"] for r in D._rows("cards.csv")
+                     if r[next(iter(r))] and r.get("MetaType") == "6" and r.get("Target") and r.get("Disabled") != "true")
+
+
 def locations():
     bad = set(_skip().get("locations", []))
     return [n for n, (_, r) in D.table("locations.csv").items()
@@ -106,9 +122,10 @@ def use_genmaps(n_inst, dirs=None):
     return dict(NI.APK_BY_IDX)
 
 
-def make_battle_fn(agents=10, seed0=10_000_000, roster=None, locs=None, p_team=0.5, gen=None, p_gen=0.5, gadgets=False):
+def make_battle_fn(agents=10, seed0=10_000_000, roster=None, locs=None, p_team=0.5, gen=None, p_gen=0.5, gadgets=False, hyper=False):
     """gen = use_genmaps()'s {instance: dir}: there a battle plays the generated layout with probability p_gen;
-    gadgets: every player gets a random gadget card of its brawler (none if it has none)"""
+    gadgets: every player gets a random gadget card of its brawler (none if it has none); hyper: every player gets its
+    brawler's hypercharge card (with_hyper)"""
     roster = roster or heroes(); locs = locs or locations(); gen = gen or {}
     seeds = iter(range(seed0, seed0 + 10 ** 9))
 
@@ -126,7 +143,8 @@ def make_battle_fn(agents=10, seed0=10_000_000, roster=None, locs=None, p_team=0
         ctl = sorted(int(p) for p in rng.choice(10, size=agents, replace=False))
         cfg = {"seed": next(seeds), "ctl": ctl, "end": "agents", "div": div,
                "tag": {"loc": os.path.basename(os.path.dirname(g)) if g else loc, "chr": br, "team_size": size, "groups": groups}}
-        return with_gadgets(cfg, rng) if gadgets else cfg   # drawn last: the rest of the battle is the same without gadgets
+        cfg = with_gadgets(cfg, rng) if gadgets else cfg   # drawn last: the rest of the battle is the same without gadgets
+        return with_hyper(cfg) if hyper else cfg            # no draw
     return battle_fn
 
 
@@ -312,6 +330,15 @@ def gadget_ready(r, p):
     pl = r.pl[p]
     return bool(getattr(r, "gad_valid", 0) and r.gad_kind[p] != P.GAD_NONE and r.gad_charges[p] > 0 and r.gad_cd[p] <= 0
                 and pl.alive and not pl.eliminated and pl.reserved[3] <= 0)
+
+
+def hyper_ready(r, p):
+    """host response r, player p -> the hypercharge can be activated now (Env.hyper's rule): the host runs hypercharge
+    (hyp_valid, native/loader/hyper.c), the player has its card, the charge (reserved[0]) is full (>= reserved[1]), it is
+    not active, the brawler is in play"""
+    pl = r.pl[p]
+    return bool(getattr(r, "hyp_valid", 0) and r.hyp_card[p] and r.hyp_left[p] <= 0 and pl.reserved[1] > 0
+                and pl.reserved[0] >= pl.reserved[1] and pl.alive and not pl.eliminated and pl.reserved[3] <= 0)
 
 
 def player_ranks(r):
@@ -777,6 +804,16 @@ class Env(MAEnv):
             if s is not None: out[k] = gadget_ready(s.inst.resp, int(a) & 15)
         return out
 
+    def hyper(self, ids):
+        """(B,) float32: 1 = the agent can activate its hypercharge now (obs_v5 self 4; hyper_ready): the host runs
+        hypercharge (hyp_valid), the card is equipped, the charge is full, it is not active and the brawler is in play.
+        All 0 with a host without hyper.c."""
+        by = {s.battle: s for s in self.I}; out = np.zeros(len(ids), np.float32)
+        for k, a in enumerate(ids):
+            s = by.get(int(a) >> 4)
+            if s is not None: out[k] = hyper_ready(s.inst.resp, int(a) & 15)
+        return out
+
     def cond(self, ids):
         """(B, N_COND) conditioning vectors (obs_v5.cond) of the agents of the last poll()"""
         by = {s.battle: s for s in self.I}
@@ -925,7 +962,8 @@ def _check():
     _check_planner(players, tiles, NS)
     _check_who(NS)
     _check_gadgets(NS)
-    print("env_v5 sliders, aux labels, intents, planner hook, identity rows, gadget readiness ok")
+    _check_hyper(NS)
+    print("env_v5 sliders, aux labels, intents, planner hook, identity rows, gadget / hypercharge readiness ok")
 
 
 def _check_gadgets(NS):
@@ -945,6 +983,24 @@ def _check_gadgets(NS):
     r1, r2 = np.random.default_rng(4), np.random.default_rng(4)                              # gadgets drawn last: the battle
     c1, c2 = make_battle_fn(3, seed0=7)(r1, 0), make_battle_fn(3, seed0=7, gadgets=True)(r2, 0)   # is the same without them
     assert c1["tag"] == c2["tag"] and c1["ctl"] == c2["ctl"] and "gadget" not in c1["div"] and len(c2["div"]["gadget"]) == 10
+
+
+def _check_hyper(NS):
+    """hypercharge readiness from the host's hyp_* fields (fake responses) and the loadout request"""
+    pl = lambda **o: NS(**{"alive": 1, "eliminated": 0, "reserved": [4000, 4000, 0, 0], **o})
+    def resp(valid=1, card=23000777, left=0, **o):
+        return NS(hyp_valid=valid, hyp_card=[card] * 16, hyp_left=[left] * 16, pl=[pl(**o)] * 16)
+    assert hyper_ready(resp(), 0) and not hyper_ready(NS(pl=[pl()] * 16), 0)                 # a host without hyp_*: never
+    for bad in (dict(valid=0), dict(card=0), dict(left=30), dict(reserved=[3999, 4000, 0, 0]), dict(reserved=[0, 0, 0, 0]),
+                dict(alive=0), dict(eliminated=1), dict(reserved=[4000, 4000, 0, 40])):
+        assert not hyper_ready(resp(**bad), 0), bad
+    env = Env.__new__(Env); env.I = [NS(battle=3, inst=NS(resp=resp())), NS(battle=4, inst=NS(resp=resp(left=2)))]
+    assert env.hyper(np.array([3 << 4 | 2, 4 << 4 | 2, 9 << 4])).tolist() == [1, 0, 0]        # unknown battle: 0
+    hb = hyper_brawlers(); assert "ShotgunGirl" in hb and len(hb) > 50, len(hb)
+    r1, r2 = np.random.default_rng(4), np.random.default_rng(4)                              # no draw: the same battle
+    c1, c2 = make_battle_fn(3, seed0=7, gadgets=True)(r1, 0), make_battle_fn(3, seed0=7, gadgets=True, hyper=True)(r2, 0)
+    assert c1["tag"] == c2["tag"] and c1["div"]["gadget"] == c2["div"]["gadget"] and "hyper" not in c1["div"]
+    assert c2["div"]["hyper"] == list(range(10))
 
 
 def _check_aux(players, tiles, bush, NS):

@@ -5,15 +5,16 @@ the repo root and is run as `python -m <module>` from the root after `source env
 
 ## Before you change anything
 - Read README.md (file map, setup) and the docstring at the top of the file you touch. The docstrings are the spec.
-- `deps/` is nirkt's code (README "Credits"), not under this repo's licence. Keep changes there small, and record every
-  one in `host/*.patch` (a diff against nirkt's pinned commit) so the two stay separable.
+- `engine/` is nirkt's code (README "Credits", `engine/NOTICE.md`), not under this repo's licence. Keep changes there
+  small, and record every one in `engine/patches/*.patch` (a diff on top of the earlier patches, paths relative to
+  `engine/`) so the two stay separable. This repo's own code is the flat modules at the root.
 - `./setup.sh` builds everything (SETUP.md); `source env.sh` before any module. Without the host built, only the
   self-checks that skip the game data run (`scorecard.py --check`, `apply_noise.py --test`).
 - No game files, binaries, checkpoints, datasets or run outputs go into git (`.gitignore`).
 
 ## Checks
 - Self-checks, no battle (`obs_v5` / `env_v5` need the game files from `setup.sh`): `python -m obs_v5`, `python -m intent`, `python -m planner`, `python -m model`, `python -m fast_obs`, `python -m env_v5 --check`,
-  `python scorecard.py --check`, `python apply_noise.py --test`, `python -m super_audit --check`, `python -m gadget_check --check`, `python -m export_policy --check`. Run the ones for the modules you touched.
+  `python scorecard.py --check`, `python apply_noise.py --test`, `python -m super_audit --check`, `python -m gadget_check --check`, `python -m hyper_check --check`, `python -m charge_check --check`, `python -m export_policy --check`. Run the ones for the modules you touched.
 - Host checks (boot takes 60-90 s each, so batch your questions into one run): `python -m live_check`,
   `python -m test_fast` (fast paths must stay bit-equal to the reference paths), `python -m train_ppo --run t --smoke`.
 - Every new module gets an assert self-check (`python -m <module>` or `--check`), like the existing ones.

@@ -1,0 +1,122 @@
+/* superfix (bsrl-sim issue #6): supers whose effect the shipped client libg does not run, re-implemented with libg's own
+ * functions (the way spawnfix.c re-creates the children of explosions).
+ *
+ * spawnAreaEffect 0xb3970c (character, ...) -> area: compiled out as `mov x0, xzr; ret`, so no skill ever creates its
+ * AreaEffectObject: AreaBuff supers (Emz, Max, Jae-Yong), Attack supers whose effect is an area at the brawler (Angelo,
+ * Jacky, Maisie, Pearl, Hank) and the other callers (0xb7d534 / 0xb7d570 AreaBuff, 0xb7fd6c / 0xb7f044 Attack area 1 / 2,
+ * 0xb786f4, 0xb7ffac, 0xb82aa8, 0xc2f654). Rebuilt from the chain of the shipped helper 0xb35c40 (12 callers, two in the
+ * skill execute): create 0xb2aefc(data, owner, x, y, z, kind, extra) -> modifiers 0xb2b2d4(area, mods, 0) -> follow the
+ * owner 0xb29350(area, owner) -> add to the object manager 0xb63198(owner+0x20, area) -> start 0xb29494(area) (which runs
+ * spawnfix's on_area: a BulletExplosion area gets its children). Arguments from the call sites: x0 owner, w1 extra (the
+ * scaled base damage, as 0xb35c40's callers compute it), x3 data, w4 kind, w7 follow, [sp+16] modifiers, [sp+24] start
+ * now (0 at 0xb7ffac, whose caller starts it); w2, w5, w6, [sp], [sp+8] are not used here.
+ *
+ * DelayedDamage areas (type 8; Tara's BlackHoleUltiExplosion): the area apply 0xb29494 runs once at the spawn and its type
+ * gate refuses 8; the client only (de)serialises the area's "done" byte +0xfc (0xb28a94 / 0xb28388). From the area tick
+ * 0xb28c0c, once CustomValue ms (data +0x13c) have passed since the apply (area +0xd0 = its tick), the apply runs again with
+ * the data's type set to Damage (0) for the call: damage, pushback and wall break then come from libg. 0xb29494 rewrites
+ * area +0xd0 / +0xd4 / +0xd8 before its gate: saved and restored, as is the shared data's type.
+ *
+ * Ally / own heal of a super projectile (HealOwnPercent, data +0x1f0; Poco's DeadMariachiUltiProjectile): the attack
+ * execute calls the getter 0xafaa10 at 0xb4de50 and drops the result (the server block that used it is compiled out),
+ * so the projectile's ally-heal amount +0x10c (the hit code 0xb754b8..0xb754f4 heals same-team characters it touches
+ * through 0xb41554 when it is >= 1) is never set. The `bl` is redirected: +0x10c = projectile damage (+0xd4) x percent
+ * / 100, and the owner is healed the same amount once per attack (DamageOnlyWithOneProj, getter 0xafaa08), only for the
+ * owner's super (attack slot [sp+256] == 2 at that point).
+ * NB_SUPERFIX=0 turns every part off. */
+#include "nbhost.h"
+#include <stdlib.h>
+extern Module *g_libg;
+void *hook_replace(Module *m, uint64_t off, void *repl);
+void hook_enter(Module *m, uint64_t off, void (*fn)(uint64_t *ctx));
+void hook_bl(Module *m, uint64_t off, void *fn);
+#define B(off) ((uint8_t *)g_libg->base + (off))
+#define I32(p, o) (*(int32_t *)((uint8_t *)(p) + (o)))
+#define PTR(p, o) (*(void **)((uint8_t *)(p) + (o)))
+static int mode(void) { return I32(g_libg->base, 0x12eefb4) == 3; }   /* battle running (spawnfix.c mode()) */
+
+int g_superfix = 1, g_superfix_dbg;
+static long g_narea, g_narea_skip;
+
+typedef void *(*mkarea_t)(void *data, void *owner, int x, int y, int z, int kind, int extra);
+typedef int (*geti_t)(void *);
+static void *my_spawn_area(uint8_t *ch, int extra, int w2, void *data, int kind, int w5, int w6, int follow,
+                           void *s0, void *s1, void *mods, long start) {
+    (void)w2; (void)w5; (void)w6; (void)s0; (void)s1;
+    if (!g_superfix || !mode() || !ch || !data || !PTR(ch, 0x20)) { g_narea_skip++; return NULL; }   /* the stub's result */
+    int x = ((geti_t)B(0xb6a628))(ch), y = ((geti_t)B(0xb6a630))(ch);
+    void *a = ((mkarea_t)B(0xb2aefc))(data, ch, x, y, 0, kind, extra);
+    if (!a) { g_narea_skip++; return NULL; }
+    if (mods) ((void (*)(void *, void *, int))B(0xb2b2d4))(a, mods, 0);
+    if (follow & 1) ((void (*)(void *, void *))B(0xb29350))(a, ch);    /* bools are passed as bytes: low bit only */
+    ((void (*)(void *, void *))B(0xb63198))(PTR(ch, 0x20), a);
+    if (start & 1) ((void (*)(void *))B(0xb29494))(a);
+    g_narea++;
+    if (g_superfix_dbg) LOG("[superfix] spawnAreaEffect owner %p data %p type %d kind %d extra %d follow %d start %d -> %p\n",
+                            ch, data, I32(data, 0x118), kind, extra, follow & 1, (int)(start & 1), a);
+    return a;
+}
+
+/* ---- DelayedDamage (type 8) */
+typedef void *(*getp_t)(void *);
+static long g_ndelayed;
+static void on_area_tick(uint64_t *ctx) {   /* enter hook on 0xb28c0c, ctx[0] = area */
+    uint8_t *a = (uint8_t *)ctx[0];
+    if (!g_superfix || !mode() || !a) return;
+    extern void superfix_status_area(uint8_t *) __attribute__((weak)); if (superfix_status_area) superfix_status_area(a);   /* type 36 */
+    uint8_t *d = ((getp_t)B(0xb6a384))(a), *sim = ((getp_t)B(0xb6a378))(a);
+    if (!d || !sim || I32(d, 0x118) != 8 || a[0xfc]) return;
+    int el = I32(sim, 0x10) - I32(a, 0xd0);                 /* ticks since the spawn apply (0xc26bd8 = sim +0x10) */
+    if (el < I32(d, 0x13c) / 50) return;                    /* CustomValue in ms, 50 ms ticks (BlackHole 700 -> 14) */
+    a[0xfc] = 1;
+    int d0 = I32(a, 0xd0), d4 = I32(a, 0xd4), d8 = I32(a, 0xd8);
+    I32(d, 0x118) = 0; ((void (*)(void *))B(0xb29494))(a); I32(d, 0x118) = 8;
+    I32(a, 0xd0) = d0; I32(a, 0xd4) = d4; I32(a, 0xd8) = d8;
+    g_ndelayed++;
+    if (g_superfix_dbg) LOG("[superfix] delayed damage area %p after %d ticks, dmg %d\n", a, el, I32(a, 0xe8));
+}
+
+/* ---- ally / own heal (HealOwnPercent) */
+static long g_nheal, g_nheal_self;
+int superfix_heal_own(void *pdata, uint8_t *p, uint8_t *owner, int slot) {   /* in place of `bl 0xafaa10` at 0xb4de50 */
+    int pct = ((geti_t)B(0xafaa10))(pdata);
+    if (!g_superfix || !mode() || pct <= 0 || !p || slot != 2) return pct;
+    int amount = (int)((long)I32(p, 0xd4) * pct / 100);
+    if (amount < 1) return pct;
+    if (I32(p, 0x10c) == 0) { I32(p, 0x10c) = amount; g_nheal++; }
+    static void *last_owner; static int last_tick = -1;
+    uint8_t *sim = owner ? ((getp_t)B(0xb6a378))(owner) : NULL; int t = sim ? I32(sim, 0x10) : -1;
+    if (owner && (!((geti_t)B(0xafaa08))(pdata) || owner != last_owner || t != last_tick)) {
+        last_owner = owner; last_tick = t;
+        int hp_a = I32(owner, 0x3c4);
+        ((void (*)(void *, int, int, int, void *, int, int, int, long, long))B(0xb41554))(owner, ((geti_t)B(0xb6a754))(p), amount, 1, pdata, I32(p, 0x418), 0, 0, 0, 0);
+        g_nheal_self++;
+        if (g_superfix_dbg) LOG("[superfix] heal own: owner hp %d -> %d (max %d)\n", hp_a, I32(owner, 0x3c4), I32(owner, 0x3c8));
+    }
+    if (g_superfix_dbg) LOG("[superfix] heal own: projectile %p %d %% of %d -> %d, owner %p\n", p, pct, I32(p, 0xd4), amount, owner);
+    return pct;
+}
+/* hook_bl lands here with lr = 0xb4de54: x26 = the projectile just spawned (0xb4dc4c), x19 = owner, [sp+256] = attack slot */
+void superfix_heal_thunk(void);
+__asm__(".text\n.global superfix_heal_thunk\nsuperfix_heal_thunk:\n\tmov x1, x26\n\tmov x2, x19\n\tldr w3, [sp, #256]\n\tb superfix_heal_own\n");
+
+void superfix_install(void) {
+    const char *e = getenv("NB_SUPERFIX"); if (e) g_superfix = atoi(e);
+    if (getenv("NB_SUPERFIX_DBG")) g_superfix_dbg = 1;
+    if (!g_superfix) { LOG("[superfix] disabled\n"); return; }
+    if (*(uint32_t *)B(0xb3970c) == 0xaa1f03e0 && *(uint32_t *)B(0xb39710) == 0xd65f03c0)   /* mov x0, xzr; ret */
+        hook_replace(g_libg, 0xb3970c, (void *)my_spawn_area);
+    else LOG("[superfix] 0xb3970c is not the spawnAreaEffect stub: left as it is\n");
+    if (*(uint32_t *)B(0xb28c0c) == 0xa9be7bfd) hook_enter(g_libg, 0xb28c0c, on_area_tick);   /* stp x29, x30, [sp, #-32]! */
+    if (*(uint32_t *)B(0xb4de4c) == 0xaa1503e0 && (*(uint32_t *)B(0xb4de50) & 0xfc000000) == 0x94000000)   /* mov x0, x21; bl */
+        hook_bl(g_libg, 0xb4de50, (void *)superfix_heal_thunk);
+    LOG("[superfix] installed (spawnAreaEffect, delayed damage, heal own)\n");
+    extern void superfix_items_install(void) __attribute__((weak)); if (superfix_items_install) superfix_items_install();
+    extern void superfix_moves_install(void) __attribute__((weak)); if (superfix_moves_install) superfix_moves_install();
+    extern void superfix_status_install(void) __attribute__((weak)); if (superfix_status_install) superfix_status_install();
+}
+void superfix_status(void) { LOG("[superfix] areas spawned %ld, skipped %ld; delayed damage %ld; heal own %ld projectiles, %ld owners\n",
+                                 g_narea, g_narea_skip, g_ndelayed, g_nheal, g_nheal_self);
+    extern void superfix_items_status(void) __attribute__((weak)); if (superfix_items_status) superfix_items_status();
+    extern void superfix_moves_status(void) __attribute__((weak)); if (superfix_moves_status) superfix_moves_status();
+    extern void superfix_status_status(void) __attribute__((weak)); if (superfix_status_status) superfix_status_status(); }

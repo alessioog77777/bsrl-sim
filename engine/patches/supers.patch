@@ -1,0 +1,962 @@
+# supers (bsrl-sim issue #6): supers whose effect the shipped client libg compiles out, re-implemented in the host with
+# libg's own functions (native/loader/superfix*.c; NB_SUPERFIX=0 turns all of it off). Applies on top of
+# training_round.patch, fair_view.patch, live_state.patch and gadgets.patch (paths relative to engine/).
+diff --git a/native/loader/battle_fix.c b/native/loader/battle_fix.c
+index dbc7de6..62e2eee 100644
+--- a/native/loader/battle_fix.c
++++ b/native/loader/battle_fix.c
+@@ -86,7 +86,12 @@ static uint64_t my_init(ARGS8) { if (mode()) { ensure((uint8_t *)a0); bar_fix_se
+ static uint64_t my_ser(ARGS8) { if (mode()) ensure((uint8_t *)a0); return o_ser(FWD8); }
+ static uint8_t g_scratch[0x200] __attribute__((aligned(16)));
+ static uint64_t my_pred(ARGS8) { if (!a0 && mode()) { a0 = (uint64_t)g_scratch; g_guard[0]++; } return o_pred(FWD8); }
+-static uint64_t my_die(ARGS8) { uint64_t r = o_die(FWD8); if (!r && a0 && mode()) { r = a0; g_guard[1]++; } return r; }
++uint64_t superfix_change_character(void *old, void *data) __attribute__((weak));   /* superfix_moves.c: the new character */
++static uint64_t my_die(ARGS8) {
++    uint64_t nc = superfix_change_character && mode() ? superfix_change_character((void *)a0, (void *)a1) : 0;
++    uint64_t r = o_die(FWD8);   /* the shipped stub retires the old character (HP 0) and returns NULL */
++    if (nc) return nc;
++    if (!r && a0 && mode()) { r = a0; g_guard[1]++; } return r; }
+ 
+ void battle_fix_install(void) {
+     hook_bl(g_libg, 0xb64954, ability_writer);
+@@ -101,7 +106,9 @@ void battle_fix_install(void) {
+     LOG("[battle-fix] installed: ability/element writers, element repair, 4 null guards\n");
+ }
+ extern void spawnfix_status(void) __attribute__((weak));
++extern void superfix_status(void) __attribute__((weak));
+ void battle_fix_status(void) {
+     if (spawnfix_status) spawnfix_status();
++    if (superfix_status) superfix_status();
+     LOG("[battle-fix] ability fields %ld, elements %ld, characters populated %ld, guards %ld/%ld\n", g_abil, g_elem, g_populated, g_guard[0], g_guard[1]);
+ }
+diff --git a/native/loader/build.sh b/native/loader/build.sh
+index 2e51585..438b70f 100755
+--- a/native/loader/build.sh
++++ b/native/loader/build.sh
+@@ -10,5 +10,5 @@
+ set -e
+ cd "$(dirname "$0")"
+ aarch64-linux-gnu-gcc -O2 -g -ffp-contract=off -fno-omit-frame-pointer -static -D_GNU_SOURCE -Wall -Wno-unused-function -Wno-incompatible-pointer-types \
+-  -Wno-int-conversion -fno-strict-aliasing -Iinc -o nbhost_spawnfix2.tmp main.c elfload.c bionic_shim.c android_shim.c jni_fake.c boot.c hook.c offline.c battle_fix.c env.c prof.c encode.c heapcheck.c bar_fix.c gl_client.c gl_client_gen.c spawnfix.c gadget.c trace.c thunk.S -lm -lpthread
++  -Wno-int-conversion -fno-strict-aliasing -Iinc -o nbhost_spawnfix2.tmp main.c elfload.c bionic_shim.c android_shim.c jni_fake.c boot.c hook.c offline.c battle_fix.c env.c prof.c encode.c heapcheck.c bar_fix.c gl_client.c gl_client_gen.c spawnfix.c superfix.c superfix_items.c superfix_moves.c superfix_status.c gadget.c trace.c thunk.S -lm -lpthread
+ mv -f nbhost_spawnfix2.tmp nbhost_spawnfix2 && echo "built native/loader/nbhost_spawnfix2"
+diff --git a/native/loader/main.c b/native/loader/main.c
+index aac58b0..fe385d5 100644
+--- a/native/loader/main.c
++++ b/native/loader/main.c
+@@ -152,7 +152,7 @@ int main(int argc, char **argv) {
+         LOG("[patch] applied %zu RET patches and 2 NOP runs from the phone\n", sizeof g_ret_patches / 4);
+     }
+     { extern int g_env_on, g_lockstep; if (g_env_on && !g_lockstep) g_lockstep = 1; }   /* env: every frame owes a tick */
+-    if (strcmp(stage, "onload")) { extern void offline_install(const char *); offline_install(g_payloads); extern void trace_install(void) __attribute__((weak)); if (trace_install) trace_install(); extern void spawnfix_install(void) __attribute__((weak)); if (spawnfix_install) spawnfix_install(); }
++    if (strcmp(stage, "onload")) { extern void offline_install(const char *); offline_install(g_payloads); extern void trace_install(void) __attribute__((weak)); if (trace_install) trace_install(); extern void spawnfix_install(void) __attribute__((weak)); if (spawnfix_install) spawnfix_install(); extern void superfix_install(void) __attribute__((weak)); if (superfix_install) superfix_install(); }
+     double t = now();
+     run_initializers(cxx); run_initializers(scid); run_initializers(g_libg);
+     LOG("[time] static constructors in %.3f s\n", now() - t);
+diff --git a/native/loader/superfix.c b/native/loader/superfix.c
+new file mode 100644
+index 0000000..a5c7215
+--- /dev/null
++++ b/native/loader/superfix.c
+@@ -0,0 +1,122 @@
++/* superfix (bsrl-sim issue #6): supers whose effect the shipped client libg does not run, re-implemented with libg's own
++ * functions (the way spawnfix.c re-creates the children of explosions).
++ *
++ * spawnAreaEffect 0xb3970c (character, ...) -> area: compiled out as `mov x0, xzr; ret`, so no skill ever creates its
++ * AreaEffectObject: AreaBuff supers (Emz, Max, Jae-Yong), Attack supers whose effect is an area at the brawler (Angelo,
++ * Jacky, Maisie, Pearl, Hank) and the other callers (0xb7d534 / 0xb7d570 AreaBuff, 0xb7fd6c / 0xb7f044 Attack area 1 / 2,
++ * 0xb786f4, 0xb7ffac, 0xb82aa8, 0xc2f654). Rebuilt from the chain of the shipped helper 0xb35c40 (12 callers, two in the
++ * skill execute): create 0xb2aefc(data, owner, x, y, z, kind, extra) -> modifiers 0xb2b2d4(area, mods, 0) -> follow the
++ * owner 0xb29350(area, owner) -> add to the object manager 0xb63198(owner+0x20, area) -> start 0xb29494(area) (which runs
++ * spawnfix's on_area: a BulletExplosion area gets its children). Arguments from the call sites: x0 owner, w1 extra (the
++ * scaled base damage, as 0xb35c40's callers compute it), x3 data, w4 kind, w7 follow, [sp+16] modifiers, [sp+24] start
++ * now (0 at 0xb7ffac, whose caller starts it); w2, w5, w6, [sp], [sp+8] are not used here.
++ *
++ * DelayedDamage areas (type 8; Tara's BlackHoleUltiExplosion): the area apply 0xb29494 runs once at the spawn and its type
++ * gate refuses 8; the client only (de)serialises the area's "done" byte +0xfc (0xb28a94 / 0xb28388). From the area tick
++ * 0xb28c0c, once CustomValue ms (data +0x13c) have passed since the apply (area +0xd0 = its tick), the apply runs again with
++ * the data's type set to Damage (0) for the call: damage, pushback and wall break then come from libg. 0xb29494 rewrites
++ * area +0xd0 / +0xd4 / +0xd8 before its gate: saved and restored, as is the shared data's type.
++ *
++ * Ally / own heal of a super projectile (HealOwnPercent, data +0x1f0; Poco's DeadMariachiUltiProjectile): the attack
++ * execute calls the getter 0xafaa10 at 0xb4de50 and drops the result (the server block that used it is compiled out),
++ * so the projectile's ally-heal amount +0x10c (the hit code 0xb754b8..0xb754f4 heals same-team characters it touches
++ * through 0xb41554 when it is >= 1) is never set. The `bl` is redirected: +0x10c = projectile damage (+0xd4) x percent
++ * / 100, and the owner is healed the same amount once per attack (DamageOnlyWithOneProj, getter 0xafaa08), only for the
++ * owner's super (attack slot [sp+256] == 2 at that point).
++ * NB_SUPERFIX=0 turns every part off. */
++#include "nbhost.h"
++#include <stdlib.h>
++extern Module *g_libg;
++void *hook_replace(Module *m, uint64_t off, void *repl);
++void hook_enter(Module *m, uint64_t off, void (*fn)(uint64_t *ctx));
++void hook_bl(Module *m, uint64_t off, void *fn);
++#define B(off) ((uint8_t *)g_libg->base + (off))
++#define I32(p, o) (*(int32_t *)((uint8_t *)(p) + (o)))
++#define PTR(p, o) (*(void **)((uint8_t *)(p) + (o)))
++static int mode(void) { return I32(g_libg->base, 0x12eefb4) == 3; }   /* battle running (spawnfix.c mode()) */
++
++int g_superfix = 1, g_superfix_dbg;
++static long g_narea, g_narea_skip;
++
++typedef void *(*mkarea_t)(void *data, void *owner, int x, int y, int z, int kind, int extra);
++typedef int (*geti_t)(void *);
++static void *my_spawn_area(uint8_t *ch, int extra, int w2, void *data, int kind, int w5, int w6, int follow,
++                           void *s0, void *s1, void *mods, long start) {
++    (void)w2; (void)w5; (void)w6; (void)s0; (void)s1;
++    if (!g_superfix || !mode() || !ch || !data || !PTR(ch, 0x20)) { g_narea_skip++; return NULL; }   /* the stub's result */
++    int x = ((geti_t)B(0xb6a628))(ch), y = ((geti_t)B(0xb6a630))(ch);
++    void *a = ((mkarea_t)B(0xb2aefc))(data, ch, x, y, 0, kind, extra);
++    if (!a) { g_narea_skip++; return NULL; }
++    if (mods) ((void (*)(void *, void *, int))B(0xb2b2d4))(a, mods, 0);
++    if (follow & 1) ((void (*)(void *, void *))B(0xb29350))(a, ch);    /* bools are passed as bytes: low bit only */
++    ((void (*)(void *, void *))B(0xb63198))(PTR(ch, 0x20), a);
++    if (start & 1) ((void (*)(void *))B(0xb29494))(a);
++    g_narea++;
++    if (g_superfix_dbg) LOG("[superfix] spawnAreaEffect owner %p data %p type %d kind %d extra %d follow %d start %d -> %p\n",
++                            ch, data, I32(data, 0x118), kind, extra, follow & 1, (int)(start & 1), a);
++    return a;
++}
++
++/* ---- DelayedDamage (type 8) */
++typedef void *(*getp_t)(void *);
++static long g_ndelayed;
++static void on_area_tick(uint64_t *ctx) {   /* enter hook on 0xb28c0c, ctx[0] = area */
++    uint8_t *a = (uint8_t *)ctx[0];
++    if (!g_superfix || !mode() || !a) return;
++    extern void superfix_status_area(uint8_t *) __attribute__((weak)); if (superfix_status_area) superfix_status_area(a);   /* type 36 */
++    uint8_t *d = ((getp_t)B(0xb6a384))(a), *sim = ((getp_t)B(0xb6a378))(a);
++    if (!d || !sim || I32(d, 0x118) != 8 || a[0xfc]) return;
++    int el = I32(sim, 0x10) - I32(a, 0xd0);                 /* ticks since the spawn apply (0xc26bd8 = sim +0x10) */
++    if (el < I32(d, 0x13c) / 50) return;                    /* CustomValue in ms, 50 ms ticks (BlackHole 700 -> 14) */
++    a[0xfc] = 1;
++    int d0 = I32(a, 0xd0), d4 = I32(a, 0xd4), d8 = I32(a, 0xd8);
++    I32(d, 0x118) = 0; ((void (*)(void *))B(0xb29494))(a); I32(d, 0x118) = 8;
++    I32(a, 0xd0) = d0; I32(a, 0xd4) = d4; I32(a, 0xd8) = d8;
++    g_ndelayed++;
++    if (g_superfix_dbg) LOG("[superfix] delayed damage area %p after %d ticks, dmg %d\n", a, el, I32(a, 0xe8));
++}
++
++/* ---- ally / own heal (HealOwnPercent) */
++static long g_nheal, g_nheal_self;
++int superfix_heal_own(void *pdata, uint8_t *p, uint8_t *owner, int slot) {   /* in place of `bl 0xafaa10` at 0xb4de50 */
++    int pct = ((geti_t)B(0xafaa10))(pdata);
++    if (!g_superfix || !mode() || pct <= 0 || !p || slot != 2) return pct;
++    int amount = (int)((long)I32(p, 0xd4) * pct / 100);
++    if (amount < 1) return pct;
++    if (I32(p, 0x10c) == 0) { I32(p, 0x10c) = amount; g_nheal++; }
++    static void *last_owner; static int last_tick = -1;
++    uint8_t *sim = owner ? ((getp_t)B(0xb6a378))(owner) : NULL; int t = sim ? I32(sim, 0x10) : -1;
++    if (owner && (!((geti_t)B(0xafaa08))(pdata) || owner != last_owner || t != last_tick)) {
++        last_owner = owner; last_tick = t;
++        int hp_a = I32(owner, 0x3c4);
++        ((void (*)(void *, int, int, int, void *, int, int, int, long, long))B(0xb41554))(owner, ((geti_t)B(0xb6a754))(p), amount, 1, pdata, I32(p, 0x418), 0, 0, 0, 0);
++        g_nheal_self++;
++        if (g_superfix_dbg) LOG("[superfix] heal own: owner hp %d -> %d (max %d)\n", hp_a, I32(owner, 0x3c4), I32(owner, 0x3c8));
++    }
++    if (g_superfix_dbg) LOG("[superfix] heal own: projectile %p %d %% of %d -> %d, owner %p\n", p, pct, I32(p, 0xd4), amount, owner);
++    return pct;
++}
++/* hook_bl lands here with lr = 0xb4de54: x26 = the projectile just spawned (0xb4dc4c), x19 = owner, [sp+256] = attack slot */
++void superfix_heal_thunk(void);
++__asm__(".text\n.global superfix_heal_thunk\nsuperfix_heal_thunk:\n\tmov x1, x26\n\tmov x2, x19\n\tldr w3, [sp, #256]\n\tb superfix_heal_own\n");
++
++void superfix_install(void) {
++    const char *e = getenv("NB_SUPERFIX"); if (e) g_superfix = atoi(e);
++    if (getenv("NB_SUPERFIX_DBG")) g_superfix_dbg = 1;
++    if (!g_superfix) { LOG("[superfix] disabled\n"); return; }
++    if (*(uint32_t *)B(0xb3970c) == 0xaa1f03e0 && *(uint32_t *)B(0xb39710) == 0xd65f03c0)   /* mov x0, xzr; ret */
++        hook_replace(g_libg, 0xb3970c, (void *)my_spawn_area);
++    else LOG("[superfix] 0xb3970c is not the spawnAreaEffect stub: left as it is\n");
++    if (*(uint32_t *)B(0xb28c0c) == 0xa9be7bfd) hook_enter(g_libg, 0xb28c0c, on_area_tick);   /* stp x29, x30, [sp, #-32]! */
++    if (*(uint32_t *)B(0xb4de4c) == 0xaa1503e0 && (*(uint32_t *)B(0xb4de50) & 0xfc000000) == 0x94000000)   /* mov x0, x21; bl */
++        hook_bl(g_libg, 0xb4de50, (void *)superfix_heal_thunk);
++    LOG("[superfix] installed (spawnAreaEffect, delayed damage, heal own)\n");
++    extern void superfix_items_install(void) __attribute__((weak)); if (superfix_items_install) superfix_items_install();
++    extern void superfix_moves_install(void) __attribute__((weak)); if (superfix_moves_install) superfix_moves_install();
++    extern void superfix_status_install(void) __attribute__((weak)); if (superfix_status_install) superfix_status_install();
++}
++void superfix_status(void) { LOG("[superfix] areas spawned %ld, skipped %ld; delayed damage %ld; heal own %ld projectiles, %ld owners\n",
++                                 g_narea, g_narea_skip, g_ndelayed, g_nheal, g_nheal_self);
++    extern void superfix_items_status(void) __attribute__((weak)); if (superfix_items_status) superfix_items_status();
++    extern void superfix_moves_status(void) __attribute__((weak)); if (superfix_moves_status) superfix_moves_status();
++    extern void superfix_status_status(void) __attribute__((weak)); if (superfix_status_status) superfix_status_status(); }
+diff --git a/native/loader/superfix_items.c b/native/loader/superfix_items.c
+new file mode 100644
+index 0000000..3206e7a
+--- /dev/null
++++ b/native/loader/superfix_items.c
+@@ -0,0 +1,180 @@
++/* superfix_items.c (bsrl-sim issue #6, see superfix.c): areas that items and areas should leave behind but the shipped
++ * client libg never spawns.
++ *
++ * Item TriggerAreaEffect (ItemData +0x60): the item update 0xb6b8e0 (vtable 0x1209240 slot +0x28) runs the trigger: an
++ * enemy within TriggerRangeSubTiles sets +0x90 (triggered) and the fuse +0x9c (Value2 / Value; b6dce0) for the fuse types
++ * of the mask 0x4802020200005040 (b6cf0c: 6 Mine, 12, 14, 25, 33, 41, 59, 62); the fuse counts down 50 ms a tick
++ * (b6cf30) and at 0 only types 9, 0x42 and 3 have client code (b6ded0..): the item is then removed (slot 6 0xb6e4a4)
++ * without its area. +0x60 is read only at b6d020 (type 25's radius): the server's spawn is compiled out. Re-implemented
++ * after the update returns: when the fuse ran out in that update, the area is spawned with the sequence libg's own item
++ * destroy 0xb6e0b0 uses for DestroyAreaEffect (b6e0f8..b6e1e0): create 0xb29360(data, skin 0xc70e4c(item, 0, 0xb6a718(item)))
++ * -> position 0xba7dc8 / 0xb6a61c -> +0x80/+0x84/+0x88 -> owner/kind 0xb29340 -> damage pair +0xe8 = item +0xe0 ->
++ * modifiers 0xb2b2d4(area, item +0x150, 0) -> object manager 0xb63198 -> start 0xb29494. Bo's Mine (Bo_def_ulti2_area).
++ * Piper's bomb 18000035 is left to env.c (sf_bomb_state / sf_explode). ConductorSign (type 53, Chuck) has no trigger in
++ * the client (its update b6bcf0 only counts +0x9c down while +0x2bc, never set here, is 0): its TriggerAreaEffect
++ * ConductorSignArea (Damage) is spawned once, on the sign's first update that runs (the update is skipped while
++ * +0xd4 > now), i.e. when the post lands.
++ *
++ * Area ChainAreaEffect (AreaEffectData +0xe0, getter 0xa97c04): the area expire 0xb28f84 (called from the area tick at
++ * b28d08 when shouldExpire 0xb28d4c says so) only sets +0xf4 and runs the listeners; no reader of 0xa97c04 spawns the
++ * chain. On entry, for an area that reached its end tick (+0xd8), the chain area is spawned at it with the same sequence
++ * (owner +0x108, kind +0xf8, flag +0x2d0, damage pair +0xe8, modifiers +0x168), and the chain's SpawnItem (+0x110) is made
++ * with the item factory 0xb55684 as spawnfix.c's make_item does (spawnfix's on_area only does that for type 5).
++ * Ruffs' RuffsSupplySpawn -> RuffsSupplyExplosion (+ RuffsBuff).
++ *
++ * Otis' super projectile deals no damage to the character it attaches its SilencerHugger to (b74c00): see superfix_hugger.
++ *
++ * NB_SUPERFIX=0 turns this off with the rest of superfix; NB_SUPERFIX_ITEMS=0 only this part. */
++#include "nbhost.h"
++#include <stdlib.h>
++extern Module *g_libg;
++extern int g_superfix, g_superfix_dbg;
++void *hook_replace(Module *m, uint64_t off, void *repl);
++void hook_enter(Module *m, uint64_t off, void (*fn)(uint64_t *ctx));
++#define B(off) ((uint8_t *)g_libg->base + (off))
++#define I32(p, o) (*(int32_t *)((uint8_t *)(p) + (o)))
++#define U8(p, o) (*(uint8_t *)((uint8_t *)(p) + (o)))
++#define U64(p, o) (*(uint64_t *)((uint8_t *)(p) + (o)))
++#define PTR(p, o) (*(void **)((uint8_t *)(p) + (o)))
++static int mode(void) { return I32(g_libg->base, 0x12eefb4) == 3; }   /* battle running (spawnfix.c mode()) */
++typedef void *(*getp_t)(void *);
++typedef int (*geti_t)(void *);
++static void *data_of(void *o) { return ((getp_t)B(0xb6a384))(o); }
++static int now_of(void *o) { uint8_t *sim = ((getp_t)B(0xb6a378))(o); return sim ? I32(sim, 0x10) : -1; }   /* 0xc26bd8 = sim +0x10 */
++
++int g_superfix_items = 1;
++static long g_ntrig, g_nsign, g_nchain, g_nchain_item, g_nchain_early;
++static int busy;   /* our own spawns run 0xb29494 / update code again: no nested spawn */
++#define BOMB_ITEM 18000035                  /* Piper's bomb: env.c sf_bomb_state / sf_explode explode it */
++#define FUSE_TYPES 0x4802020200005040ULL    /* b6cf0c: item types with a trigger fuse */
++
++static long hp_sum(uint8_t *src) {   /* debug: HP of every character (vtable 0x1209020) in src's object manager */
++    uint8_t *mgr = PTR(src, 0x20); void **arr = mgr ? PTR(mgr, 0x28) : NULL; int cnt = mgr ? I32(mgr, 0x34) : 0; long s = 0;
++    for (int i = 0; arr && i < cnt && i < 512; i++) { uint8_t *o = arr[i]; if (o && *(uint8_t **)o == B(0x1209020)) s += I32(o, 0x3c4); }
++    return s;
++}
++static long g_last_hit;   /* debug: HP the last spawned area took at its start */
++/* the item destroy 0xb6e0b0's area spawn (b6e0f8..b6e1e0) with the source object, owner/kind/flag, damage pair and modifiers
++ * as arguments (item: +0xb0, +0xb8, 0, +0xe0, +0x150; area: +0x108, +0xf8, +0x2d0, +0xe8, +0x168) */
++static uint8_t *spawn_area_at(uint8_t *src, void *ad, void *owner, int kind, int flag, uint64_t dmg, void *mods) {
++    if (!src || !ad || !owner || !PTR(src, 0x20)) return NULL;
++    void *skin = ((void *(*)(void *, void *, void *))B(0xc70e4c))(src, NULL, ((getp_t)B(0xb6a718))(src));
++    uint8_t *a = ((uint8_t *(*)(void *, void *))B(0xb29360))(ad, skin);
++    if (!a) return NULL;
++    ((void (*)(void *, void *, int))B(0xba7dc8))(a + 0x48, src + 0x48, 1);
++    ((void (*)(void *, int, int, int))B(0xb6a61c))(a, ((geti_t)B(0xb6a628))(src), ((geti_t)B(0xb6a630))(src), ((geti_t)B(0xb6a638))(src));
++    I32(a, 0x80) = ((geti_t)B(0xb6a754))(src);
++    I32(a, 0x84) = ((geti_t)B(0xb6a820))(src);
++    I32(a, 0x88) = ((geti_t)B(0xb6a884))(src);
++    ((void (*)(void *, void *, int, int))B(0xb29340))(a, owner, kind, flag);
++    U64(a, 0xe8) = dmg;
++    ((void (*)(void *, void *, int))B(0xb2b2d4))(a, mods, 0);
++    ((void (*)(void *, void *))B(0xb63198))(PTR(src, 0x20), a);
++    long h0 = g_superfix_dbg ? hp_sum(src) : 0;
++    ((void (*)(void *))B(0xb29494))(a);
++    g_last_hit = g_superfix_dbg ? h0 - hp_sum(src) : 0;
++    return a;
++}
++
++/* ---- item TriggerAreaEffect */
++typedef void (*upd_t)(void *, void *, void *, void *);
++static upd_t o_item_update;
++static int g_sign_ring[64], g_sign_pos, g_sign_last = -1;
++static int seen(int *ring, int n, int *pos, int id) {
++    for (int i = 0; i < n; i++) if (ring[i] == id) return 1;
++    ring[*pos] = id; *pos = (*pos + 1) % n; return 0;
++}
++static void my_item_update(uint8_t *it, void *x1, void *x2, void *x3) {
++    uint8_t *d = it ? data_of(it) : NULL;
++    int on = g_superfix && g_superfix_items && d && !busy && mode();
++    int fuse = on && U8(it, 0x90) && I32(it, 0x9c) > 0;   /* triggered, fuse still running */
++    o_item_update(it, x1, x2, x3);
++    if (!on) return;
++    int type = I32(d, 0x54), id = I32(d, 0x20); void *trig = PTR(d, 0x60);
++    if (!trig || id == BOMB_ITEM) return;
++    static int ring2[64], pos2;   /* debug: where each trap lies once armed (the audit's target stands still) */
++    if (g_superfix_dbg && type >= 0 && type < 64 && ((FUSE_TYPES >> type) & 1) && I32(it, 0x94) <= 0 && !seen(ring2, 64, &pos2, I32(it, 8))) {
++        uint8_t *mgr = PTR(it, 0x20); void **arr = mgr ? PTR(mgr, 0x28) : NULL; int cnt = mgr ? I32(mgr, 0x34) : 0; long best = -1;
++        for (int i = 0; arr && i < cnt && i < 512; i++) { uint8_t *o = arr[i];
++            if (!o || *(uint8_t **)o != B(0x1209020) || o == PTR(it, 0xb0) || I32(o, 0x3c4) <= 0) continue;
++            long dx = I32(o, 0x38) - I32(it, 0x38), dy = I32(o, 0x3c) - I32(it, 0x3c), d2 = dx * dx + dy * dy; if (best < 0 || d2 < best) best = d2; }
++        LOG("[superfix] trap %d armed at %d,%d tick %d, nearest other character %ld u\n", I32(it, 8), I32(it, 0x38), I32(it, 0x3c),
++            now_of(it), best < 0 ? -1L : (long)__builtin_sqrt((double)best));
++    }
++    int fire = 0;
++    if (type >= 0 && type < 64 && ((FUSE_TYPES >> type) & 1) && fuse && I32(it, 0x9c) <= 0) { fire = 1; g_ntrig++; }
++    if (type == 53) {   /* object ids restart in every battle: the ring is cleared when the tick goes back */
++        int t = now_of(it);
++        if (t < g_sign_last) { for (int i = 0; i < 64; i++) g_sign_ring[i] = 0; }
++        g_sign_last = t;
++        if (I32(it, 0xd4) <= t && !seen(g_sign_ring, 64, &g_sign_pos, I32(it, 8))) { fire = 2; g_nsign++; }
++    }
++    if (!fire) return;
++    busy = 1;
++    uint8_t *a = spawn_area_at(it, trig, PTR(it, 0xb0), I32(it, 0xb8), 0, U64(it, 0xe0), it + 0x150);
++    busy = 0;
++    if (g_superfix_dbg) LOG("[superfix] item %d (data %d type %d) %s -> area %p (type %d) at %d,%d dmg %d/%d tick %d, HP taken %ld\n", I32(it, 8), id,
++                            type, fire == 2 ? "landed" : "fuse out", a, I32(trig, 0x118), I32(it, 0x38), I32(it, 0x3c), I32(it, 0xe0), I32(it, 0xe4), now_of(it), g_last_hit);
++}
++
++/* ---- area ChainAreaEffect */
++typedef long (*mkitem_t)(void *, int, int, int, int, int, int, int, int, int, void *, void *, void *, int);
++static void on_area_expire(uint64_t *c) {
++    uint8_t *a = (uint8_t *)c[0]; uint8_t *d = a ? data_of(a) : NULL;
++    if (!g_superfix || !g_superfix_items || !d || busy || !mode() || U8(a, 0xf4)) return;   /* +0xf4: already expired */
++    uint8_t *chain = ((getp_t)B(0xa97c04))(d);
++    if (!chain) return;
++    if (now_of(a) < I32(a, 0xd8)) { g_nchain_early++; return; }   /* removed before its end tick (owner died, ...): no chain */
++    busy = 1;
++    uint8_t *a2 = spawn_area_at(a, chain, PTR(a, 0x108), I32(a, 0xf8), U8(a, 0x2d0), U64(a, 0xe8), a + 0x168);
++    void *idata = PTR(chain, 0x110); long it = 0;
++    if (a2 && idata && PTR(a, 0x108)) {   /* the chain's SpawnItem, as spawnfix.c make_item */
++        void *owner = PTR(a, 0x108);
++        it = ((mkitem_t)B(0xb55684))(idata, I32(a2, 0x38), I32(a2, 0x3c), 1, 99, I32(a2, 0xe8), I32(a2, 0xec), I32(a2, 0x80), I32(a2, 0x84),
++                                     I32(a2, 0x88), owner, a2, ((getp_t)B(0xb6a378))(owner), I32(a2, 0xf8));
++        if (it) g_nchain_item++;
++    }
++    busy = 0;
++    if (a2) g_nchain++;
++    if (g_superfix_dbg) LOG("[superfix] area %p (data %d type %d) expired at tick %d (end %d) -> chain area %p (type %d) dmg %d at %d,%d item %p, HP taken %ld\n", a,
++                            I32(d, 0x20), I32(d, 0x118), now_of(a), I32(a, 0xd8), a2, I32(chain, 0x118), a2 ? I32(a2, 0xe8) : 0, I32(a, 0x38), I32(a, 0x3c), (void *)it, g_last_hit);
++}
++
++/* ---- Otis (Silencer) super hit: at b74b2c the projectile hit code sees a character hit by a projectile whose SpawnedItem is
++ * type 0x28 (SilencerHugger), makes the hugger with the factory (b74bf4, damage pair = projectile +0xd4/+0xd8) and attaches
++ * it to the character with 0xb6e5b4 (b74c00); the character's HP is never touched on this path (host run: hugger attached
++ * to the target with pair 340/340, target HP unchanged for 100 ticks). The `bl` at b74c00 is redirected: the attach runs,
++ * then the projectile damage goes through the damage root 0xb422d0 with the arguments of the hit code's own call at b7327c
++ * (victim, owner index, damage, 0, 0, owner +0xe0, projectile, 1, +0xfc, +0x100, data, 0, +0x418, 0, 1, 0, 0xb779a0 & 1, 0). */
++static long g_nhug;
++typedef uint64_t (*root_t)(void *, int, int, int, int, void *, void *, int, int, int, void *, int, int, int, int, int, int, int);
++void superfix_hugger(uint8_t *it, uint8_t *ch, uint8_t *pr) {   /* in place of `bl 0xb6e5b4` at 0xb74c00; x2 = x25 = projectile */
++    ((void (*)(void *, void *))B(0xb6e5b4))(it, ch);
++    if (!g_superfix || !g_superfix_items || !mode() || !ch || !pr || busy) return;
++    int dmg = I32(pr, 0xd4), hp0 = I32(ch, 0x3c4);
++    if (dmg <= 0 || hp0 <= 0) return;
++    busy = 1;
++    ((root_t)B(0xb422d0))(ch, ((geti_t)B(0xb6a754))(pr), dmg, 0, 0, PTR(pr, 0xe0), pr, 1, I32(pr, 0xfc), I32(pr, 0x100), data_of(pr), 0,
++                          I32(pr, 0x418), 0, 1, 0, ((geti_t)B(0xb779a0))(pr) & 1, 0);
++    busy = 0;
++    g_nhug++;
++    if (g_superfix_dbg) LOG("[superfix] hugger %d on %d: damage %d, hp %d -> %d tick %d\n", I32(it, 8), I32(ch, 8), dmg, hp0, I32(ch, 0x3c4), now_of(ch));
++}
++void superfix_hugger_thunk(void);
++__asm__(".text\n.global superfix_hugger_thunk\nsuperfix_hugger_thunk:\n\tmov x2, x25\n\tb superfix_hugger\n");
++
++void superfix_items_install(void) {
++    const char *e = getenv("NB_SUPERFIX_ITEMS"); if (e) g_superfix_items = atoi(e);
++    if (!g_superfix_items) { LOG("[superfix] items: disabled\n"); return; }
++    if (*(uint32_t *)B(0xb6b8e0) == 0xd105c3ff) o_item_update = (upd_t)hook_replace(g_libg, 0xb6b8e0, (void *)my_item_update);   /* sub sp, sp, #0x170 */
++    else LOG("[superfix] items: 0xb6b8e0 is not the item update: trigger areas off\n");
++    if (*(uint32_t *)B(0xb28f84) == 0xd101c3ff) hook_enter(g_libg, 0xb28f84, on_area_expire);   /* sub sp, sp, #0x70 */
++    else LOG("[superfix] items: 0xb28f84 is not the area expire: chain areas off\n");
++    void hook_bl(Module *m, uint64_t off, void *fn);
++    if (*(uint32_t *)B(0xb74bfc) == 0xaa0003f4 && *(uint32_t *)B(0xb74c00) == 0x97ffe66d)   /* mov x20, x0; bl 0xb6e5b4 */
++        hook_bl(g_libg, 0xb74c00, (void *)superfix_hugger_thunk);
++    else LOG("[superfix] items: 0xb74c00 is not the hugger attach: Otis' super damage off\n");
++    LOG("[superfix] items installed (item trigger areas, area chains, hugger hit)\n");
++}
++void superfix_items_status(void) { LOG("[superfix] items: trigger areas %ld (fuse) + %ld (sign); chain areas %ld (items %ld, %ld expired early); hugger hits %ld\n",
++                                       g_ntrig, g_nsign, g_nchain, g_nchain_item, g_nchain_early, g_nhug); }
+diff --git a/native/loader/superfix_moves.c b/native/loader/superfix_moves.c
+new file mode 100644
+index 0000000..f8ddb69
+--- /dev/null
++++ b/native/loader/superfix_moves.c
+@@ -0,0 +1,310 @@
++/* superfix_moves (bsrl-sim issue #6): supers that move the brawler or hit around it, whose server half is a bare `ret`
++ * in the shipped client libg. The skill activation 0xb7b268 switches on the skill's BehaviorType (data +0x1a8) and
++ * calls these stubs; the client half (move speed, "airborne" checks, no attacks in the air) is shipped and runs.
++ *
++ * FlyJump (Mico, LeaperUlti, type 19): handler 0xb7ceec calls the jump start 0xb55598(char) (`ret`, one caller 0xb7cf00),
++ * then spawns the skill's AreaEffectObject LeaperUltiArea (Effect, follows the owner, its damage word +0xe8 = the
++ * damage of its ChainAreaEffect, computed by the handler at 0xb7cf54..0xb7cfa0) through spawnAreaEffect 0xb3970c
++ * (superfix.c). While the ulti skill's active counter +8 >= 1 the client treats Mico as airborne (0xb477f4: no fire,
++ * MovementSpeed). Missing: the height and the landing hit. Here: the start hook starts a job; while the skill is active
++ * the character's z (+0x40) follows a ramp up / hold / ramp down; the landing is the indicator area's ChainAreaEffect
++ * (data +0xe0, getter 0xa97c04: LeaperUltiAreaExplosion, Damage + Pushback) spawned at the indicator when it times out:
++ * the area update 0xb28c0c calls expire 0xb28f84 only from 0xb28d08, whose `bl` is redirected here. The chain area gets
++ * the indicator's kind (+248) and is spawned and started with the shipped helper 0xb35c40 (its damage word is then the
++ * chain data's own Damage), so libg's area apply deals the damage and the push. Moves sent while airborne are taken by
++ * the shipped mover (the client only drops them during the 1000 ms CastingTime). The indicator's expired byte +244 is set before expire runs (expire sets it itself as
++ * its first store), so a generic "chain on expire" hook on 0xb28f84 that checks +244 does not spawn it a second time.
++ * Fallback without an indicator (or if it never expires): the chain is spawned at Mico LAND_WAIT ticks after the skill
++ * ended.
++ *
++ * Ww (Carl, WhirlwindUlti, type 8): handler 0xb7d1c8 calls the spin 0xb5a704(char, scaled damage, Damage,
++ * MsBetweenAttacks) (`ret`, one caller 0xb7d204); the client changes the move speed while the skill is active. Missing:
++ * the contact damage. Here (modelled on env.c charge_contact_tick): while the ulti skill is active, each living enemy
++ * character within WW_R of Carl is hit for the scaled damage through the damage root 0xb422d0 (so env's damage model,
++ * power cubes and event records apply), at most once per MsBetweenAttacks per target; the owner's super charge is
++ * kept (a super's hits do not recharge it, as env.c does for the charge contact and the leap bombs).
++ *
++ * Blink (Gigi, DaredevilUlti, type 1): handler 0xb7c198 -> 0xb80110(skill, char) calls the teleport 0xb4ffe0(char, tx,
++ * ty, areaLeave, areaEnter, scaled damage, Damage, ...) (`ret`; 5 callers). Only its two Blink call sites are taken here
++ * (return address 0xb804a8 / 0xb80334; the projectile / component callers 0xb7495c, 0xb75dc0, 0xb9beb0 keep the stub):
++ * the leave area is spawned at the start, the brawler is moved to the target (pulled back along the line to a walkable
++ * tile: ForceValidTile), the enter area is spawned there, and when the enter area does not deal damage itself (an
++ * Effect area: DaredevilUltiNoDamageEnter; the overcharged DaredevilOverchargedUltiDamage is a Damage area and does)
++ * every living enemy character within its radius is hit once for the scaled damage through the damage root. A
++ * BlinkReturn skill (type 23, the swapped-in DaredevilUltiReturn) teleports back to where the last Blink started.
++ *
++ * ChangeCharacter (Bonnie's CannonGirlSmall, Moe's DiggerDrill, Meg's MechaDude ulti, type 11 via 0xb7bb58; also the
++ * end of the CannonGirl / Digger charge): the shipped 0xb4ffec(char, new data) is a stub that kills the old character
++ * and returns NULL; battle_fix.c already replaces it (my_die) so a NULL does not crash the caller. battle_fix calls
++ * superfix_change_character (weak) first: it builds the new character the way the hero spawner 0xc2806c does (factory
++ * 0xb5dd08, add 0xb63198, player / team ids, 0xb59de0 with the player's hero entry, skin 0xc70d2c, components 0xb58068)
++ * but without placement, spawn protection or super reset, at the old character's position and facing; the HP fraction
++ * carries over (the mech, UniqueProperty 2, starts full); the player's hero id +0x10 is pointed at it so the env's
++ * player-to-character lookup and input follow the new form. The stub then retires the old character as before.
++ *
++ * The per-tick work runs from the character tick 0xb3ae74 (enter hook, per character; only characters with a job do
++ * anything). NB_SUPERFIX=0 turns every part off (superfix_install does not call this file's install). */
++#include "nbhost.h"
++#include <math.h>
++#include <stdlib.h>
++extern Module *g_libg;
++extern int g_superfix, g_superfix_dbg;
++void hook_enter(Module *m, uint64_t off, void (*fn)(uint64_t *ctx));
++void hook_bl(Module *m, uint64_t off, void *fn);
++#define B(off) ((uint8_t *)g_libg->base + (off))
++#define I32(p, o) (*(volatile int32_t *)((uint8_t *)(p) + (o)))
++#define U8(p, o) (*(volatile uint8_t *)((uint8_t *)(p) + (o)))
++#define PTR(p, o) (*(void *volatile *)((uint8_t *)(p) + (o)))
++#define VTOF(o) ((int)((uint8_t *)PTR(o, 0) - g_libg->base))
++#define VT_CHAR 0x1209020                     /* character vtable (env.c VT_CHAR) */
++#define RET_INSN 0xd65f03c0
++static int mode(void) { return g_superfix && I32(g_libg->base, 0x12eefb4) == 3; }   /* battle running (spawnfix.c mode()) */
++
++typedef void *(*getp_t)(void *);
++typedef int (*geti_t)(void *);
++static void *sim_of(void *o) { return ((getp_t)B(0xb6a378))(o); }
++static int now_of(void *o) { void *s = sim_of(o); return s ? I32(s, 0x10) : 0; }             /* sim tick (0xc26bd8) */
++static void *ulti_skill(uint8_t *ch) {   /* skill slot 1 = ulti (ctor 0xb34560: +0x458 array, +0x464 count) */
++    void **sk = PTR(ch, 0x458); return sk && I32(ch, 0x464) > 1 ? sk[1] : NULL;
++}
++static uint8_t *skill_data(void *sk) { return sk ? ((uint8_t *(*)(void *, int))B(0xb7adfc))(sk, U8(sk, 49) & 1) : NULL; }   /* +49 = overcharged */
++static int area_radius(uint8_t *ad) { int r = ad ? I32(ad, 0x12c) : 0; return r > 0 && r < 5000 ? r : 0; }   /* AreaEffectData Radius (+300, getter a97bb4; +292 is TimeMs) */
++/* the shipped helper 0xb35c40(owner, data, x, y, extra damage, kind, modifiers): create 0xb2aefc, add 0xb63198, start
++ * 0xb29494; kind 2 = what the skill execute passes (0xb7bebc). The area's damage word is extra + the data's own Damage
++ * (0xb2b0b4), so extra is 0 here, as at every shipped caller. */
++static void *spawn_area(uint8_t *owner, void *data, int x, int y, int dmg, int kind) {
++    if (!owner || !data || !PTR(owner, 0x20)) return NULL;
++    return ((void *(*)(void *, void *, int, int, int, int, void *))B(0xb35c40))(owner, data, x, y, dmg, kind, NULL);
++}
++
++/* damage `v` for `dmg` through the (env-hooked) damage root, the way env.c charge_contact_tick calls it; the owner's
++ * super charge (player +0x54) is restored afterwards */
++typedef uint64_t (*root_t)(void *, int, int, int, int, void *, void *, int, int, int, void *, int, int, int, int, int, int, int);
++static void hit(uint8_t *ch, uint8_t *v, int dmg) {
++    void *sim = sim_of(ch); int owner = I32(ch, 0x80), np = sim ? I32(sim, 0x7c) : 0;
++    uint8_t *pl = sim && owner >= 0 && owner < np && np <= 64 ? ((uint8_t **)PTR(sim, 0x70))[owner] : NULL;
++    int c0 = pl ? I32(pl, 0x54) : 0;
++    ((root_t)B(0xb422d0))(v, owner, dmg, dmg, 0, ch, NULL, 1, I32(ch, 0x38), I32(ch, 0x3c), NULL, 0, 0, 0, 1, 0, 0, 0);
++    if (pl) I32(pl, 0x54) = c0;
++}
++static int enemy(uint8_t *ch, uint8_t *c) {   /* a living enemy character (another owner; env.c's charge contact rule) */
++    return c && c != ch && VTOF(c) == VT_CHAR && I32(c, 0x3c4) > 0 && !(I32(c, 0x80) == I32(ch, 0x80) && I32(ch, 0x80) >= 0);
++}
++static void **objs(void *sim, int *n) { void *h = sim ? PTR(sim, 0) : NULL; *n = h ? I32(h, 0xc) : 0; if (*n < 0 || *n > 4096) *n = 0; return h ? (void **)PTR(h, 0) : NULL; }
++
++/* ======================= FlyJump */
++#define FJ_H 700           /* peak z: the height env.c's leap uses (Piper) */
++#define FJ_RAMP 6          /* ticks up and down (300 ms) */
++#define LAND_WAIT 10       /* ticks after the skill ended without an indicator expiry: land anyway */
++typedef struct { uint8_t *ch; int id, t, seen, done_t, landed; void *ind; } FlyJob;
++static FlyJob g_fj[16]; static int g_nfj;
++static long g_fj_start, g_fj_land, g_fj_fallback;
++static void flyjump_start(uint64_t *ctx) {   /* enter 0xb55598(char) */
++    uint8_t *ch = (uint8_t *)ctx[0]; if (!mode() || !ch) return;
++    void *sk = ulti_skill(ch); uint8_t *sd = skill_data(sk); if (!sd || I32(sd, 0x1a8) != 19) return;
++    int k; for (k = 0; k < g_nfj && g_fj[k].ch != ch; k++) {}
++    if (k == g_nfj) { if (g_nfj >= 16) return; g_nfj++; }
++    g_fj[k] = (FlyJob){ch, I32(ch, 8), 0, 0, 0, 0, PTR(sd, U8(sk, 49) & 1 ? 176 : 160)};   /* AreaEffectObject (OC +176) */
++    g_fj_start++;
++    if (g_superfix_dbg) LOG("[superfix] flyjump start char %d at %d,%d active %d indicator %p chain %p\n", I32(ch, 8),
++                            I32(ch, 0x38), I32(ch, 0x3c), I32(sk, 8), g_fj[k].ind, g_fj[k].ind ? PTR(g_fj[k].ind, 0xe0) : NULL);
++}
++static void flyjump_land(FlyJob *j, uint8_t *at, int kind, const char *how) {
++    void *chain = j->ind ? PTR(j->ind, 0xe0) : NULL;   /* ChainAreaEffect */
++    j->landed = 1; I32(j->ch, 0x40) = 0;
++    if (!chain || I32(j->ch, 0x3c4) <= 0) return;
++    void *a = spawn_area(j->ch, chain, I32(at, 0x38), I32(at, 0x3c), 0, kind);
++    g_fj_land++;
++    if (g_superfix_dbg) LOG("[superfix] flyjump land (%s) char %d at %d,%d: area %p type %d r %d dmg %d kind %d\n", how, j->id,
++                            I32(at, 0x38), I32(at, 0x3c), a, I32(chain, 0x118), area_radius(chain), a ? I32(a, 232) : 0, kind);
++}
++static void flyjump_tick(FlyJob *j) {
++    uint8_t *ch = j->ch; void *sk = ulti_skill(ch); int left = sk ? I32(sk, 8) : 0;
++    if (I32(ch, 0x3c4) <= 0) { I32(ch, 0x40) = 0; j->landed = 2; return; }
++    j->t++;
++    if (left >= 1) j->seen = 1;
++    else if (!j->seen && j->t < 40) return;              /* the active counter may be set after the start hook */
++    if (left >= 1 && !j->done_t) {
++        int up = j->t < FJ_RAMP ? j->t : FJ_RAMP, down = left < FJ_RAMP ? left : FJ_RAMP;
++        I32(ch, 0x40) = FJ_H * (up < down ? up : down) / FJ_RAMP;
++        return;
++    }
++    I32(ch, 0x40) = 0;
++    if (!j->done_t) j->done_t = j->t;
++    if (!j->landed && j->t - j->done_t >= LAND_WAIT) {   /* no indicator expiry seen: land at the brawler */
++        g_fj_fallback++; flyjump_land(j, ch, 2, "fallback");
++    }
++}
++/* in place of `bl 0xb28f84` (area expire) at 0xb28d08 */
++static void on_area_expire(uint8_t *a) {
++    if (mode() && a && !U8(a, 244)) {
++        uint8_t *own = PTR(a, 280);   /* the character the area follows */
++        for (int i = 0; i < g_nfj; i++) {
++            FlyJob *j = &g_fj[i];
++            if (j->landed || own != j->ch || !j->ind || ((getp_t)B(0xb6a384))(a) != j->ind) continue;
++            if (now_of(a) < I32(a, 216)) continue;           /* a natural timeout only (+216 = end tick) */
++            U8(a, 244) = 1;                                  /* expire's own first store, done early (see the header) */
++            flyjump_land(j, a, I32(a, 248), "indicator");
++        }
++    }
++    ((void (*)(void *))B(0xb28f84))(a);
++}
++
++/* ======================= Ww */
++#define WW_R 300           /* contact radius: not in the tables; ~ Carl's spin ring (env.c's charge contact uses 250) */
++typedef struct { uint8_t *ch; int id, dmg, every, n; int hid[24], ht[24]; } WwJob;
++static WwJob g_ww[16]; static int g_nww;
++static long g_ww_start, g_ww_hits;
++static void ww_start(uint64_t *ctx) {   /* enter 0xb5a704(char, scaled damage, Damage, MsBetweenAttacks) */
++    uint8_t *ch = (uint8_t *)ctx[0]; if (!mode() || !ch) return;
++    int ms = (int)ctx[3], k;
++    for (k = 0; k < g_nww && g_ww[k].ch != ch; k++) {}
++    if (k == g_nww) { if (g_nww >= 16) return; g_nww++; }
++    g_ww[k] = (WwJob){ch, I32(ch, 8), (int)ctx[1], ms / 50 > 0 ? ms / 50 : 1, 0, {0}, {0}};   /* 50 ms per tick */
++    g_ww_start++;
++    if (g_superfix_dbg) LOG("[superfix] ww start char %d dmg %d (Damage %d) every %d ms\n", I32(ch, 8), (int)ctx[1], (int)ctx[2], ms);
++}
++static int ww_tick(WwJob *j) {   /* 0 = job over */
++    uint8_t *ch = j->ch; void *sk = ulti_skill(ch); uint8_t *sd = skill_data(sk);
++    if (I32(ch, 0x3c4) <= 0 || !sd || I32(sd, 0x1a8) != 8 || I32(sk, 8) < 1) return 0;
++    void *sim = sim_of(ch); int now = sim ? I32(sim, 0x10) : 0, n, x = I32(ch, 0x38), y = I32(ch, 0x3c);
++    void **v = objs(sim, &n);
++    for (int i = 0; i < n; i++) {
++        uint8_t *c = v[i]; if (!enemy(ch, c)) continue;
++        long dx = I32(c, 0x38) - x, dy = I32(c, 0x3c) - y; if (dx * dx + dy * dy > (long)WW_R * WW_R) continue;
++        int cid = I32(c, 8), h; for (h = 0; h < j->n && j->hid[h] != cid; h++) {}
++        if (h < j->n && now - j->ht[h] < j->every) continue;
++        if (h == j->n) { if (j->n >= 24) continue; j->n++; j->hid[h] = cid; }
++        j->ht[h] = now;
++        int hp0 = I32(c, 0x3c4); hit(ch, c, j->dmg); g_ww_hits++;
++        if (g_superfix_dbg) LOG("[superfix] ww hit char %d -> %d: hp %d -> %d\n", j->id, cid, hp0, I32(c, 0x3c4));
++        v = objs(sim, &n);   /* the root may add objects */
++    }
++    return 1;
++}
++
++/* ======================= Blink */
++static int tile_blocks_move(int id) {   /* tiles.csv BlocksMovement rows (env.c SF_BLOCK) */
++    static const int rows[] = {1,2,3,4,6,9,10,11,12,13,14,15,16,18,20,21,39,40,41,42,43,44,45,46,53,54,55,56,57,58,59,60,61,62,63,65,66,69,70,71,72,73};
++    for (unsigned i = 0; i < sizeof rows / sizeof *rows; i++) if (id == 27000000 + rows[i]) return 1;
++    return 0;
++}
++static int walkable(void *sim, int x, int y) {   /* env.c walkable(): 300-unit tiles of the sim's map (+0x68) */
++    void *m = PTR(sim, 0x68); if (!m) return 1;
++    int W = I32(m, 0xc4), Hh = I32(m, 0xc8), tx = (int)floor(x / 300.0), ty = (int)floor(y / 300.0);
++    if (tx < 0 || ty < 0 || tx >= W || ty >= Hh) return 0;
++    void *t = ((void **)PTR(m, 0x20))[tx + W * ty]; if (!t) return 1;
++    void *d = PTR(t, 8); return !d || !tile_blocks_move(I32(d, 0x20));
++}
++static void stop_mover(void *ch) {   /* env.c sf_stop: not charging, can stop, moving -> stop 0xb4103c */
++    if (!U8(ch, 0x490) && (((geti_t)B(0xb50ac8))(ch) & 1) && (((geti_t)B(0xb393f0))(ch) & 1)) ((void (*)(void *))B(0xb4103c))(ch);
++}
++typedef struct { uint8_t *ch; int x, y; } BlinkHome;
++static BlinkHome g_home[16]; static int g_nhome;
++static long g_blink, g_blink_back, g_blink_hits;
++static void blink_start(uint64_t *ctx) {   /* enter 0xb4ffe0(char, tx, ty, areaLeave, areaEnter, scaled damage, Damage, ...) */
++    uint64_t lr = ctx[9] - (uint64_t)g_libg->base;
++    if (!mode() || (lr != 0xb804a8 && lr != 0xb80334)) return;   /* the two calls in the Blink handler 0xb80110 */
++    uint8_t *ch = (uint8_t *)ctx[0]; void *sim = ch ? sim_of(ch) : NULL; if (!sim || I32(ch, 0x3c4) <= 0) return;
++    uint8_t *sd = skill_data(ulti_skill(ch)); int type = sd ? I32(sd, 0x1a8) : -1;
++    int tx = (int)ctx[1], ty = (int)ctx[2], dmg = (int)ctx[5], x0 = I32(ch, 0x38), y0 = I32(ch, 0x3c), k;
++    uint8_t *aLeave = (uint8_t *)ctx[3], *aEnter = (uint8_t *)ctx[4];
++    for (k = 0; k < g_nhome && g_home[k].ch != ch; k++) {}
++    if (type == 23) {                                        /* BlinkReturn: back to the remembered start */
++        if (k == g_nhome) return;
++        tx = g_home[k].x; ty = g_home[k].y; g_blink_back++;
++    } else {
++        if (k == g_nhome) { if (g_nhome >= 16) return; g_nhome++; }
++        g_home[k] = (BlinkHome){ch, x0, y0};
++    }
++    double L = hypot(tx - x0, ty - y0), back = 0; int lx = tx, ly = ty;   /* ForceValidTile: back along the line */
++    while (!walkable(sim, lx, ly) && back < L) {
++        back += 50; double f = (L - back) / (L > 1 ? L : 1); if (f < 0) f = 0;
++        lx = (int)floor(x0 + (tx - x0) * f + 0.5); ly = (int)floor(y0 + (ty - y0) * f + 0.5);
++    }
++    if (aLeave) spawn_area(ch, aLeave, x0, y0, 0, 2);
++    stop_mover(ch);
++    ((void (*)(void *, int, int, int))B(0xb6a61c))(ch, lx, ly, 0);
++    if (aEnter) spawn_area(ch, aEnter, lx, ly, 0, 2);
++    int r = area_radius(aEnter), hits = 0;
++    if (type != 23 && dmg > 0 && r > 0 && (!aEnter || I32(aEnter, 0x118) != 0)) {   /* the enter area does not hit (not Damage) */
++        int n; void **v = objs(sim, &n);
++        for (int i = 0; i < n; i++) {
++            uint8_t *c = v[i]; if (!enemy(ch, c)) continue;
++            long dx = I32(c, 0x38) - lx, dy = I32(c, 0x3c) - ly; if (dx * dx + dy * dy > (long)r * r) continue;
++            hit(ch, c, dmg); hits++; v = objs(sim, &n);
++        }
++    }
++    g_blink++; g_blink_hits += hits;
++    if (g_superfix_dbg) LOG("[superfix] blink type %d char %d %d,%d -> %d,%d (asked %d,%d) leave %p enter %p r %d type %d dmg %d hits %d\n",
++                            type, I32(ch, 8), x0, y0, lx, ly, tx, ty, aLeave, aEnter, r, aEnter ? I32(aEnter, 0x118) : -1, dmg, hits);
++}
++
++/* ======================= ChangeCharacter: the new character for battle_fix.c's hook on 0xb4ffec */
++static long g_change, g_change_skip;
++uint64_t superfix_change_character(uint8_t *old, uint8_t *nd) {   /* the new character, or 0 (battle_fix keeps the old) */
++    if (!mode() || !old || !nd || VTOF(old) != VT_CHAR || !PTR(old, 0x20)) { g_change_skip++; return 0; }
++    uint8_t *pl = ((uint8_t *(*)(void *))B(0xb6a718))(old), *sim = sim_of(old);
++    void *cfg = pl ? ((getp_t)B(0xc41460))(pl) : NULL;               /* the player's hero entry (spawner's x3) */
++    if (!pl || !sim || !cfg) { g_change_skip++; return 0; }
++    uint8_t *nc = ((uint8_t *(*)(void *))B(0xb5dd08))(nd);          /* factory: alloc 0xf18 + character ctor */
++    if (!nc) { g_change_skip++; return 0; }
++    U8(nc, 3741) = U8(old, 3741);
++    ((void (*)(void *, void *))B(0xb63198))(PTR(old, 0x20), nc);   /* add to the object manager (spawner order) */
++    I32(nc, 128) = I32(old, 128); I32(nc, 132) = I32(old, 132); I32(nc, 136) = I32(old, 136);   /* player, team, ... */
++    U8(nc, 1129) = U8(old, 1129);
++    ((void (*)(void *, void *, int))B(0xb59de0))(nc, cfg, 0);       /* level, HP, skills, cards */
++    I32(nc, 1260) = I32(sim, 0x10);
++    ((void (*)(void *))B(0xb5a638))(nc);
++    void *sc = PTR(pl, 472);                                         /* skin as the spawner's caller picks it (0xc27940) */
++    if (!sc) { void **hs = PTR(pl, 48); int hi = I32(pl, 64); sc = hs && hi >= 0 && hs[hi] ? PTR(hs[hi], 32) : NULL; }
++    PTR(nc, 24) = sc ? ((void *(*)(void *, void *, int))B(0xc70d2c))(sc, nd, 0) : PTR(old, 24);
++    I32(nc, 1824) = I32(old, 1824);
++    /* no placement 0xc2ca08, spawn protection or super reset (spawn-only): the new form stands where the old one was */
++    ((void (*)(void *, int, int, int))B(0xb6a61c))(nc, I32(old, 0x38), I32(old, 0x3c), 0);
++    I32(nc, 800) = I32(old, 800);                                    /* facing */
++    ((void (*)(void *))B(0xb58068))(nc);                             /* the data's Components (Brawler_MechaDude) */
++    int hp = I32(old, 0x3c4), mhp = I32(old, 0x3c8), up = ((geti_t)B(0xab3d04))(nd);
++    if (up != 2 && hp > 0 && mhp > 0) {   /* the HP fraction carries over; the mech (UniqueProperty 2) and a form after a death start full */
++        long v = (long)I32(nc, 0x3c8) * hp / mhp; I32(nc, 0x3c4) = v < 1 ? 1 : (int)v;
++    }
++    I32(pl, 0x10) = I32(nc, 8);   /* the player's hero id (env player_char_id, the input path); +0x1e4 is the possession link
++                                     (Willow): a character whose possession timer +3284 is 0 clears it at once (0xb40f30) */
++    g_change++;
++    if (g_superfix_dbg) LOG("[superfix] change character %d (data %p hp %d/%d) -> %d (data %p hp %d/%d) at %d,%d\n", I32(old, 8),
++                            PTR(old, 0x10), hp, mhp, I32(nc, 8), nd, I32(nc, 0x3c4), I32(nc, 0x3c8), I32(nc, 0x38), I32(nc, 0x3c));
++    return (uint64_t)nc;
++}
++
++/* ======================= per character tick (enter 0xb3ae74) */
++static void on_char_tick(uint64_t *ctx) {
++    uint8_t *ch = (uint8_t *)ctx[0];
++    if (!ch || !mode() || (!g_nfj && !g_nww)) return;
++    for (int i = 0; i < g_nfj; i++) if (g_fj[i].ch == ch) {
++        if (I32(ch, 8) != g_fj[i].id) { g_fj[i--] = g_fj[--g_nfj]; continue; }   /* object reused */
++        flyjump_tick(&g_fj[i]);
++        if (g_fj[i].landed) g_fj[i--] = g_fj[--g_nfj];
++    }
++    for (int i = 0; i < g_nww; i++) if (g_ww[i].ch == ch)
++        if (I32(ch, 8) != g_ww[i].id || !ww_tick(&g_ww[i])) g_ww[i--] = g_ww[--g_nww];
++}
++
++void superfix_moves_install(void) {
++    int n = 0;
++    if (*(uint32_t *)B(0xb3ae74) != 0xa9ba7bfd) { LOG("[superfix] moves: 0xb3ae74 is not the character tick: left out\n"); return; }   /* stp x29, x30, [sp, #-96]! */
++    hook_enter(g_libg, 0xb3ae74, on_char_tick);
++    if (*(uint32_t *)B(0xb55598) == RET_INSN && *(uint32_t *)B(0xb7cf00) == 0x97ff61a6 &&   /* bl 0xb55598 */
++        *(uint32_t *)B(0xb28d08) == 0x9400009f) {                                            /* bl 0xb28f84 */
++        hook_enter(g_libg, 0xb55598, flyjump_start); hook_bl(g_libg, 0xb28d08, (void *)on_area_expire); n |= 1;
++    } else LOG("[superfix] moves: FlyJump sites differ: left out\n");
++    if (*(uint32_t *)B(0xb5a704) == RET_INSN && *(uint32_t *)B(0xb5a708) == RET_INSN) { hook_enter(g_libg, 0xb5a704, ww_start); n |= 2; }
++    else LOG("[superfix] moves: 0xb5a704 is not the Ww stub: left out\n");
++    if (*(uint32_t *)B(0xb4ffe0) == RET_INSN) { hook_enter(g_libg, 0xb4ffe0, blink_start); n |= 4; }
++    else LOG("[superfix] moves: 0xb4ffe0 is not the teleport stub: left out\n");
++    LOG("[superfix] moves installed:%s%s%s%s\n", n & 1 ? " flyjump" : "", n & 2 ? " ww" : "", n & 4 ? " blink" : "", " change");
++}
++void superfix_moves_status(void) {
++    LOG("[superfix] moves: flyjump %ld starts, %ld landings (%ld fallback); ww %ld starts, %ld hits; blink %ld (%ld back), %ld hits; "
++        "change character %ld (%ld left to battle_fix)\n", g_fj_start, g_fj_land, g_fj_fallback, g_ww_start, g_ww_hits, g_blink,
++        g_blink_back, g_blink_hits, g_change, g_change_skip);
++}
+diff --git a/native/loader/superfix_status.c b/native/loader/superfix_status.c
+new file mode 100644
+index 0000000..215bee3
+--- /dev/null
++++ b/native/loader/superfix_status.c
+@@ -0,0 +1,271 @@
++/* superfix_status.c (bsrl-sim issue #6, see superfix.c): status effects. The shipped client libg compiles the character's
++ * status-effect manager (char +0x890) out: add 0xba3230(cont, ch, data, w3 source player, w4 team, x5 source object,
++ * x6 source character, w7 kind, ...) is `mov x0, xzr; ret` (40 callers: the skill's ActivationSelfStatusEffects 0xb8061c via
++ * 0xb807ac, the wrapper 0xb35dd0(ch, data, ...) = 0xba3230(ch+0x890, ch, data, ...), the area enemy status 0xb2a71c, the
++ * MountUp tick 0xba0048, ...), the removes 0xba3260(cont, data, -2) / 0xba3264(cont, data, source) are bare `ret`, and
++ * nothing writes the aggregates the character code reads. So no status effect ever existed in a battle here.
++ *
++ * Store: a host-side list of instances (character, data, source, start / end tick, next trigger). The add still returns
++ * NULL, the stub's own result (every caller tests it and then skips its own bookkeeping on the instance, e.g. 0xb807b0),
++ * so libg's instance list (char +0x918) stays empty and nothing libg-side points at our records.
++ * Per character and tick (enter hook on the character update 0xb3941c = VT_CHAR slot +0x28, before libg's own update):
++ *   expiry (DurationTicks +0x98, until = add tick + duration; a non-Stacking re-add (+0xac) refreshes the end tick),
++ *   Damage +0xb8 / Healing +0xf0 every TriggerRate +0xa0 ticks (TriggerOnFirstTick +0xab: also at the add; TriggerRate 0:
++ *   once) through the damage root 0xb422d0 (env.c's hook on it applies the env's damage model and events, as for its own
++ *   calls) and the heal 0xb41554(ch, source player, amount, 1, NULL, 0, 0, 0, 0, 0) (the argument pattern of 0xb43ae8),
++ *   then the aggregates: char +0x954 = max ShieldPercent +0xf4 (the damage root 0xb422d0 reads it at 0xb428fc:
++ *   pct = max(skill shield, +0x954), damage * (100 - pct) / 100), char +0x97c = max Invisibility +0x12c (0 none ..
++ *   3 full; libg's reader 0xb3931c and the char update). Pulsating effects (+0xb0 on / +0xb4 off ticks) count only in
++ *   their on phases. Nothing else in this libg writes those two words.
++ * Not modelled (no client reader found): speed (SpeedBoostPercent +0xf8 / Absolute +0xfc / reduces +0x100 / +0x104: the
++ *   move start 0xb4790c times a path with the CharacterData speed 0xab31e0 only), damage boosts (+0x108, +0x114: the damage
++ *   percent 0xb4b660 reads char +0x968 / +0x970, whose status mapping is not proven), stuns, silences, boolean attributes
++ *   (Kaze's HasStormVision), CancelOn* conditions. Those statuses are stored (so their duration and target are right)
++ *   but change nothing. 0xba3274 (called at stop / charge end / respawn) and the other manager stubs are left alone.
++ *
++ * StatusEffect areas (AreaEffectData +0x118 == 36: Max, Jae-Yong, Najia's jars, Kaze's storm, slows ...): the area apply
++ * 0xb29494 returns before its status code for type 36 (its type gate) and libg reads StatusEffectSelf +0x88 / Ally +0x90
++ * nowhere. From the area tick (superfix.c's enter hook on 0xb28c0c calls superfix_status_area): at the area's first tick
++ * (or after StatusEffectTickInterval +0xa0 ticks with DelayFirstTick +0x17c) and then every TickInterval ticks (0: once),
++ * every live character within 0xb2b298(data, ch) (libg's own range: radius + the character's radius - 50) of the area gets
++ * Self (the area's owner +0x108), Ally (same team, 0xb6a820) or Enemy +0x98 through 0xb35dd0 with the arguments of the
++ * area enemy call 0xb2a71c (source player 0xb6a754(area), team 0xb6a820(area), area, owner, kind +0xf8, 0, -1, -1, 0).
++ * AffectOnlyHeroes +0x1b4 keeps brawlers only (0xb34de4); IgnoreCharacters +0x1b6 areas (projectile slows) are skipped.
++ * MountUp (Draco): the component's tick 0xba0048 is never called in this libg; it is run from the character tick (below).
++ * NB_SUPERFIX=0 turns this off with the rest, NB_SUPERFIX_STATUS=0 this part alone; NB_SUPERFIX_DBG=1 logs adds, area hits, triggers and brawler HP drops. */
++#include "nbhost.h"
++#include <stdlib.h>
++#include <string.h>
++extern Module *g_libg;
++extern int g_superfix, g_superfix_dbg;
++void *hook_replace(Module *m, uint64_t off, void *repl);
++void hook_enter(Module *m, uint64_t off, void (*fn)(uint64_t *ctx));
++#define B(off) ((uint8_t *)g_libg->base + (off))
++#define I32(p, o) (*(int32_t *)((uint8_t *)(p) + (o)))
++#define U8(p, o) (*(uint8_t *)((uint8_t *)(p) + (o)))
++#define PTR(p, o) (*(void **)((uint8_t *)(p) + (o)))
++static int mode(void) { return I32(g_libg->base, 0x12eefb4) == 3; }   /* battle running (spawnfix.c mode()) */
++typedef void *(*getp_t)(void *);
++typedef int (*geti_t)(void *);
++
++/* StatusEffectData fields (loader 0xba3814) */
++enum { SE_DUR = 0x98, SE_RATE = 0xa0, SE_SRCDEATH = 0xa8, SE_FIRST = 0xab, SE_STACK = 0xac, SE_REFRESH = 0xad,
++       SE_PON = 0xb0, SE_POFF = 0xb4, SE_DMG = 0xb8, SE_HEAL = 0xf0, SE_SHIELD = 0xf4, SE_INVIS = 0x12c };
++/* character aggregates (manager +0xc4 / +0xec) */
++enum { CH_SHIELD = 0x954, CH_INVIS = 0x97c };
++#define VT_CHAR 0x1209020
++
++typedef struct {
++    uint8_t *ch; int ch_id; void *data, *src_obj, *src_ch; int src_id, src_player, start, until, next;
++} St;
++#define ST_MAX 512            /* 10 brawlers + summons x a few effects; Draco re-adds a 2-tick status every tick */
++static St g_st[ST_MAX]; static int g_nst;
++static long g_nmount, g_nadd, g_nrefresh, g_nfull, g_nexpire, g_nremove, g_ndmg, g_nheal, g_narea_hits, g_narea_apply;
++
++static int now_tick(void *obj) { uint8_t *sim = ((getp_t)B(0xb6a378))(obj); return sim ? I32(sim, 0x10) : -1; }
++static int data_id(void *d) { return d ? I32(d, 0x20) : -1; }            /* LogicData global id (table * 1e6 + row) */
++static int is_char(void *o) { return o && (int)((uint8_t *)PTR(o, 0) - g_libg->base) == VT_CHAR; }
++static void **objects(uint8_t *ch, int *n) {                            /* the object manager's list (spawnfix.c) */
++    uint8_t *mgr = ch ? PTR(ch, 0x20) : NULL; *n = 0;
++    if (!mgr) return NULL;
++    int c = I32(mgr, 0x34); if (c < 0 || c > 4096) return NULL;
++    *n = c; return PTR(mgr, 0x28);
++}
++static uint8_t *by_id(uint8_t *any, int id) {
++    int n; void **v = objects(any, &n);
++    for (int i = 0; v && i < n; i++) if (v[i] && I32(v[i], 8) == id) return v[i];
++    return NULL;
++}
++
++/* 0xba3230 */
++static void *my_status_add(void *cont, uint8_t *ch, void *data, int src_player, int team, void *src_obj, uint8_t *src_ch) {
++    (void)cont; (void)team;
++    if (!g_superfix || !mode() || !ch || !data) return NULL;
++    int dur = I32(data, SE_DUR), t = now_tick(ch);
++    if (dur <= 0 || t < 0) return NULL;
++    if (!U8(data, SE_STACK))
++        for (int i = 0; i < g_nst; i++) if (g_st[i].ch == ch && g_st[i].ch_id == I32(ch, 8) && g_st[i].data == data) {
++            if (U8(data, SE_REFRESH) || g_st[i].until < t + dur) g_st[i].until = t + dur;   /* refresh: a new full duration */
++            g_nrefresh++; return NULL;
++        }
++    if (g_nst >= ST_MAX) { g_nfull++; return NULL; }
++    int rate = I32(data, SE_RATE);
++    St *s = &g_st[g_nst++];
++    *s = (St){ch, I32(ch, 8), data, src_obj, src_ch, src_ch ? I32(src_ch, 8) : -1, src_player, t, t + dur,
++              U8(data, SE_FIRST) || rate <= 0 ? t : t + rate};
++    g_nadd++;
++    if (g_superfix_dbg) LOG("[superfix] st: add %d to ch %d (hp %d) from ch %d player %d: %d ticks, tick %d, shield %d dmg %d heal %d invis %d, live %d\n",
++                            data_id(data), I32(ch, 8), I32(ch, 0x3c4), s->src_id, src_player, dur, t, I32(data, SE_SHIELD),
++                            I32(data, SE_DMG), I32(data, SE_HEAL), I32(data, SE_INVIS), g_nst);
++    return NULL;
++}
++/* 0xba3264(cont, data, source) / 0xba3260(cont, data, -2 = any source) */
++static void my_status_remove(void *cont, void *data, void *src) {
++    if (!g_superfix || !cont) return;
++    uint8_t *ch = (uint8_t *)cont - 0x890;
++    for (int i = g_nst - 1; i >= 0; i--) {
++        St *s = &g_st[i];
++        if (s->ch != ch || s->data != data) continue;
++        if ((int32_t)(intptr_t)src != -2 && src && src != s->src_ch && src != s->src_obj) continue;
++        g_st[i] = g_st[--g_nst]; g_nremove++;
++    }
++}
++
++static int pulse_on(const St *s, int t) {
++    int on = I32(s->data, SE_PON), off = I32(s->data, SE_POFF);
++    return on <= 0 || off <= 0 || (t - s->start) % (on + off) < on;
++}
++static void trigger(St *s, int t) {
++    uint8_t *ch = s->ch, *src = s->src_id >= 0 ? by_id(ch, s->src_id) : NULL;
++    int dmg = I32(s->data, SE_DMG), heal = I32(s->data, SE_HEAL), hp0 = I32(ch, 0x3c4);
++    if (dmg > 0) {   /* the argument pattern of env.c's own root calls (charge contact, leap bombs) */
++        ((uint64_t (*)(void *, int, int, int, int, void *, void *, int, int, int, void *, int, int, int, int, int, int, int))B(0xb422d0))(
++            ch, s->src_player, dmg, dmg, 0, src, NULL, 1, I32(ch, 0x38), I32(ch, 0x3c), NULL, 0, 0, 0, 1, 0, 0, 0);
++        g_ndmg++;
++    }
++    if (heal > 0 && I32(ch, 0x3c4) > 0) {
++        ((void (*)(void *, int, int, int, void *, int, int, int, long, long))B(0xb41554))(ch, s->src_player, heal, 1, NULL, 0, 0, 0, 0, 0);
++        g_nheal++;
++    }
++    if (g_superfix_dbg && (dmg > 0 || heal > 0))
++        LOG("[superfix] st: trigger %d on ch %d tick %d (+%d): dmg %d heal %d, hp %d -> %d\n", data_id(s->data), I32(ch, 8), t, t - s->start,
++            dmg, heal, hp0, I32(ch, 0x3c4));
++}
++
++/* enter hook on the character update 0xb3941c: ctx[0] = character */
++static int g_last_tick = -1;
++static void on_char_update(uint64_t *ctx) {
++    uint8_t *ch = (uint8_t *)ctx[0];
++    if (!g_superfix || !mode() || !is_char(ch)) return;
++    int t = now_tick(ch); if (t < 0) return;
++    if (t != g_last_tick) {   /* once per tick: drop the records of characters that left the object list */
++        g_last_tick = t;
++        int n; void **v = objects(ch, &n);
++        for (int i = g_nst - 1; i >= 0 && v; i--) {
++            int alive = 0;
++            for (int k = 0; k < n && !alive; k++) alive = v[k] == g_st[i].ch && I32(v[k], 8) == g_st[i].ch_id;
++            if (!alive) { g_st[i] = g_st[--g_nst]; g_nexpire++; }
++        }
++    }
++    {   /* MountUp (Draco): libg never runs this component's tick (vtable +0x40 = 0xba0048; its mount ticks +0x38 stayed at
++         * CustomValue 200 for 100 ticks after the mount in a host run, so a mounted Draco stayed mounted): run it once per
++         * tick while mounted. It counts +0x38 down, adds the component data's +0xb8 / +0xc8 statuses (DragonRiderUltiSpeed:
++         * shield 20, 2 ticks) through 0xb35dd0 each tick and dismounts at 0 (weapon swap 0xb35c3c, still a stub). */
++        int nc = I32(ch, 0xa6c); void **c = PTR(ch, 0xa60);
++        for (int i = 0; c && i < nc && i < 64; i++)
++            if (c[i] && I32(c[i], 0x10) == 21 && I32(c[i], 0x38) > 0 && PTR(c[i], 8) == ch &&
++                (*(void ***)c[i])[0x40 / 8] == (void *)B(0xba0048)) { ((void (*)(void *))B(0xba0048))(c[i]); g_nmount++; }
++    }
++    int shield = 0, invis = 0, any = 0;
++    for (int i = 0; i < g_nst; i++) {
++        St *s = &g_st[i];
++        if (s->ch != ch || s->ch_id != I32(ch, 8)) continue;
++        int rate = I32(s->data, SE_RATE), dur = s->until - s->start;
++        /* last trigger: e < duration with TriggerOnFirstTick, e <= duration without (both give duration / rate triggers) */
++        int last = U8(s->data, SE_FIRST) ? s->until - 1 : s->until;
++        while (s->next <= t && s->next <= last && I32(ch, 0x3c4) > 0) {
++            trigger(s, t);
++            s->next = rate > 0 ? s->next + rate : 0x7fffffff;
++            if (rate > 0 && dur / rate > 64) break;   /* belt and braces for long effects added long ago */
++        }
++        if (t >= s->until || (U8(s->data, SE_SRCDEATH) && s->src_id >= 0 && !by_id(ch, s->src_id))) {
++            if (g_superfix_dbg) LOG("[superfix] st: end %d on ch %d tick %d (%d ticks)\n", data_id(s->data), I32(ch, 8), t, t - s->start);
++            g_st[i--] = g_st[--g_nst]; g_nexpire++; continue;
++        }
++        any = 1;
++        if (!pulse_on(s, t)) continue;
++        int sp = I32(s->data, SE_SHIELD), iv = I32(s->data, SE_INVIS);
++        if (sp > shield) shield = sp;
++        if (iv > invis) invis = iv;
++    }
++    (void)any;
++    I32(ch, CH_SHIELD) = shield;   /* nothing in this libg writes these two: ours */
++    I32(ch, CH_INVIS) = invis;
++    if (g_superfix_dbg) {   /* MountUp (component type 21, char +0xa60 / count +0xa6c): its mount ticks +0x38 (0xb50be8) */
++        int nc = I32(ch, 0xa6c); void **c = PTR(ch, 0xa60);
++        for (int i = 0; c && i < nc && i < 64; i++) if (c[i] && I32(c[i], 0x10) == 21) {
++            static void *last_c; static int last_v = -1;
++            if (c[i] != last_c || I32(c[i], 0x38) != last_v) {
++                if (I32(c[i], 0x38) == 0 || last_v <= 0 || I32(c[i], 0x38) % 10 == 0)
++                    LOG("[superfix] st: mount ch %d ticks %d tick %d\n", I32(ch, 8), I32(c[i], 0x38), t);
++                last_c = c[i]; last_v = I32(c[i], 0x38);
++            }
++        }
++    }
++    if (g_superfix_dbg && ((geti_t)B(0xb34de4))(ch) & 1) {   /* brawlers: HP drops, with the shield in force */
++        static struct { int id, hp, tick; } hp[64]; static int nhp;
++        int id = I32(ch, 8), h = I32(ch, 0x3c4), k;
++        for (k = 0; k < nhp && hp[k].id != id; k++) {}
++        if (k == nhp) { if (nhp == 64) return; hp[nhp++] = (typeof(hp[0])){id, h, t}; return; }
++        if (h < hp[k].hp) LOG("[superfix] st: hp ch %d %d -> %d (-%d) tick %d shield %d invis %d\n", id, hp[k].hp, h, hp[k].hp - h, t, shield, invis);
++        hp[k].hp = h; hp[k].tick = t;
++    }
++}
++
++/* StatusEffect (type 36) areas, from superfix.c's area tick hook (0xb28c0c) */
++typedef struct { void *a, *d; int start, end, next; } AreaRec;
++#define AR_MAX 128
++static AreaRec g_ar[AR_MAX]; static int g_nar;
++typedef void (*apply_t)(void *, void *, int, int, void *, void *, int, int, int, int, int);   /* 0xb35dd0 */
++void superfix_status_area(uint8_t *a) {
++    if (!g_superfix || !mode() || !a) return;
++    uint8_t *d = ((getp_t)B(0xb6a384))(a);
++    if (!d || I32(d, 0x118) != 36) return;
++    void *self = PTR(d, 0x88), *ally = PTR(d, 0x90), *enemy = PTR(d, 0x98);
++    uint8_t *owner = PTR(a, 0x108);
++    if ((!self && !ally && !enemy) || U8(d, 0x1b6) || !owner) return;   /* IgnoreCharacters: it slows projectiles */
++    int t = now_tick(a), interval = I32(d, 0xa0), k;
++    for (k = 0; k < g_nar && !(g_ar[k].a == a && g_ar[k].d == d && g_ar[k].start == I32(a, 0xd0)); k++) {}
++    if (k == g_nar) {   /* first tick of this area: forget the areas whose end tick (+0xd8, start +0xd0) has passed */
++        for (int i = g_nar - 1; i >= 0; i--) if (g_ar[i].end < t) g_ar[i] = g_ar[--g_nar];
++        if (g_nar >= AR_MAX) { g_nar = 0; LOG("[superfix] status: area records full, reset\n"); }
++        k = g_nar++;
++        g_ar[k] = (AreaRec){a, d, I32(a, 0xd0), I32(a, 0xd8), U8(d, 0x17c) && interval > 0 ? t + interval : t};
++    }
++    if (t < g_ar[k].next) return;
++    g_ar[k].next = interval > 0 ? t + interval : 0x7fffffff;
++    int n; void **v = objects(owner, &n); if (!v) return;
++    int team = ((geti_t)B(0xb6a820))(a), player = ((geti_t)B(0xb6a754))(a), ax = I32(a, 0x38), ay = I32(a, 0x3c);
++    int heroes = U8(d, 0x1b4), hits = 0;
++    g_narea_apply++;
++    for (int i = 0; i < n; i++) {
++        uint8_t *o = v[i];
++        if (!is_char(o) || I32(o, 0x3c4) <= 0) continue;
++        if (heroes && !(((geti_t)B(0xb34de4))(o) & 1)) continue;
++        long dx = I32(o, 0x38) - ax, dy = I32(o, 0x3c) - ay, r = ((int (*)(void *, void *))B(0xb2b298))(d, o);
++        if (dx * dx + dy * dy > r * r) continue;
++        void *st = o == owner ? self : ((geti_t)B(0xb6a820))(o) == team ? ally : enemy;
++        if (!st) continue;
++        if (g_superfix_dbg) LOG("[superfix] st: area %d (owner ch %d) tick %d: %s %d -> ch %d at %ld u\n", data_id(d), I32(owner, 8), t,
++                                st == enemy ? "enemy" : o == owner ? "self" : "ally", data_id(st), I32(o, 8), (long)__builtin_sqrt((double)(dx * dx + dy * dy)));
++        ((apply_t)B(0xb35dd0))(o, st, player, team, a, owner, I32(a, 0xf8), 0, -1, -1, 0);
++        hits++; g_narea_hits++;
++        v = objects(owner, &n); if (!v) break;   /* a trigger cannot run here (deferred to the char tick), but stay safe */
++    }
++}
++
++static void on_mount_trigger(uint64_t *ctx) {   /* dbg: 0xba0244(component, skillData), the MountUp "skill triggered" handler */
++    uint8_t *comp = (uint8_t *)ctx[0], *sd = (uint8_t *)ctx[1]; uint8_t *ch = comp ? PTR(comp, 8) : NULL;
++    LOG("[superfix] st: mount handler ch %d skill type %d bt %d mounted %d\n", ch ? I32(ch, 8) : -1, sd ? I32(sd, 0x1ac) : -1,
++        sd ? I32(sd, 0x1a8) : -1, comp ? I32(comp, 0x38) : -1);
++}
++void superfix_status_install(void) {
++    const char *e = getenv("NB_SUPERFIX_STATUS");
++    if (e && !atoi(e)) { LOG("[superfix] status effects off (NB_SUPERFIX_STATUS=0)\n"); return; }
++    if (*(uint32_t *)B(0xba3230) != 0xaa1f03e0 || *(uint32_t *)B(0xba3234) != 0xd65f03c0 ||   /* mov x0, xzr; ret */
++        *(uint32_t *)B(0xba3260) != 0xd65f03c0 || *(uint32_t *)B(0xba3264) != 0xd65f03c0 ||   /* ret; ret */
++        *(uint32_t *)B(0xb3941c) != 0xa9bd7bfd) {                                              /* stp x29, x30, [sp, #-48]! */
++        LOG("[superfix] status: libg bytes differ from v68.279, status effects left out\n"); return;
++    }
++    hook_replace(g_libg, 0xba3230, (void *)my_status_add);
++    hook_replace(g_libg, 0xba3260, (void *)my_status_remove);
++    hook_replace(g_libg, 0xba3264, (void *)my_status_remove);
++    hook_enter(g_libg, 0xb3941c, on_char_update);
++    if (g_superfix_dbg && *(uint32_t *)B(0xba0244) == 0xa9bd7bfd) hook_enter(g_libg, 0xba0244, on_mount_trigger);
++    LOG("[superfix] status effects installed (store, shield / invisibility aggregates, damage / heal triggers, type-36 areas)\n");
++}
++void superfix_status_status(void) {
++    LOG("[superfix] status: added %ld, refreshed %ld, full %ld, ended %ld, removed %ld, live %d; damage %ld, heal %ld; "
++        "type-36 area applies %ld, characters hit %ld; MountUp ticks %ld\n", g_nadd, g_nrefresh, g_nfull, g_nexpire, g_nremove, g_nst, g_ndmg, g_nheal,
++        g_narea_apply, g_narea_hits, g_nmount);
++}
