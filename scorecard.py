@@ -3,7 +3,7 @@
     python scorecard.py RUN [--last 3000]     # RUN = $SIM_WORK/runs/<run> (or a path); CPU only, reads files
     -> one summary line on stdout, details in RUN/scorecard.json
 
-From episodes.jsonl (every finished training agent) + eval_episodes.jsonl (the policy's eval rows), grouped by battle kind (eval / evalb / evalp:<preset> / train),
+From episodes.jsonl (every finished training agent) + eval_episodes.jsonl (the policy's eval rows), grouped by battle kind (eval / evalb / evalp:<preset> / evalp_plan / train),
 team size and brawler:
   place      own placement; in teams the team's (best member rank among that battle's rows)
   win, top   share placing 1st / in the top half of the teams
@@ -15,6 +15,8 @@ team size and brawler:
 Presets (eval kind evalp, train --eval-presets): per preset the metrics above, the paired difference to balanced on
   the same seeds (mean, SE) and a pass rule per style (PASS_RULES; every preset: place within 0.5 of balanced); a rule
   whose metric is undefined there (mate metrics in solo evals) is listed as n/a, not failed.
+Intents (rows with env_v5 "intents"): per group the follow rate (achieved / started) per intent kind and the planner's
+  rule census {rule: [picked, started, preempted]} (eval kind evalp_plan = player 0 on the rule planner, --eval-plan).
 Slider slopes (training rows, sampled weights): OLS of each per-episode metric on the slider weights -> slope and SE per
   (slider, metric); "own" = each slider's own term per minute (s_<slider>): t < 2 = the slider changes nothing.
 From replays/*.json (one learner battle per update, true positions):
@@ -65,7 +67,20 @@ def ep_stats(rows):
 
 def kind_of(r):
     t = r.get("tag") or {}; k = t.get("kind", "")
-    return "evalp:%s" % t.get("preset") if k == "evalp" else k if k in ("eval", "evalb") else "train"
+    return "evalp:%s" % t.get("preset") if k == "evalp" else k if k in ("eval", "evalb", "evalp_plan") else "train"
+
+
+def intent_report(rows):
+    """{group: {"follow": {kind: achieved / started}, "n": {kind: [started, achieved, timeout, invalid]}, "rules": {rule:
+    [picked, started, preempted]}}} per battle group (kind_of) of the rows with env_v5 "intents" (intents on)"""
+    out = {}
+    for r in rows:
+        if "intents" not in r: continue
+        g = out.setdefault(kind_of(r), {"n": {}, "rules": {}})
+        for k, v in r["intents"].items(): g["n"][k] = [x + y for x, y in zip(g["n"].get(k, [0] * 4), v)]
+        for k, v in (r.get("plan_rules") or {}).items(): g["rules"][k] = [x + y for x, y in zip(g["rules"].get(k, [0] * 3), v)]
+    for g in out.values(): g["follow"] = {k: round(v[1] / v[0], 3) for k, v in g["n"].items() if v[0]}
+    return out
 
 
 STEP_S = 0.1   # env step (2 ticks)
@@ -194,7 +209,7 @@ def scorecard(run, last=3000, stats_of=None):
         c = json.load(open(fn)); a, b, r_ = replay_stats(c["frames"], c["chr"], c.get("groups") or [0] * 10, stats_of)
         li += a; la += b; rg += r_
     out["replays"] = {**summarize_leads(li, la), "range": round(float(np.median(rg)), 3) if rg else None}
-    out["presets"] = preset_report(rows); out["slopes"] = slider_slopes(rows)
+    out["presets"] = preset_report(rows); out["slopes"] = slider_slopes(rows); out["intents"] = intent_report(rows)
     return out
 
 
@@ -237,6 +252,10 @@ def _check():
     sl = slider_slopes(tr)
     assert abs(sl["hidden"]["bush_camp"][0] - 0.05) < 0.005 and abs(sl["hidden"]["push"][0]) < 0.005, sl["hidden"]
     assert sl["own_t"]["bush_camp"] > 10 and kind_of(ev[0]) == "evalp:balanced" and ep_stats(ev[:20])["hidden"] == 0.1
+    ir = intent_report([{"tag": {"kind": "evalp_plan"}, "intents": {"farm": [4, 3, 1, 0]}, "plan_rules": {"farm": [5, 4, 1]}},
+                        {"tag": {"kind": "evalp_plan"}, "intents": {"farm": [2, 0, 0, 2], "gas": [1, 1, 0, 0]}},
+                        {"tag": {"kind": "k1"}, "intents": {}}, {"tag": {"kind": "eval"}}])
+    assert ir["evalp_plan"]["follow"] == {"farm": 0.5, "gas": 1.0} and ir["evalp_plan"]["rules"] == {"farm": [5, 4, 1]} and set(ir) == {"evalp_plan", "train"}, ir
     print("scorecard ok")
 
 
@@ -258,4 +277,5 @@ if __name__ == "__main__":
             print("presets: " + ", ".join("%s %s (place %s%s%s)" % (p, "PASS" if v.get("pass") else "-" if "pass" not in v else "FAIL", v.get("place"),
                                                                  "; " + "; ".join(v["why"]) if v.get("why") else "",
                                                                  "; n/a " + ", ".join(v["n/a"]) if v.get("n/a") else "") for p, v in sc["presets"].items()))
+        for g, v in sc["intents"].items(): print("intents %s: follow %s%s" % (g, v["follow"], "; planner rules %s" % v["rules"] if v["rules"] else ""))
         if sc["slopes"].get("own_t"): print("slider own-term t (< 2 = no effect):", sc["slopes"]["own_t"])

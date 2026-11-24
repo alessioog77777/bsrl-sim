@@ -45,12 +45,17 @@
   scenario_episodes.jsonl, every episode's replay in replays/scn/ (viz: failures first).
 * Intents (--intent-scale S > 0 switches them on; default 0 = off: the intent block of s is all zeros, no intent reward):
   env_v5.Env.intents after the observation build gives the block (obs_v5 v5.5: s = cat[self, cond, intent]); per agent
-  and battle --p-steer of the agents are steered, the rest free (always none); a steered agent's planner tick picks a
-  random valid intent with --p-rand-intent, else none (the rule planner's share comes with step E). Reward += S x
-  intent.step_reward (terms "i_rew" = rew_int, which the live value excludes). BC battles (native AI) and evals
-  (tag "intent": "none", scenario battles too) play free. progress.jsonl (only with S > 0): t_i_rew (mean per episode),
-  intents {kind: [started, achieved, timeout, invalid]} and intent_follow (achieved / started) over the recent episodes;
-  replay frames carry "i" (the active intent: kind, target dx / dy, radius, time left).
+  and battle --p-steer of the agents are steered, the rest free (always none); a steered agent's planner tick takes the
+  rule planner's pick (planner.py, which may be none) with --p-plan (default 0 = no planner: the step-D behaviour;
+  design 0.5), a random valid intent with --p-rand-intent, else none; a held planner intent may be preempted by the
+  planner (gas / higher rule with a target change > 2 tiles), a random one never. Reward += S x intent.step_reward
+  (terms "i_rew" = rew_int, which the live value excludes). BC battles (native AI) and evals (tag "intent": "none",
+  scenario battles too) play free; --eval-plan 1 adds kind "evalp_plan" (the eval seeds vs 9 native, player 0 on the
+  planner at every tick) -> pl_rank / pl_ci95 / pl_win / pl_top3 / pl_follow / pl_rules in evals.jsonl next to the
+  free-play eval of the same seeds. progress.jsonl (only with S > 0): t_i_rew (mean per episode), intents {kind:
+  [started, achieved, timeout, invalid]}, intent_follow (achieved / started) and with the planner plan_rules {rule:
+  [picked, started, preempted]} over the recent episodes; replay frames carry "i" (the active intent: kind, target dx /
+  dy, radius, time left, "y" its reason) or "iy" (the planner's reason for none).
 shortcut: no exploiters (a second learner trained only to beat this one); add them if b_rank flattens again with PFSP.
 """
 import argparse, glob, json, os, shutil, signal, sys, time
@@ -118,16 +123,18 @@ def id_name(x):
 
 def intent_frame(o, b):
     """replay frame "i" of row b when it has an active intent (o["intent"] = env_v5.Env.intents' block): kind, target
-    dx, dy (10-tile units, as the policy sees it), radius / 10 tiles, time left 1 -> 0"""
-    x = o.get("intent")
-    if x is None or not x[b, :O.I_XY].any(): return {}
-    return {"i": {"k": O.INTENTS[1 + int(x[b, :O.I_XY].argmax())], "t": [round(float(x[b, O.I_XY]), 3), round(float(x[b, O.I_XY + 1]), 3)],
-                  "r": round(float(x[b, O.I_RAD]), 3), "l": round(float(x[b, O.I_LEFT]), 2)}}
+    dx, dy (10-tile units, as the policy sees it), radius / 10 tiles, time left 1 -> 0, + "y" = its reason (o["i_why"] =
+    env_v5.Env.last_why: the planner's text or "random"); without one, "iy" = the planner's reason for none, if any"""
+    x = o.get("intent"); why = o.get("i_why"); why = why[b] if why is not None and b < len(why) else None
+    if x is None or not x[b, :O.I_XY].any(): return {"iy": why} if why else {}
+    out = {"k": O.INTENTS[1 + int(x[b, :O.I_XY].argmax())], "t": [round(float(x[b, O.I_XY]), 3), round(float(x[b, O.I_XY + 1]), 3)],
+           "r": round(float(x[b, O.I_RAD]), 3), "l": round(float(x[b, O.I_LEFT]), 2)}
+    return {"i": {**out, "y": why} if why else out}
 
 
 def policy_s(env, ids, o):
     """the policy's vector input s = cat[self, cond, intent] of a poll (+ o["intent"] = the block, for the replay)"""
-    c = env.cond(ids); o["intent"] = env.intents(ids, o, c)
+    c = env.cond(ids); o["intent"] = env.intents(ids, o, c); o["i_why"] = getattr(env, "last_why", None)   # reasons: replay frames
     return np.concatenate([o["self"], c, o["intent"]], 1)
 
 
@@ -189,10 +196,12 @@ def chunks(traj, L):
 
 def eval_items(a):
     """the battles of one eval: (seed, kind, preset) for eval / evalb, then per --eval-presets name (balanced first, the
-    paired reference) the same seeds as kind "evalp" vs 9 native"""
+    paired reference) the same seeds as kind "evalp" vs 9 native, then with --eval-plan the eval seeds as kind
+    "evalp_plan" (player 0 on the rule planner: eval_intent)"""
     pre = [p for p in a.eval_presets.split(",") if p]; pre = (["balanced"] + [p for p in pre if p != "balanced"]) if pre else []
     return ([(sd, "eval", None) for sd in range(1, a.eval_episodes + 1)] + [(sd, "evalb", None) for sd in range(1, a.evalb_episodes + 1)]
-            + [(sd, "evalp", p) for p in pre for sd in range(1, a.eval_episodes + 1)])
+            + [(sd, "evalp", p) for p in pre for sd in range(1, a.eval_episodes + 1)]
+            + [(sd, "evalp_plan", None) for sd in range(1, a.eval_episodes + 1) if getattr(a, "eval_plan", 0)])
 
 
 def scenario_flags(ap):
@@ -231,6 +240,22 @@ def eval_tag(a, preset):
     return {"sliders": [float(v) for v in O.preset_vec(p)], "preset": p}
 
 
+def eval_intent(kind):
+    """the eval battles' tag "intent": evalp_plan -> "plan" (env_v5: the planner at every tick), every other -> "none"
+    (free play)"""
+    return "plan" if kind == "evalp_plan" else "none"
+
+
+def eval_plan(rows):
+    """{"pl_<k>": ...} of an eval's evalp_plan rows (player 0, one per seed): eval_summary's episodes / rank / ci95 / win /
+    top3 (compare with the same seeds' free-play "eval" numbers) + pl_follow = achieved / started intents; {} without"""
+    rs = list({r["seed"]: r for r in rows if r["tag"]["kind"] == "evalp_plan" and r["player"] == 0}.values())
+    if not rs: return {}
+    st = intent_stats(rs)
+    return {**{"pl_" + k: v for k, v in eval_summary(rs).items() if k in ("episodes", "rank", "ci95", "win", "top3")},
+            "pl_follow": st["intent_follow"], "pl_rules": st.get("plan_rules", {})}
+
+
 def eval_presets(rows):
     """{"p_<preset>": eval_summary} of an eval's evalp rows (player 0, one per seed)"""
     out = {}
@@ -252,17 +277,24 @@ def intent_flags(ap):
     ap.add_argument("--intent-scale", type=float, default=0.0, help="weight of the intent reward; > 0 switches intents on (start 0.25)")
     ap.add_argument("--p-steer", type=float, default=0.7, help="with intents on: share of agents per battle that get intents (the rest play free)")
     ap.add_argument("--p-rand-intent", type=float, default=0.3, help="with intents on: chance per planner tick of a random valid intent (else none)")
+    ap.add_argument("--p-plan", type=float, default=0.0, help="with intents on: chance per planner tick of the rule planner's pick (planner.py; design 0.5; 0 = off)")
+    ap.add_argument("--eval-plan", type=int, default=0, help="1 = evals also play the eval seeds with player 0 on the rule planner (kind evalp_plan; needs --intent-scale > 0)")
 
 
 def set_intents(a):
-    """the intent flags -> env_v5.Env (class attributes: train_fast's workers inherit them)"""
-    E.Env.intent_scale, E.Env.p_steer, E.Env.p_rand_intent = a.intent_scale, a.p_steer, a.p_rand_intent
+    """the intent flags -> env_v5.Env (class attributes: train_fast's workers inherit them); the rule planner exists only
+    with --p-plan > 0 or --eval-plan (else Env.planner None: the step-D behaviour)"""
+    if (a.p_plan > 0 or a.eval_plan) and not a.intent_scale: raise SystemExit("--p-plan / --eval-plan need --intent-scale > 0")
+    E.Env.intent_scale, E.Env.p_steer, E.Env.p_rand_intent, E.Env.p_plan = a.intent_scale, a.p_steer, a.p_rand_intent, a.p_plan
     E.Env.intent_jitter = O.NOISE["jitter"] if a.noise else (0.0, 0.0)
+    if a.p_plan > 0 or a.eval_plan:
+        import planner as PL
+        E.Env.planner = PL.RulePlanner(noisy=bool(a.noise))   # clean obs: no false detections to confirm
 
 
 def intent_stats(rows):
     """progress.jsonl intent fields of episode rows (env_v5 "intents" / terms "i_rew"): mean i_rew, summed counts per
-    kind, achieved / started"""
+    kind, achieved / started; + plan_rules {rule: [picked, started, preempted]} summed when rows have them (--p-plan)"""
     rows = [r for r in rows if "intents" in r]
     cnt = {k: [0, 0, 0, 0] for k in O.INTENTS[1:]}
     for r in rows:
@@ -270,7 +302,17 @@ def intent_stats(rows):
     st = sum(v[0] for v in cnt.values())
     return {"t_i_rew": round(float(np.mean([r["terms"].get("i_rew", 0.0) for r in rows])), 4) if rows else None,
             "intents": {k: v for k, v in cnt.items() if v[0]}, "intent_follow": round(sum(v[1] for v in cnt.values()) / st, 3) if st else None,
-            "steered": round(float(np.mean([r.get("intent_mode") == "steered" for r in rows])), 3) if rows else None}
+            "steered": round(float(np.mean([r.get("intent_mode") == "steered" for r in rows])), 3) if rows else None,
+            **({"plan_rules": pr} if (pr := _plan_rules(rows)) else {})}
+
+
+def _plan_rules(rows):
+    """episode rows' "plan_rules" summed: {rule: [picked, started, preempted]} in planner.RULES order"""
+    tot = {}
+    for r in rows:
+        for k, v in (r.get("plan_rules") or {}).items(): tot[k] = [x + y for x, y in zip(tot.get(k, [0, 0, 0]), v)]
+    import planner as PL
+    return {k: tot[k] for k in PL.RULES if k in tot}
 
 
 TR_X = ("i_rew",)   # transition terms the buffer keeps besides rew / done (train_fast's workers send these)
@@ -506,6 +548,21 @@ def _check():
     st = intent_stats([{"intents": {"farm": [2, 1, 1, 0]}, "terms": {"i_rew": 0.02}, "intent_mode": "steered"},
                        {"intents": {}, "terms": {"i_rew": 0.0}, "intent_mode": "free"}, {"terms": {}}])
     assert st == {"t_i_rew": 0.01, "intents": {"farm": [2, 1, 1, 0]}, "intent_follow": 0.5, "steered": 0.5}, st
+    o["i_why"] = ["no plan fits: free play", "cube 3 tiles S: picking up"]   # step E: reasons (env_v5.Env.last_why)
+    assert intent_frame(o, 0) == {"iy": "no plan fits: free play"} and intent_frame(o, 1)["i"]["y"] == "cube 3 tiles S: picking up"
+    o["i_why"] = None; assert intent_frame(o, 0) == {} and "y" not in intent_frame(o, 1)["i"]
+    pr = [{"intents": {"farm": [1, 1, 0, 0]}, "terms": {"i_rew": 0.01}, "plan_rules": {"farm": [2, 1, 0], "none": [3, 0, 0]}},
+          {"intents": {"move_to": [1, 0, 0, 0]}, "terms": {"i_rew": 0.0}, "plan_rules": {"gas": [1, 1, 1], "farm": [1, 0, 0]}}]
+    assert intent_stats(pr)["plan_rules"] == {"gas": [1, 1, 1], "farm": [3, 1, 0], "none": [3, 0, 0]}   # planner.RULES order
+    tm = {"dealt": 1.0, "taken": 1.0, "kills": 0, "cubes": 0, "hits": 1, "shots": 2}
+    ev = [dict(r, seed=k + 1, player=0, rank=3 + k, win=0, ticks=100, truncated=False, terms={**tm, **r["terms"]}, tag={"kind": "evalp_plan"})
+          for k, r in enumerate(pr)]
+    ep = eval_plan(ev + [dict(ev[0], tag={"kind": "eval"})])
+    assert ep["pl_episodes"] == 2 and ep["pl_rank"] == 3.5 and ep["pl_follow"] == 0.5 and ep["pl_rules"]["farm"] == [3, 1, 0], ep
+    assert eval_plan(ev[:0]) == {} and eval_intent("evalp_plan") == "plan" and eval_intent("eval") == "none"
+    A = argparse.Namespace(eval_presets="", eval_episodes=2, evalb_episodes=1, eval_plan=1)
+    assert [k for _, k, _ in eval_items(A)] == ["eval", "eval", "evalb", "evalp_plan", "evalp_plan"]
+    assert "evalp_plan" not in [k for _, k, _ in eval_items(argparse.Namespace(**{**vars(A), "eval_plan": 0}))]
     print("train_ppo helpers ok")
 
 
@@ -579,7 +636,7 @@ def main():
             sd, kd, pre = eval_queue.pop(0); b = kd == "evalb"
             if kd == "evalscn": return SC.battle_cfg(pre)
             return {**cfg, "seed": sd, "ctl": list(range(10)) if b else [0], "end": "player0",
-                    "tag": {**tag, "kind": kd, "opp": list(range(1, 10)) if b else [], "intent": "none", **eval_tag(a, pre)}}   # evals: free play
+                    "tag": {**tag, "kind": kd, "opp": list(range(1, 10)) if b else [], "intent": eval_intent(kd), **eval_tag(a, pre)}}   # free play (evalp_plan: planner)
         sd = int(rng_b.integers(10_000_000, 2 ** 31 - 1))
         if bc():
             return {**cfg, "seed": sd, "ctl": list(range(10)), "native_ctl": True, "tag": {**tag, "kind": "bc"}}
@@ -624,7 +681,7 @@ def main():
         sm = {"update": ev["update"], "agent_steps": ev["steps"], "minutes": round((time.time() - t0) / 60, 1),
               "eval_s": round(time.time() - ev["t0"], 1), **eval_summary(by("eval")),
               **{"b_" + k: v for k, v in eval_summary(by("evalb")).items() if k in ("episodes", "rank", "ci95", "win", "top3")},
-              **eval_presets(env.episodes[ev["n0"]:])}
+              **eval_presets(env.episodes[ev["n0"]:]), **eval_plan(env.episodes[ev["n0"]:])}
         evf.write(json.dumps(sm) + "\n"); evf.flush(); print("[eval]", json.dumps(sm), flush=True); evepf.flush()
         if scf: scenario_eval(env.episodes[ev["n0"]:], ev, sm["minutes"], scf, scef)
         ev.update(active=False, t_last=time.time())

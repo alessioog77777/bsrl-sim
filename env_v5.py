@@ -18,12 +18,16 @@ taken per step `te` in every transition's terms.
 Intents (intent.py, behaviour design 4; on iff Env.intent_scale > 0 = trainer --intent-scale): `Env.intents(ids, o,
 cond)` after the observation build gives the (B, N_INT) block of s (all zeros when off). Per agent and battle: free
 (always none) or steered (p_steer); a steered agent's planner tick (every INTENT_EVERY decisions, staggered by player
-index, and the decision right after an achieved end) with no active intent picks a random valid intent with
-p_rand_intent, the planner's (step E: Env.planner, p_plan; 0 until then) or none. Battles tagged "intent": "none"
-(evals, scenarios) and native-AI battles (BC) stay none. The world target is kept per agent; reward and ends are
-computed in _finish_step on the true positions: reward += intent_scale x intent.step_reward, transition term "i_rew"
-(the scaled part; the trainers' rew_int), episode rows "intents" {kind: [started, achieved, timeout, invalid]},
-"intent_mode" free | steered and terms "i_rew".
+index, and the decision right after an achieved end) with no active intent takes the rule planner's pick with p_plan
+(Env.planner = planner.RulePlanner, trainer --p-plan; its "none" = free play), a random valid intent with p_rand_intent,
+else none; at a tick with a held planner intent the planner may preempt it (planner.preempts; random intents never).
+Battles tagged "intent": "plan" (evalp_plan) ask the planner at every tick; any other "intent" tag (evals, scenarios:
+"none") and native-AI battles (BC) stay none. The world target is kept per agent; reward and ends are computed in
+_finish_step on the true positions: reward += intent_scale x intent.step_reward, transition term "i_rew" (the scaled
+part; the trainers' rew_int), episode rows "intents" {kind: [started, achieved, timeout, invalid]} (a preempted intent
+has no end), "plan_rules" {rule: [picked, started, preempted]} (planner agents), "intent_mode" free | steered and terms
+"i_rew". `Env.last_why` = per row of the last intents() call the reason of the active intent ("random" or the planner's)
+or of the planner's none (replay frames).
 Identity (obs v5.6): every poll sets `Env.last_who` = who(ids, vec), the owner player / brawler / side of each fair
 observation row, read from the host's snap2 dump of that response (F_STATE; no host change) and matched to the rows by
 position; obs_v5.ObsV5.build(..., who=env.last_who) turns it into the identity columns (with the identity noise).
@@ -322,7 +326,7 @@ class Env(MAEnv):
     # intents (module doc; intent.py): off at intent_scale 0 (block all zeros, no reward, no random draws)
     intent_scale = 0.0             # train --intent-scale (start 0.25)
     p_steer, p_rand_intent = 0.7, 0.3   # train --p-steer, --p-rand-intent (design 4.4)
-    p_plan, planner = 0.0, None    # step E: the rule planner's share at a tick and the planner (None: no planner yet)
+    p_plan, planner = 0.0, None    # train --p-plan: the rule planner's share at a tick; planner.RulePlanner (None = off)
     intent_jitter = O.NOISE["jitter"]   # per-episode sigma range of the target offset noise (10-tile units; trainer --noise 0: none)
     INTENT_EVERY = 10              # decisions between planner ticks (1 s at ticks 2)
 
@@ -517,6 +521,7 @@ class Env(MAEnv):
             if st is not None:
                 row["ret"] += st["sum"]; row["terms"]["i_rew"] = round(st["sum"], 4); row["intent_mode"] = "steered" if st["steer"] else "free"
                 row["intents"] = {k: list(v) for k, v in st["cnt"].items() if v[0]}
+                if st.get("rules"): row["plan_rules"] = {k: list(v) for k, v in st["rules"].items()}
             if getattr(s, "scn", None) is not None and p == 0 and (row["tag"] or {}).get("scn"):   # the scenario's agent
                 row["scn"] = {"name": s.scn["name"], "item": s.scn["item"], "battle": s.scn["battle"], "pre": s.scn["pre"], **SC().score(s.scn)}
 
@@ -524,12 +529,15 @@ class Env(MAEnv):
     def intents(self, ids, o=None, cond=None):
         """(B, N_INT) intent blocks of the agents of the last poll() (intent.encode; all zeros when intents are off).
         Runs the planner ticks: a steered agent with no active intent picks one at its tick (decision n with
-        (n + player) % INTENT_EVERY == 0, or the decision after an achieved end; not while respawning). The offset is the
-        target's true world point (an anchored player: where it is now) minus the true own position, plus the episode's
-        detector jitter. o / cond (this poll's observation / conditioning rows) are for the planner (step E)."""
+        (n + player) % INTENT_EVERY == 0, or the decision after an achieved end; not while respawning); at a tick with a
+        held planner intent the planner may preempt it (planner.preempts: gas rule / higher rule or same rule with the
+        target > 2 tiles away; random intents never). The offset is the target's true world point (an anchored player:
+        where it is now) minus the true own position, plus the episode's detector jitter. o / cond = this poll's
+        observation / conditioning rows (what the planner reads). Sets last_why: per row the active intent's reason, or
+        the planner's reason for none at its last tick (None: no reason; replay frames)."""
         ids = np.asarray(ids, np.int64); B = len(ids)
-        if not self.intent_scale or not B: return np.zeros((B, O.N_INT), np.float32)
-        by = {s.battle: s for s in self.I}; rg = self._ir(); ws = {}
+        if not self.intent_scale or not B: self.last_why = None; return np.zeros((B, O.N_INT), np.float32)
+        by = {s.battle: s for s in self.I}; rg = self._ir(); ws = {}; why = [None] * B
         kind, dx, dy, rad, lf = np.zeros(B, np.int64), np.zeros(B), np.zeros(B), np.zeros(B), np.zeros(B)
         for b, a in enumerate(ids):
             s, p = by[int(a) >> 4], int(a) & 15
@@ -543,21 +551,28 @@ class Env(MAEnv):
                     w = ws[s.battle] = w or self._world(s)
                     c = self._choose(s, p, b, w, o, cond)
                     if c is not None: self._intent_start(s, p, st, c, w)
+            elif tick and self.planner is not None and st["act"].get("rule") and int(a) not in self.dead_aids:
+                w = ws[s.battle] = w or self._world(s); self._preempt(s, p, st, b, w, o, cond)
             it = st["act"]
-            if it is None: continue
+            if it is None: why[b] = st.get("why"); continue
+            why[b] = it["reason"]
             w = ws[s.battle] = w or self._world(s)
             tx, ty = (w["x"][it["q"]], w["y"][it["q"]]) if it["q"] >= 0 else it["pt"]
             nz = rg.normal(0.0, st["jit"], 2) * 10.0 if st["jit"] > 0 else np.zeros(2)   # 10-tile units -> tiles
             kind[b] = I.K[it["kind"]]; dx[b] = (tx - w["x"][p]) / 300.0 + nz[0]; dy[b] = (ty - w["y"][p]) / 300.0 + nz[1]
             rad[b] = it["r"]; lf[b] = I.left(it)
+        self.last_why = why
         return I.encode(kind, dx, dy, rad, lf)
 
     def _intent_agent(self, s, p):
-        """per agent and battle: free (always none) or steered (p_steer); tag "intent" set (evals / scenarios: "none") or a
+        """per agent and battle: free (always none) or steered (p_steer); tag "intent" "plan" (evalp_plan battles): steered
+        with every tick the planner's (needs Env.planner); any other tag "intent" (evals / scenarios: "none") or a
         native-AI battle (BC): free"""
-        rg = self._ir(); fixed = (s.cfg.get("tag") or {}).get("intent") is not None or bool(s.cfg.get("native_ctl"))
-        st = s.it[p] = {"steer": (not fixed) and rg.random() < self.p_steer, "n": 0, "act": None, "replan": False,
+        rg = self._ir(); mode = (s.cfg.get("tag") or {}).get("intent"); fixed = mode is not None or bool(s.cfg.get("native_ctl"))
+        plan = mode == "plan" and self.planner is not None and not s.cfg.get("native_ctl")
+        st = s.it[p] = {"steer": plan or ((not fixed) and rg.random() < self.p_steer), "n": 0, "act": None, "replan": False,
                         "jit": float(rg.uniform(*self.intent_jitter)), "cnt": {k: [0, 0, 0, 0] for k in I.SPEC}, "sum": 0.0}
+        if plan: st["plan_only"] = True
         return st
 
     def _world(self, s, r=None):
@@ -588,18 +603,41 @@ class Env(MAEnv):
 
     def _choose(self, s, p, b, w, o, cond):
         """a steered agent's planner tick with no active intent -> an intent.new candidate or None (none for this second).
-        One draw u: u < p_plan -> the planner (step E plugs in here: self.planner.plan(env, s, p, b, w, o, cond), may return
-        None = none); u < p_plan + p_rand_intent -> a random valid intent (intent.sample); else none. Preemption of an
-        active intent (design 4.4: gas rule / target moved > 2 tiles) is E's too: intents() only ticks without one."""
-        u = self._ir().random()
-        if self.planner is not None and u < self.p_plan: return self.planner.plan(self, s, p, b, w, o, cond)
+        One draw u: u < p_plan -> the rule planner (self.planner.plan(env, s, p, b, w, o, cond); its none = None); u < p_plan
+        + p_rand_intent -> a random valid intent (intent.sample); else none. An evalp_plan agent (plan_only) always asks the
+        planner (no draw)."""
+        st = s.it[p]
+        if st.get("plan_only"): return self._plan(s, p, b, w, o, cond)
+        u = self._ir().random(); st["why"] = None
+        if self.planner is not None and u < self.p_plan: return self._plan(s, p, b, w, o, cond)
         if u < self.p_plan + self.p_rand_intent: return I.sample(self._scene(s, p, b, w), self._ir())
         return None
+
+    def _plan(self, s, p, b, w, o, cond):
+        """the planner's pick at a tick -> the candidate (None for its none); counts st["rules"][rule] = [picked, started,
+        preempted] (an anchor not matched: picked, not started); st["why"] = the reason of a none pick (replay frames)"""
+        c = self.planner.plan(self, s, p, b, w, o, cond); st = s.it[p]
+        n = st.setdefault("rules", {}).setdefault(c["rule"], [0, 0, 0]); n[0] += 1
+        if c["kind"] == "none": st["why"] = c["reason"]; return None
+        n[1] += 1; st["why"] = None
+        return c
+
+    def _preempt(self, s, p, st, b, w, o, cond):
+        """a tick while a planner intent is held: the planner's pick replaces it when planner.preempts says so (the old one
+        is dropped: no end counted, its reward so far stays)"""
+        import planner as PL
+        c = self.planner.plan(self, s, p, b, w, o, cond); it = st["act"]
+        if c["kind"] == "none": return
+        xy = lambda q, pt: (w["x"][q] / 300.0, w["y"][q] / 300.0) if q >= 0 else (pt[0] / 300.0, pt[1] / 300.0)
+        if not PL.preempts(it.get("rule"), xy(it["q"], it["pt"]), c["rule"], xy(c.get("q", -1), c.get("pt"))): return
+        n = st.setdefault("rules", {}).setdefault(c["rule"], [0, 0, 0]); n[0] += 1; n[1] += 1; n[2] += 1
+        self._intent_start(s, p, st, c, w)
 
     def _intent_start(self, s, p, st, c, w):
         tx, ty = (w["x"][c["q"]], w["y"][c["q"]]) if c.get("q", -1) >= 0 else c["pt"]
         d0 = np.hypot(tx - w["x"][p], ty - w["y"][p]) / 300.0
         st["act"] = I.new(c, d0, s.sl["range"][p] / 300.0, steps_per_s=max(1, 20 // self.ticks)); st["cnt"][c["kind"]][0] += 1
+        st["act"]["rule"] = c.get("rule")                # the planner rule (None: a random intent, never preempted)
 
     def _raw_has(self, s, r, p, pt, obj):
         """is a box / cube still at pt (within 1 tile)? From agent p's raw state2 row of this response (the nearest 6 boxes /
@@ -838,8 +876,9 @@ def _check():
     assert np.isclose(env._trans[-1][3]["te"], 0.5), env._trans[-1][3]          # aux hit label: enemy damage only
     _check_aux(players, tiles, bush, NS)
     _check_intents(players, tiles, NS)
+    _check_planner(players, tiles, NS)
     _check_who(NS)
-    print("env_v5 sliders, aux labels, intents, identity rows ok")
+    print("env_v5 sliders, aux labels, intents, planner hook, identity rows ok")
 
 
 def _check_aux(players, tiles, bush, NS):
@@ -947,6 +986,56 @@ def _check_intents(players, tiles, NS):
     row = env.episodes[-1]; got = sum(t.get("i_rew", 0.0) for a, _, _, t, _ in env._trans if a == 16)
     assert np.isclose(row["terms"]["i_rew"], round(got, 4)) and np.isclose(row["ret"], got) and row["intent_mode"] == "steered"
     assert row["intents"] == {k: v for k, v in st["cnt"].items() if v[0]} and row["intents"]["move_to"][3] == 1, row
+
+
+def _check_planner(players, tiles, NS):
+    """the planner hook (step E) on a synthetic solo battle (agent p0, enemy p1 10 tiles right): p_plan 1 -> the
+    planner's pick starts, anchored to the true player, with its rule / reason (last_why, plan_rules); the same pick at
+    the next tick keeps it; a gas pick preempts it; a random intent is never preempted; the planner's none and an
+    unmatched anchor = no intent (reason kept); tag "intent": "plan" asks the planner even at p_plan 0; the episode row"""
+    import planner as PL
+    NW = P.OBS_VEC + P.OBS_GRID
+    mk = lambda **o: NS(pl=players(**o), fin=[0] if o.get("p0_eliminated") else [], over=0, tick=1, njumps=0, jumps=[], done=0,
+                        alive=10, winner=-1, reserved=[0] * 8, obs_written=1)
+    def battle(tag=None):
+        sl = slider_state(tiles.ravel(), 60, 40, ["Sniper"] * 10, np.random.default_rng(0))
+        return NS(sl=sl, cfg={"tag": {"groups": [0] * 10, **(tag or {})}}, hold={}, battle=1, pos={}, ptick=0, pjump=set(),
+                  agents={0: 16}, wprev=set(), it={}, inst=NS(resp=mk(), obs_f32=np.zeros(10 * NW, np.float32)))
+    def fake(self, i, r):
+        for p, aid in self.I[i].agents.items(): self._trans.append((aid, 0.0, p in r.fin, {"hp": 0.0, "place": 0.0, "win": 0.0}, None))
+        for p in r.fin: self.episodes.append({"player": p, "ret": 0.0, "terms": {}})
+    def obs(**kw):
+        s8, e, g, c = PL.synth(**kw); return {"self": s8[None], "ent": e[None], "grid": g[None]}, c[None]
+    env = Env.__new__(Env); env._trans, env.episodes, env.w, env.slider_scale, env.ticks, env.dead_aids = [], [], {}, 0.0, 2, set()
+    env.intent_scale, env.p_steer, env.p_rand_intent, env.p_plan, env.intent_jitter = 0.25, 1.0, 0.0, 1.0, (0.0, 0.0)
+    env.planner = PL.RulePlanner(); env.last_meta = np.array([[1650, 1650, 0, 60, 40]]); ids = np.array([16])
+    env.I = [battle()]; st = None
+    weak = obs(foes=[((10, 0), 0.4, None, False)])                    # p1 is 10 tiles right of p0, at 40 % as seen
+    blk = env.intents(ids, *weak); st = env.I[0].it[0]
+    assert blk[0, I.K["engage"] - 1] == 1 and st["act"]["q"] == 1 and st["act"]["rule"] == "engage" and st["rules"] == {"engage": [1, 1, 0]}
+    assert env.last_why == [st["act"]["reason"]] and st["act"]["reason"] == "enemy 10 tiles E at 40 %: engaging", env.last_why
+    for _ in range(10): env.intents(ids, *weak)                       # its next tick: the same pick keeps it
+    assert st["rules"] == {"engage": [1, 1, 0]} and st["cnt"]["engage"][0] == 1
+    gas = np.full((O.G, O.G), O.SEG.index("floor"), np.uint8); gas[:, 11:] = O.SEG.index("poison")
+    g_o = obs(foes=[((10, 0), 0.4, None, False)], grid=gas)
+    for _ in range(9): env.intents(ids, *g_o)                         # between ticks: no planner call
+    assert st["act"]["rule"] == "engage"
+    env.intents(ids, *g_o); assert st["act"]["rule"] == "gas" and st["act"]["kind"] == "move_to" and st["rules"]["gas"] == [1, 1, 1]
+    assert st["act"]["pt"][0] < 1650 and env.last_why[0].startswith("in the gas")
+    st["act"] = I.new(dict(kind="hold", q=-1, pt=(2250.0, 1650.0)), 2.0); n = dict(st["rules"])   # a random intent: never preempted
+    for _ in range(10): env.intents(ids, *g_o)
+    assert st["act"]["kind"] == "hold" and st["act"].get("rule") is None and st["rules"] == n and env.last_why == ["random"]
+    env.I = [battle()]; blk = env.intents(ids, *obs()); st = env.I[0].it[0]   # nothing in view: the planner's none
+    assert not blk.any() and st["act"] is None and env.last_why == ["no plan fits: free play"] and st["rules"] == {"none": [1, 0, 0]}
+    env.I = [battle()]; env.intents(ids, *obs(foes=[((0, 5), 0.4, None, False)])); st = env.I[0].it[0]   # nobody there
+    assert st["act"] is None and env.last_why[0].endswith("(target not matched)") and st["rules"] == {"engage": [1, 0, 0]}
+    env.p_plan, env.p_rand_intent = 0.0, 1.0; env.I = [battle({"intent": "plan"})]   # evalp_plan: the planner on every tick
+    env.intents(ids, *weak); st = env.I[0].it[0]
+    assert st["plan_only"] and st["steer"] and st["act"]["rule"] == "engage"
+    env.I[0].inst.resp = mk(p0_eliminated=1); sup, MAEnv._finish_step = MAEnv._finish_step, fake
+    try: env._finish_step(0, env.I[0].inst.resp)
+    finally: MAEnv._finish_step = sup
+    row = env.episodes[-1]; assert row["plan_rules"] == {"engage": [1, 1, 0]} and row["intents"]["engage"] == [1, 0, 0, 1], row
 
 
 TEAM_SLIDERS = ("protect", "leash")   # fire only with a mate: normalised over team battles

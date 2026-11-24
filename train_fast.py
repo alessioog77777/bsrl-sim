@@ -19,8 +19,9 @@ of one forward come from whichever instances were ready, and actions are sampled
 Non-acting heads (--vlive, --aux-w): as train_ppo (its helpers: targets / readouts in prepare(), losses in train()); the
 aux labels (env_v5.Env.aux_now) are computed in the workers next to priv and reach the main process in a second shared
 memory block; the replay readout (train_ppo.aux_readout of the recorded row) goes back with the actions.
-Intents (--intent-scale > 0, train_ppo's flags): env_v5.Env.intents runs in the workers (train_ppo.policy_s, after the
-observation build), so the block reaches the main process inside s and both trainers share one implementation.
+Intents (--intent-scale > 0, --p-plan, --eval-plan: train_ppo's flags): env_v5.Env.intents (and the rule planner) runs in
+the workers (train_ppo.policy_s, after the observation build), so the block reaches the main process inside s and both
+trainers share one implementation; the planner's reasons go into the worker's replay frames.
 Hard scenarios (--eval-scenarios): every worker records its scenario episodes (scenarios.Recorder) and sends their
 index entries; the main process writes replays/scn/index.json and, at the eval's end, scenarios.jsonl.
 progress.jsonl: all train_ppo fields; t_poll_build_act_rest = [main waiting for workers, build per worker (mean),
@@ -94,7 +95,7 @@ def worker(w, lo, hi, a, loc, out, conn, shm, init, ashm=None):
     try:
         from nbpc import diversity as D
         import env_v5 as E, obs_v5 as O, fast_obs as FO, scenarios as SC
-        from train_ppo import Recorder, eval_tag, TR_X, policy_s, set_intents
+        from train_ppo import Recorder, eval_tag, eval_intent, TR_X, policy_s, set_intents
         from fast_act import OBS_W, _OFF
         st = dict(init); evq = []; rng_b = np.random.default_rng(a.seed + 7 + 1000 * w)
         kmix = [int(x) for x in a.kmix.split(",")]; M = a.opp_slots; NW = a.workers
@@ -124,7 +125,7 @@ def worker(w, lo, hi, a, loc, out, conn, shm, init, ashm=None):
                 if kd == "evalscn": return SC.battle_cfg(pre)   # hard scenario (its own map / brawlers / teams)
                 if a.eval_team > 1: cfg = teams(cfg, tag, a.eval_team); tag = cfg["tag"]
                 return {**cfg, "seed": sd, "ctl": list(range(10)) if b else [0], "end": "player0",
-                        "tag": {**tag, "kind": kd, "opp": list(range(1, 10)) if b else [], "intent": "none", **eval_tag(a, pre)}}   # evals: free play
+                        "tag": {**tag, "kind": kd, "opp": list(range(1, 10)) if b else [], "intent": eval_intent(kd), **eval_tag(a, pre)}}   # free play (evalp_plan: planner)
             if roster or len(locs) > 1 or gen:           # A3: random brawlers / map per training battle
                 g = gen.get(li) if li in gen and rng_b.random() < a.p_gen else None
                 lc = E.GEN_BASE if g else locs[int(rng_b.integers(len(locs)))]
@@ -231,7 +232,7 @@ def main(argv=None):
     torch.manual_seed(a.seed); np.random.seed(a.seed)
     from nbpc.maenv import REWARD_W, TERMS
     import env_v5 as E, obs_v5 as O
-    from train_ppo import Buffer, chunks, eval_summary, eval_items, eval_presets, split_params, gae, expl_var, live_targets, head_loss
+    from train_ppo import Buffer, chunks, eval_summary, eval_items, eval_presets, eval_plan, split_params, gae, expl_var, live_targets, head_loss
     from train_ppo import aux_targets, aux_readout, scenario_items, scenario_eval, intent_stats, load_opt
     import scenarios as SC
     from fast_act import StackedActor, OBS_W, _OFF
@@ -326,7 +327,7 @@ def main(argv=None):
         sm = {"update": ev["update"], "agent_steps": ev["steps"], "minutes": round((time.time() - t0) / 60, 1),
               "eval_s": round(time.time() - ev["t0"], 1), **eval_summary(by("eval")),
               **{"b_" + k: v for k, v in eval_summary(by("evalb")).items() if k in ("episodes", "rank", "ci95", "win", "top3")},
-              **eval_presets(episodes[ev["n0"]:])}
+              **eval_presets(episodes[ev["n0"]:]), **eval_plan(episodes[ev["n0"]:])}
         evf.write(json.dumps(sm) + "\n"); evf.flush(); print("[eval]", json.dumps(sm), flush=True); evepf.flush()
         if scf: scenario_eval(episodes[ev["n0"]:], ev, sm["minutes"], scf, scef)
         ev.update(active=False, t_last=time.time())

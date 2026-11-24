@@ -46,6 +46,7 @@ table{border-collapse:collapse;font-size:11px}td,th{padding:2px 8px;text-align:r
 <div id="tip"></div>
 <script>
 const $=id=>document.getElementById(id), css=n=>getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'})[c]);   // replay text into innerHTML
 const C=i=>css('--c'+(i+1)), fmt=v=>v==null?'–':Math.abs(v)>=1000?Math.round(v).toLocaleString():+(+v).toPrecision(3)+'';
 const jl=async u=>{const r=await fetch(u+'?'+Date.now());if(!r.ok)return [];return (await r.text()).split('\n').filter(x=>x.trim()).map(x=>JSON.parse(x))};
 let P=[],EV=[],SCN=[],sidx=[];
@@ -169,7 +170,8 @@ function frame(){if(!RP)return;const F=RP.frames[fi],cv=$('map'),g=cv.getContext
   h.beginPath();h.arc(mx,my,6,0,7);h.fillStyle=css('--c1');h.fill();
   let ix='';if(F.i){const I_=F.i,qx=mx+I_.t[0]*10*t,qy=my+I_.t[1]*10*t;h.strokeStyle=css('--c4');h.lineWidth=2;h.setLineDash([4,3]);   // the active intent: target + radius
     h.beginPath();h.moveTo(mx,my);h.lineTo(qx,qy);h.stroke();h.beginPath();h.arc(qx,qy,Math.max(3,I_.r*10*t),0,7);h.stroke();h.setLineDash([]);
-    ix=` · intent ${I_.k.replace('_',' ')} (${(Math.hypot(I_.t[0],I_.t[1])*10).toFixed(1)} tiles, ${(100*I_.l).toFixed(0)} % time left)`}
+    ix=` · intent ${I_.k.replace('_',' ')} (${(Math.hypot(I_.t[0],I_.t[1])*10).toFixed(1)} tiles, ${(100*I_.l).toFixed(0)} % time left)`+(I_.y?`: <i>${esc(I_.y)}</i>`:'')}
+  else if(F.iy)ix=` · plan: <i>${esc(F.iy)}</i>`;   // the planner's reason for none (step E)
   let ax='';if(F.x){const P_=F.x,G=RP.groups,c7=css('--c7'),c8=css('--c8');   // --aux-w readout: predicted (filled / rings) vs truth (outlines / crosses)
     for(let k=0;k<8;k++){const a0=(k*45-22.5)*Math.PI/180;h.beginPath();h.moveTo(mx,my);h.arc(mx,my,5*t,a0,a0+Math.PI/4);h.closePath();
       h.globalAlpha=Math.min(.6,P_.b[k]);h.fillStyle=c7;h.fill();h.globalAlpha=1;if(F.xt&&F.xt.b[k]){h.lineWidth=2;h.strokeStyle=c7;h.stroke()}}
