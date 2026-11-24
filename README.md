@@ -105,6 +105,7 @@ Example reasons: `Undertaker (melee, range 3) 4 tiles E: keeping my distance W`,
 | `charge_check.py` | One-boot check of the charge supers' extras that `super_audit` cannot see: Bull's lane and El Primo's landing break a destructible wall, Damian's arena knocks an enemy at its edge back in, Berry's paint damages an enemy and heals Berry. `python -m charge_check`, `--check` |
 | `status_check.py` | One-boot check of status effects and movement (issue #19): walk speeds against the table, Max's super speeds him up, Spike's super slows its target, Frank's super stuns its target (no move, no attack, then free again), Draco's mount speeds him up and swaps his weapon, Leon's super hides him from a far enemy's observation (obs v5.9). `python -m status_check`, `--check` |
 | `gadget_check.py` | One-boot check of gadget activation: the loadout reaches the host, each implemented kind's effect, uses and cooldown spent, fire 3 while not ready spends nothing, `Env.gadget` agrees with the host. `python -m gadget_check`, `--check` |
+| `star_audit.py` | Star power probe (issue #20): one boot, native-AI battles where every player carries a star power card, the host counting which card types libg looks up (`star.c`, `NB_STAR_PROBE=1`), plus a static scan of libg's lookup call sites; classes per card and `LIVE` (the cards found read, what `--star-powers 1` hands out). Results in `notes/issue20.md`. `python -m star_audit [--rounds 3] [--cards A,B]`, `--check` |
 | `hyper_check.py` | One-boot check of hypercharge: the card reaches the host, charging from hits, fire 4 activates only at a full charge with the card, +speed / +damage / shield while active, the end after 5 s and normal speed after it, `Env.hyper` agrees with the host. `python -m hyper_check`, `--check` |
 | `live_check.py` | One-boot check of the host round: team reward, area effects (radius, kind), teammate respawn, HUD mask, live map tiles, cubes lost at a knock-out. |
 | `showdown_check.py` | Showdown rules (issue #21), played by the native AI in solo / duo / trio: the battle ends when one team is left, death cube drops, spawn protection after a respawn. `--check` without the host. |
@@ -160,7 +161,7 @@ Before `update.sh` existed: `git pull` once, then `./update.sh`.
 Self-checks (no battle is booted; `obs_v5` / `env_v5` read the game's data tables, so they need the game files):
 
 ```bash
-python -m obs_v5 && python -m intent && python -m planner && python -m model && python -m fast_obs && python -m env_v5 --check && python -m train_ppo --check && python -m scenarios --check && python -m gadget_check --check && python -m hyper_check --check && python -m charge_check --check && python -m showdown_check --check && python -m status_check --check && python -m super_audit --check && python -m export_policy --check && python apply_noise.py --test
+python -m obs_v5 && python -m intent && python -m planner && python -m model && python -m fast_obs && python -m env_v5 --check && python -m train_ppo --check && python -m scenarios --check && python -m gadget_check --check && python -m hyper_check --check && python -m charge_check --check && python -m showdown_check --check && python -m status_check --check && python -m super_audit --check && python -m star_audit --check && python -m export_policy --check && python apply_noise.py --test
 ```
 
 Live checks (boot the host; each boot takes about 60-90 s):
@@ -172,6 +173,7 @@ python -m hyper_check                               # hypercharge activation, bu
 python -m charge_check                              # charge supers: walls, Damian's arena edge, Berry's paint
 python -m status_check                              # speed boosts, slows, stuns, Draco's mount, Leon unseen
 python -m showdown_check                            # team end, death cube drops, respawn protection
+python -m star_audit                                # which star power cards libg still reads in battle
 python -m env_v5 --n 4 --minutes 2 --agents 10      # random-action benchmark
 ```
 

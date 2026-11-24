@@ -189,10 +189,11 @@ static void my_player_ctor(uint64_t *ctx) {
 }
 extern int g_env_on; extern void env_before_build(void), env_after_build(void *), env_tick_enter(void *), env_tick_leave(void *);
 /* nbenv sim-only resets: run the native builder on a stand-in battle object (only the simulation is built) */
+extern void star_dump(void), star_built(void *), star_tick(void *), star_install(void);   /* star.c: NB_STAR_PROBE */
 void *offline_build_raw(void *battle, void *list, int a2, int a3) {
-    g_building = 1;
+    star_dump(); g_building = 1;
     orig_build((uint64_t)battle, (uint64_t)list, a2, a3, 0, 0, 0, 0);
-    g_building = 0;
+    g_building = 0; star_built(*(void **)((uint8_t *)battle + 0x30));
     return *(void **)((uint8_t *)battle + 0x30);
 }
 uint64_t g_build_args[4];
@@ -202,12 +203,12 @@ static uint64_t my_build(ARGS8) {   /* 0x9bb710: builds the local simulation (ba
         extern int g_build_list[64], g_build_nlist; int n = *(int32_t *)((uint8_t *)a1 + 0xc);
         g_build_nlist = n < 0 ? 0 : n > 64 ? 64 : n; memcpy(g_build_list, *(void **)a1, g_build_nlist * 4);
     }
-    g_building = 1;
+    star_dump(); g_building = 1;
     if (g_env_on) env_before_build();
     uint64_t r = orig_build(FWD8);
     g_building = 0;
     if (g_env_on) env_after_build((void *)a0);
-    g_sim = *(void **)((uint8_t *)a0 + 0x30); g_ticks = 0;
+    g_sim = *(void **)((uint8_t *)a0 + 0x30); g_ticks = 0; star_built(g_sim);
     LOG("[battle] local simulation built: battle=%#lx sim=%p players=%d\n", a0, g_sim, g_sim ? *(int32_t *)((uint8_t *)g_sim + 0x60) : -1);
     return r;
 }
@@ -218,6 +219,7 @@ static uint64_t my_tick(ARGS8) {    /* 0xc29098: one simulation tick (timed: the
     if (g_env_on) env_tick_enter((void *)a0);
     uint64_t r = orig_tick(FWD8);
     if (g_env_on) env_tick_leave((void *)a0);
+    star_tick((void *)a0);
     if ((void *)a0 == g_sim) { g_tick_time += tnow() - t0; g_tick_n++;
         if (g_tick_n % (g_env_on ? 20000 : 200) == 0) LOG("[perf] battle tick: %.3f ms average over %ld ticks (this process, under qemu-user)\n", g_tick_time * 1e3 / g_tick_n, g_tick_n); }
     if ((void *)a0 == g_sim && (++g_ticks <= 3 || g_ticks % (g_env_on ? 20000 : 200) == 0)) {
@@ -243,6 +245,7 @@ void offline_install(const char *payload_dir) {
         LOG("[battle] lockstep: %d ticks per frame\n", g_lockstep);
     }
     extern void battle_fix_install(void); battle_fix_install();
+    star_install();
     extern void env_install(void); env_install();
     extern void hook_enter(Module *, uint64_t, void (*)(uint64_t *));
     hook_enter(g_libg, 0x962880, my_start);

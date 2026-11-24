@@ -1,0 +1,147 @@
+# star power probe (bsrl-sim issue #20, step 1): native/loader/star.c counts the star power config lookups 0xc34be0 /
+# 0xc34c6c / 0xc34d10 per card type and logs them per battle, only with NB_STAR_PROBE=1 (nothing is hooked otherwise);
+# native/loader/offline.c calls star_install / star_dump / star_built / star_tick; build.sh compiles star.c.
+# Python side: star_audit.py. Applies on top of the other patches. Paths relative to engine/.
+diff --git a/native/loader/build.sh b/native/loader/build.sh
+index cde0b74..2124353 100755
+--- a/native/loader/build.sh
++++ b/native/loader/build.sh
+@@ -10,5 +10,5 @@
+ set -e
+ cd "$(dirname "$0")"
+ aarch64-linux-gnu-gcc -O2 -g -ffp-contract=off -fno-omit-frame-pointer -static -D_GNU_SOURCE -Wall -Wno-unused-function -Wno-incompatible-pointer-types \
+-  -Wno-int-conversion -fno-strict-aliasing -Iinc -o nbhost_spawnfix2.tmp main.c elfload.c bionic_shim.c android_shim.c jni_fake.c boot.c hook.c offline.c battle_fix.c env.c prof.c encode.c heapcheck.c bar_fix.c gl_client.c gl_client_gen.c spawnfix.c superfix.c superfix_items.c superfix_moves.c superfix_status.c superfix_cc.c gadget.c hyper.c trace.c thunk.S -lm -lpthread
++  -Wno-int-conversion -fno-strict-aliasing -Iinc -o nbhost_spawnfix2.tmp main.c elfload.c bionic_shim.c android_shim.c jni_fake.c boot.c hook.c offline.c battle_fix.c env.c prof.c encode.c heapcheck.c bar_fix.c gl_client.c gl_client_gen.c spawnfix.c superfix.c superfix_items.c superfix_moves.c superfix_status.c superfix_cc.c gadget.c hyper.c star.c trace.c thunk.S -lm -lpthread
+ mv -f nbhost_spawnfix2.tmp nbhost_spawnfix2 && echo "built native/loader/nbhost_spawnfix2"
+diff --git a/native/loader/offline.c b/native/loader/offline.c
+index 3ef7d0e..72153a1 100644
+--- a/native/loader/offline.c
++++ b/native/loader/offline.c
+@@ -189,10 +189,11 @@ static void my_player_ctor(uint64_t *ctx) {
+ }
+ extern int g_env_on; extern void env_before_build(void), env_after_build(void *), env_tick_enter(void *), env_tick_leave(void *);
+ /* nbenv sim-only resets: run the native builder on a stand-in battle object (only the simulation is built) */
++extern void star_dump(void), star_built(void *), star_tick(void *), star_install(void);   /* star.c: NB_STAR_PROBE */
+ void *offline_build_raw(void *battle, void *list, int a2, int a3) {
+-    g_building = 1;
++    star_dump(); g_building = 1;
+     orig_build((uint64_t)battle, (uint64_t)list, a2, a3, 0, 0, 0, 0);
+-    g_building = 0;
++    g_building = 0; star_built(*(void **)((uint8_t *)battle + 0x30));
+     return *(void **)((uint8_t *)battle + 0x30);
+ }
+ uint64_t g_build_args[4];
+@@ -202,12 +203,12 @@ static uint64_t my_build(ARGS8) {   /* 0x9bb710: builds the local simulation (ba
+         extern int g_build_list[64], g_build_nlist; int n = *(int32_t *)((uint8_t *)a1 + 0xc);
+         g_build_nlist = n < 0 ? 0 : n > 64 ? 64 : n; memcpy(g_build_list, *(void **)a1, g_build_nlist * 4);
+     }
+-    g_building = 1;
++    star_dump(); g_building = 1;
+     if (g_env_on) env_before_build();
+     uint64_t r = orig_build(FWD8);
+     g_building = 0;
+     if (g_env_on) env_after_build((void *)a0);
+-    g_sim = *(void **)((uint8_t *)a0 + 0x30); g_ticks = 0;
++    g_sim = *(void **)((uint8_t *)a0 + 0x30); g_ticks = 0; star_built(g_sim);
+     LOG("[battle] local simulation built: battle=%#lx sim=%p players=%d\n", a0, g_sim, g_sim ? *(int32_t *)((uint8_t *)g_sim + 0x60) : -1);
+     return r;
+ }
+@@ -218,6 +219,7 @@ static uint64_t my_tick(ARGS8) {    /* 0xc29098: one simulation tick (timed: the
+     if (g_env_on) env_tick_enter((void *)a0);
+     uint64_t r = orig_tick(FWD8);
+     if (g_env_on) env_tick_leave((void *)a0);
++    star_tick((void *)a0);
+     if ((void *)a0 == g_sim) { g_tick_time += tnow() - t0; g_tick_n++;
+         if (g_tick_n % (g_env_on ? 20000 : 200) == 0) LOG("[perf] battle tick: %.3f ms average over %ld ticks (this process, under qemu-user)\n", g_tick_time * 1e3 / g_tick_n, g_tick_n); }
+     if ((void *)a0 == g_sim && (++g_ticks <= 3 || g_ticks % (g_env_on ? 20000 : 200) == 0)) {
+@@ -243,6 +245,7 @@ void offline_install(const char *payload_dir) {
+         LOG("[battle] lockstep: %d ticks per frame\n", g_lockstep);
+     }
+     extern void battle_fix_install(void); battle_fix_install();
++    star_install();
+     extern void env_install(void); env_install();
+     extern void hook_enter(Module *, uint64_t, void (*)(uint64_t *));
+     hook_enter(g_libg, 0x962880, my_start);
+diff --git a/native/loader/star.c b/native/loader/star.c
+new file mode 100644
+index 0000000..872c03b
+--- /dev/null
++++ b/native/loader/star.c
+@@ -0,0 +1,77 @@
++/* star power probe (bsrl-sim issue #20, step 1): which star power card types the shipped libg v68.279 still reads.
++ *
++ * Every star power read in libg goes through three loadout-config lookups (the player wrappers 0xc42838 / 0xc42874 /
++ * 0xc428b0 and the projectile / area owner wrappers 0xb6a75c / 0xb6a7b0 tail-call them with the same arguments):
++ *   0xc34be0(cfg, type)       -> the config's card of that type (cfg+0x08 star power, then the cfg+0x50 list, count +0x5c),
++ *                                NULL if none
++ *   0xc34c6c(cfg, type, idx)  -> that card's Value<idx> (0xaa9568), -1 if none
++ *   0xc34d10(cfg, type)       -> an int of that card (its first skill's +0xc0), -1 if none
++ * The type is the card's Type enum (cards.csv Type, read by 0xaa9500 from the card). With NB_STAR_PROBE=1 this file
++ * hooks the three, counts calls and hits (a card of that type was found) per type with the first caller's libg offset,
++ * and logs the counts once per battle ("[star] q ..." lines, at the next build and at star_dump). A type that is never
++ * asked for while a player carries its card has no reader left in this build (likely compiled out with the server code).
++ * 40 ticks into each battle it also logs every player's star power card ("[star] p ..."): data id, Type enum, the "cards off" byte
++ * (player+0x238: the wrappers return nothing while it is set). Python: star_audit.py. Without NB_STAR_PROBE nothing is hooked. */
++#include "nbhost.h"
++#include <stdlib.h>
++#include <string.h>
++
++#define I32(p, o) (*(int32_t *)((uint8_t *)(p) + (o)))
++#define U8(p, o) (*(uint8_t *)((uint8_t *)(p) + (o)))
++#define PTR(p, o) (*(void **)((uint8_t *)(p) + (o)))
++extern Module *g_libg;
++#define B(off) ((uint8_t *)g_libg->base + (off))
++void *hook_replace(Module *m, uint64_t off, void *repl);
++
++#define NT 4096   /* Type enum values seen so far are < 1000 (the enum map 0xaa3000-0xaa8860); larger ones share the last slot */
++static int g_on;
++static uint32_t q_n[NT], q_hit[NT], q_lr[NT];
++static long g_battle;
++
++static void *(*o_card)(void *, int);
++static int (*o_val)(void *, int, int);
++static int (*o_int)(void *, int);
++static int slot(int t) { return t < 0 ? NT - 1 : t >= NT ? NT - 1 : t; }
++static void note(int t, int hit, void *lr) {
++    int s = slot(t); q_n[s]++; if (hit) q_hit[s]++;
++    if (!q_lr[s]) q_lr[s] = (uint32_t)((uint8_t *)lr - (uint8_t *)g_libg->base);
++}
++/* __builtin_return_address(0): the hook stub is a plain branch, so this is the libg call site (the wrappers tail-call) */
++static void *my_card(void *cfg, int t) { void *r = o_card(cfg, t); note(t, r != NULL, __builtin_return_address(0)); return r; }
++static int my_val(void *cfg, int t, int i) { int r = o_val(cfg, t, i); note(t, r != -1, __builtin_return_address(0)); return r; }
++static int my_int(void *cfg, int t) { int r = o_int(cfg, t); note(t, r != -1, __builtin_return_address(0)); return r; }
++
++void star_dump(void) {   /* the counts since the last dump, then zero */
++    if (!g_on) return;
++    int k = 0;
++    for (int t = 0; t < NT; t++) if (q_n[t]) {
++        LOG("[star] q battle=%ld type=%d n=%u hit=%u lr=0x%x\n", g_battle, t, q_n[t], q_hit[t], q_lr[t]); k++;
++    }
++    LOG("[star] dump battle=%ld types=%d\n", g_battle, k);
++    memset(q_n, 0, sizeof q_n); memset(q_hit, 0, sizeof q_hit); memset(q_lr, 0, sizeof q_lr);
++}
++static void *player_cfg(void *p) {   /* what the player wrappers use: player+0x348, else the active loadout's config */
++    void *c = PTR(p, 0x348); if (c) return c;
++    void **lo = PTR(p, 0x30); int li = I32(p, 0x40); void **ld = lo && li >= 0 && li < 8 ? lo[li] : NULL;
++    return ld ? ld[1] : NULL;
++}
++static void *g_ssim; static int g_sticks;
++void star_built(void *sim) { if (g_on && sim) { g_battle++; g_ssim = sim; g_sticks = 0; } }   /* after a build */
++void star_tick(void *sim) {   /* 40 ticks (2 s) into the battle, once the players have spawned: their star power cards */
++    if (!g_on || sim != g_ssim || ++g_sticks != 40) return;
++    int np = I32(sim, 0x7c); void **ps = PTR(sim, 0x70); if (np < 0 || np > 64 || !ps) np = 0;
++    for (int i = 0; i < np; i++) {
++        void *p = ps[i]; if (!p) continue;
++        void *cfg = player_cfg(p), *card = cfg ? PTR(cfg, 0x08) : NULL;
++        int t = card ? ((int (*)(void *))B(0xaa9500))(card) : -1;
++        LOG("[star] p battle=%ld slot=%d card=%d type=%d off=%d\n", g_battle, i, card ? I32(card, 0x20) : 0, t, U8(p, 0x238));
++    }
++}
++void star_install(void) {
++    const char *e = getenv("NB_STAR_PROBE"); g_on = e && atoi(e);
++    if (!g_on) return;
++    o_card = hook_replace(g_libg, 0xc34be0, (void *)my_card);
++    o_val = hook_replace(g_libg, 0xc34c6c, (void *)my_val);
++    o_int = hook_replace(g_libg, 0xc34d10, (void *)my_int);
++    LOG("[star] probe on: 0xc34be0 / 0xc34c6c / 0xc34d10 counted per card type\n");
++}
