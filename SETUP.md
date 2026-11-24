@@ -20,6 +20,11 @@ a copy you already have: `APK=/path/to/nb_68.279_release_7c5c5152.apk ./setup.sh
 `lib/arm64-v8a/libg.so` must match `engine/native/LIBG_SHA256`, or `setup.sh` stops before anything runs it. `./setup.sh --no-apt` skips system packages, `--no-python` skips
 the venv. `TORCH_INDEX_URL` picks the torch build (for example ROCm or CPU wheels).
 
+## Updating
+
+`./update.sh` (from the repo root) brings a checkout to the latest `main` and rebuilds what changed: README "Updating".
+`./update.sh --check` also runs the self-checks.
+
 ## What is in engine/
 
 One tree of nirkt's code (`engine/NOTICE.md` says which file came from which repo):
@@ -83,7 +88,8 @@ Changes made to nirkt's code, all recorded in `engine/patches/`:
 - The game download link removed from bulletlabels' `setup.sh` (`engine/setup.sh`) (this repo's `setup.sh` downloads it instead).
 
 What `setup.sh` does: system packages (APT list at its top), builds the host as `native/loader/nbhost_rl` (static
-ARM64 binary, runs under qemu), builds nirkt's patched qemu (~5 min; if that fails, `env.sh` uses the system
+ARM64 binary, runs under qemu; rebuilt when the sources in `native/loader` changed since the last build, whose hash is kept in
+`nbhost_rl.src`), builds nirkt's patched qemu (~5 min; if that fails, `env.sh` uses the system
 `qemu-aarch64`, about 2x slower, same results), creates `.venv`, downloads (unless `APK=` is given), unpacks and checks the game files.
 
 `env.sh` finds all of it under `engine/`. Each path can be overridden: `SIM_ENGINE` (the engine folder), `SIM_WORK` (runs and the
@@ -104,6 +110,6 @@ downloaded game build, default `work/`), `SIM_VENV`.
   `native/loader/hyper.c`. `python -m hyper_check` checks the built host.
 - **Every boot crashes at "loading 45%".** A game file is a Git LFS pointer, not the file (seen with `assets/sc/ui.sc`
   from a git clone of the game files): run `git lfs pull` in that clone.
-- **`gadget_check` / `hyper_check` say the host publishes no gadget / hypercharge state.** `setup.sh` builds the host only when
-  `native/loader/nbhost_rl` is missing: after a change in `engine/native/loader`, delete it and rerun
-  `./setup.sh --no-apt --no-python`.
+- **`gadget_check` / `hyper_check` say the host publishes no gadget / hypercharge state.** The host is older than its
+  sources. `./setup.sh --no-apt --no-python` rebuilds it when `engine/native/loader` changed (a host built before
+  `nbhost_rl.src` existed is rebuilt once).

@@ -113,9 +113,10 @@ Example reasons: `Undertaker (melee, range 3) 4 tiles E: keeping my distance W`,
 | `viz.html` | Run dashboard: training / eval curves, action histograms, battle replay with the policy's view. |
 | `hud_ui.npy` | Measured share of each tile hidden by the game HUD (used by the noisy observation). |
 | `env.sh` | Environment variables for the host, nirkt's packages and the work folder. |
-| `setup.sh` | One-command setup: host build, venv, game files (SETUP.md). |
+| `setup.sh` | One-command setup: host build, venv, game files (SETUP.md). Rebuilds the host when its sources changed. |
+| `update.sh` | Updates a checkout to the latest `main` (fast-forward, or a merge into your branch), then reruns `setup.sh`; `--check` runs the self-checks. |
 | `engine/` | nirkt's battle host and environment as one tree: `native/` (host sources, qemu patches), `py/` (`nbpc`, `models4.py`), `train/`, nirkt's vision-label tools; this project's changes applied. What came from where: `engine/NOTICE.md`. |
-| `engine/patches/` | Record of this project's changes to nirkt's host and camera rules (`training_round`, `fair_view`, `live_state`, `gadgets`, `charge`, `hypercharge`, `hypercharged_supers`, `supers`, `status_movement`, `obs_invisibility`; already applied in `engine/`). |
+| `engine/patches/` | Record of this project's changes to nirkt's host and camera rules (`training_round`, `fair_view`, `live_state`, `gadgets`, `charge`, `hypercharge`, `hypercharged_supers`, `area_gadgets`, `showdown`, `supers`, `status_movement`, `obs_invisibility`; already applied in `engine/`). |
 | `pro_strategies.md` | Community Showdown habits and what each means for the observation / reward. |
 
 ## Vision models
@@ -142,10 +143,24 @@ source env.sh
 
 What `setup.sh` does, the pinned versions and troubleshooting: **[SETUP.md](SETUP.md)**.
 
+### Updating
+
+```bash
+./update.sh                 # pull the latest main, rebuild what changed
+./update.sh --check         # the same, then the self-checks below
+```
+
+On `main` it fast-forwards to `origin/main`. On another branch it merges `origin/main` into that branch, and on a
+conflict it undoes the merge and stops. It stops before changing anything if tracked files have uncommitted changes. Then it
+reruns `setup.sh --no-apt` (`--apt` to include system packages), which rebuilds the host when `engine/native/loader`
+changed and installs new Python requirements; the game files and qemu are kept. It lists the new commits and says when
+the observation version changed (re-export policies for the bot with `export_policy.py`; old checkpoints still load).
+Before `update.sh` existed: `git pull` once, then `./update.sh`.
+
 Self-checks (no battle is booted; `obs_v5` / `env_v5` read the game's data tables, so they need the game files):
 
 ```bash
-python -m obs_v5 && python -m intent && python -m planner && python -m model && python -m fast_obs && python -m env_v5 --check && python -m train_ppo --check && python -m scenarios --check && python -m gadget_check --check && python -m hyper_check --check && python -m charge_check --check && python -m status_check --check && python -m export_policy --check && python apply_noise.py --test
+python -m obs_v5 && python -m intent && python -m planner && python -m model && python -m fast_obs && python -m env_v5 --check && python -m train_ppo --check && python -m scenarios --check && python -m gadget_check --check && python -m hyper_check --check && python -m charge_check --check && python -m showdown_check --check && python -m status_check --check && python -m super_audit --check && python -m export_policy --check && python apply_noise.py --test
 ```
 
 Live checks (boot the host; each boot takes about 60-90 s):
@@ -156,6 +171,7 @@ python -m gadget_check                              # which gadget kinds the bui
 python -m hyper_check                               # hypercharge activation, buffs and their end
 python -m charge_check                              # charge supers: walls, Damian's arena edge, Berry's paint
 python -m status_check                              # speed boosts, slows, stuns, Draco's mount, Leon unseen
+python -m showdown_check                            # team end, death cube drops, respawn protection
 python -m env_v5 --n 4 --minutes 2 --agents 10      # random-action benchmark
 ```
 

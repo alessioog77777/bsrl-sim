@@ -26,10 +26,18 @@ if [ $NOAPT = 0 ] && command -v apt-get >/dev/null; then
 fi
 
 say "host binary (engine/native/loader/nbhost_rl)"
-if [ ! -x "$ENG/native/loader/nbhost_rl" ]; then
-  (cd "$ENG/native/loader" && sed 's/nbhost_spawnfix2/nbhost_rl/g' build.sh | sh 2>&1 | grep -E "error:|^built ")
+# rebuilt when missing or when its sources changed since the last build (nbhost_rl.src = their hash), e.g. after update.sh
+LD=$ENG/native/loader; STAMP=$LD/nbhost_rl.src
+SRC=$(cd "$LD" && find . -type f \( -name '*.c' -o -name '*.h' -o -name '*.S' -o -name build.sh \) | LC_ALL=C sort | xargs sha256sum | sha256sum | cut -d' ' -f1)
+if [ ! -x "$LD/nbhost_rl" ] || [ "$(cat "$STAMP" 2>/dev/null)" != "$SRC" ]; then
+  [ -x "$LD/nbhost_rl" ] && echo "host sources changed since the last build: rebuilding"
+  rm -f "$LD/nbhost_rl" "$STAMP"   # a failed rebuild must not leave the old binary looking current
+  (cd "$LD" && sed 's/nbhost_spawnfix2/nbhost_rl/g' build.sh | sh 2>&1 | grep -E "error:|^built ") || true
+  [ -x "$LD/nbhost_rl" ] && echo "$SRC" > "$STAMP"
+else
+  echo "up to date"
 fi
-[ -x "$ENG/native/loader/nbhost_rl" ] || { echo "host build failed (needs gcc-aarch64-linux-gnu, libgles-dev)"; exit 1; }
+[ -x "$LD/nbhost_rl" ] || { echo "host build failed (needs gcc-aarch64-linux-gnu, libgles-dev)"; exit 1; }
 
 say "patched qemu (~5 min once; the system qemu-aarch64 works too, ~2x slower)"
 [ -x "$ENG/native/qemu/bin/qemu-aarch64-nb" ] || "$ENG/native/qemu/build.sh" || echo "qemu build failed: env.sh falls back to the system qemu-aarch64"

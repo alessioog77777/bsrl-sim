@@ -8,7 +8,7 @@ the repo root and is run as `python -m <module>` from the root after `source env
 - `engine/` is nirkt's code (README "Credits", `engine/NOTICE.md`), not under this repo's licence. Keep changes there
   small, and record every one in `engine/patches/*.patch` (a diff on top of the earlier patches, paths relative to
   `engine/`) so the two stay separable. This repo's own code is the flat modules at the root.
-- `./setup.sh` builds everything (SETUP.md); `source env.sh` before any module. Without the host built, only the
+- `./setup.sh` builds everything (SETUP.md), `./update.sh` pulls the latest `main` and rebuilds what changed; `source env.sh` before any module. Without the host built, only the
   self-checks that skip the game data run (`scorecard.py --check`, `apply_noise.py --test`).
 - No game files, binaries, checkpoints, datasets or run outputs go into git (`.gitignore`).
 
