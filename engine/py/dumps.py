@@ -2,7 +2,7 @@
 import json, os, sys, glob
 import numpy as np
 
-EB = os.path.dirname(os.path.abspath(__file__))   # vendor/ (state2.py)
+EB = os.path.dirname(os.path.abspath(__file__))   # py/ (state2.py)
 if EB not in sys.path:
     sys.path.append(EB)
 

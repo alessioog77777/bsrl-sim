@@ -1,6 +1,6 @@
 # Making the sim run
 
-Everything the sim needs is in this repository: nirkt's battle host and environment are in `deps/` with this
+Everything the sim needs is in this repository: nirkt's battle host and environment are in `engine/` with this
 project's changes already applied (README "Credits"). `setup.sh` builds it.
 
 ## Quick start (Linux x86-64 or WSL2 Ubuntu 24.04)
@@ -17,34 +17,39 @@ python -m train_ppo --run t --smoke                                # 3-update pl
 The game build is not stored in this repository. `setup.sh` downloads it (1.2 GB) once into `work/` from `APK_URL`, by default
 nirkt's copy (the link from nirkt's original `setup.sh`; not an official Null's Brawl host, so it may go away). To use
 a copy you already have: `APK=/path/to/nb_68.279_release_7c5c5152.apk ./setup.sh`. Either way its
-`lib/arm64-v8a/libg.so` must match `deps/bulletlabels/native/LIBG_SHA256`, or `setup.sh` stops before anything runs it. `./setup.sh --no-apt` skips system packages, `--no-python` skips
+`lib/arm64-v8a/libg.so` must match `engine/native/LIBG_SHA256`, or `setup.sh` stops before anything runs it. `./setup.sh --no-apt` skips system packages, `--no-python` skips
 the venv. `TORCH_INDEX_URL` picks the torch build (for example ROCm or CPU wheels).
 
-## What is in deps/
+## What is in engine/
+
+One tree of nirkt's code (`engine/NOTICE.md` says which file came from which repo):
 
 | Folder | What | From |
 |---|---|---|
-| `deps/bulletlabels` | Battle host: `native/loader` (host binary sources), `native/qemu` (patched `qemu-aarch64` build), `vendor/nbpc` (instances, observation encoding, `MAEnv`, camera rules) | [nirkt/bulletlabels](https://github.com/nirkt/bulletlabels) @ `52184b2` |
-| `deps/nbrl-env` | `py/` (`models4.py`: network blocks, masked log-prob / entropy; the original `nbpc`) and `train/` | [nirkt/nbrl-env](https://github.com/nirkt/nbrl-env) @ `7ff57bc` (models, qemu binary and duplicate host sources left out) |
+| `engine/native` | Battle host: `loader` (host binary sources), `qemu` (patched `qemu-aarch64` build), `glhost`, `payloads`, `LIBG_SHA256` | [nirkt/bulletlabels](https://github.com/nirkt/bulletlabels) @ `52184b2` |
+| `engine/py` | `nbpc` (instances, observation encoding, `MAEnv`, camera rules), `state2.py`, `dumps.py` (bulletlabels' `vendor/`); `models4.py` (network blocks, masked log-prob / entropy) and nbrl-env's other `py/` scripts | bulletlabels; [nirkt/nbrl-env](https://github.com/nirkt/nbrl-env) @ `7ff57bc` |
+| `engine/train` | nbrl-env's example training loop | nbrl-env |
+| `engine/labeller`, `framegen`, `debug`, `data`, `docs`, `tests`, `bl.py` | bulletlabels' vision-label tools (not used by the sim) | bulletlabels |
+| `engine/patches` | This project's changes, listed below | this project |
 
-Changes made to nirkt's code, all recorded in `host/`:
-- `host/training_round.patch`: team groups, summons and area effects in the observation, per-instance map folders,
+Changes made to nirkt's code, all recorded in `engine/patches/`:
+- `training_round.patch`: team groups, summons and area effects in the observation, per-instance map folders,
   teammate respawn.
-- `host/fair_view.patch`: camera view window (measured trapezoid, per-episode zoom, teammates never bush-hidden).
-- `host/live_state.patch`: live map tiles in `F_MAP` and the observation grid (a destroyed wall / bush reads as open),
+- `fair_view.patch`: camera view window (measured trapezoid, per-episode zoom, teammates never bush-hidden).
+- `live_state.patch`: live map tiles in `F_MAP` and the observation grid (a destroyed wall / bush reads as open),
   area effects' data id in item feature 5 (obs_v5 looks up radius and kind), power cubes lost at a team knock-out.
-- `host/gadgets.patch` (issue #3, a diff on top of the three above): per-player gadget state in the response (`NbeResp`
+- `gadgets.patch` (issue #3, a diff on top of the three above): per-player gadget state in the response (`NbeResp`
   `gad_*`, mirrored in `nbpc/proto.py`) and the host's own gadget activation in `native/loader/gadget.c`, which
   `env.c` `gadget_input` tries first. No gadget kind is implemented yet, so every gadget still reads as not usable.
-- `maenv.py` and `fair.py` copied from `deps/nbrl-env/py/nbpc` into `deps/bulletlabels/vendor/nbpc`, so one `nbpc`
-  package holds the host side and the environment side.
-- The game download link removed from `deps/bulletlabels/setup.sh` (this repo's `setup.sh` downloads it instead).
+- `maenv.py` and `fair.py` copied from nbrl-env's `py/nbpc` into bulletlabels' `vendor/nbpc` (now `engine/py/nbpc`),
+  so one `nbpc` package holds the host side and the environment side.
+- The game download link removed from bulletlabels' `setup.sh` (`engine/setup.sh`) (this repo's `setup.sh` downloads it instead).
 
 What `setup.sh` does: system packages (APT list at its top), builds the host as `native/loader/nbhost_rl` (static
 ARM64 binary, runs under qemu), builds nirkt's patched qemu (~5 min; if that fails, `env.sh` uses the system
 `qemu-aarch64`, about 2x slower, same results), creates `.venv`, downloads (unless `APK=` is given), unpacks and checks the game files.
 
-`env.sh` finds all of it under `deps/`. Each path can be overridden: `BULLETLABELS`, `NBRL`, `SIM_WORK` (runs and the
+`env.sh` finds all of it under `engine/`. Each path can be overridden: `SIM_ENGINE` (the engine folder), `SIM_WORK` (runs and the
 downloaded game build, default `work/`), `SIM_VENV`.
 
 ## Troubleshooting
@@ -59,5 +64,5 @@ downloaded game build, default `work/`), `SIM_VENV`.
   activates only the kinds `native/loader/gadget.c` implements (none yet), so the gadget class stays masked. Hypercharge
   has no fire class yet (issue #4). `python -m gadget_check` shows which kinds the built host publishes.
 - **`gadget_check` says the host publishes no gadget state.** `setup.sh` builds the host only when
-  `native/loader/nbhost_rl` is missing: after a change in `deps/bulletlabels/native/loader`, delete it and rerun
+  `native/loader/nbhost_rl` is missing: after a change in `engine/native/loader`, delete it and rerun
   `./setup.sh --no-apt --no-python`.

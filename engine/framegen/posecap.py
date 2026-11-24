@@ -11,7 +11,7 @@ map.json, map.npy) + script.json (per tick: the action of every player); the ren
 import argparse, json, os, sys, time
 import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'labeller'))
-import rc   # repo paths: vendor/ on sys.path, game / host / GL host defaults (labeller/rc.py)
+import rc   # repo paths: py/ on sys.path, game / host / GL host defaults (labeller/rc.py)
 from nbpc.instance import Instance
 from nbpc import diversity as D
 from nbpc import proto as P

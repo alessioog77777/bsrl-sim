@@ -6,7 +6,7 @@ classes, a set of detected entities with measured detector noise and latency, an
 testbed for training agents that have to act from imperfect perception, and policies trained here can run behind real
 vision models without retraining.
 
-The battles run in **nirkt's** battle host and environment, included under `deps/` (see Credits). `setup.sh` builds
+The battles run in **nirkt's** battle host and environment, included under `engine/` (see Credits). `setup.sh` builds
 everything. Game files are not included: you supply them.
 
 ## How it works
@@ -136,8 +136,8 @@ xychart-beta
 | `hud_ui.npy` | Measured share of each tile hidden by the game HUD (used by the noisy observation). |
 | `env.sh` | Environment variables for the host, nirkt's packages and the work folder. |
 | `setup.sh` | One-command setup: host build, venv, game files (SETUP.md). |
-| `deps/` | nirkt's `bulletlabels` and the `py/` + `train/` parts of `nbrl-env`, with this project's changes applied. |
-| `host/training_round.patch`, `host/fair_view.patch`, `host/live_state.patch`, `host/gadgets.patch` | Record of this project's changes to nirkt's host and camera rules (already applied in `deps/`). |
+| `engine/` | nirkt's battle host and environment as one tree: `native/` (host sources, qemu patches), `py/` (`nbpc`, `models4.py`), `train/`, nirkt's vision-label tools; this project's changes applied. What came from where: `engine/NOTICE.md`. |
+| `engine/patches/` | Record of this project's changes to nirkt's host and camera rules (`training_round`, `fair_view`, `live_state`, `gadgets`; already applied in `engine/`). |
 | `pro_strategies.md` | Community Showdown habits and what each means for the observation / reward. |
 
 ## Vision models
@@ -203,13 +203,13 @@ cd $SIM_WORK/runs && python -m http.server 8766      # dashboard: http://localho
 
 ## Licence
 
-GNU Affero General Public License v3.0, see [LICENSE](LICENSE), for this project's own code. `deps/` is not covered by
+GNU Affero General Public License v3.0, see [LICENSE](LICENSE), for this project's own code. `engine/` is not covered by
 it (see Credits).
 
 ## Credits
 
 Built on [nirkt](https://github.com/nirkt)'s work: the battle host
 ([bulletlabels](https://github.com/nirkt/bulletlabels) @ `52184b2`) and the environment
-([nbrl-env](https://github.com/nirkt/nbrl-env) @ `7ff57bc`) in `deps/` are nirkt's code, redistributed here with
-nirkt's permission and under nirkt's terms (not this project's licence), with this project's changes from `host/*.patch`
+([nbrl-env](https://github.com/nirkt/nbrl-env) @ `7ff57bc`) in `engine/` are nirkt's code, redistributed here with
+nirkt's permission and under nirkt's terms (not this project's licence), with this project's changes from `engine/patches/`
 applied.

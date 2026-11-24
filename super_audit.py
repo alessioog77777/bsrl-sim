@@ -43,7 +43,7 @@ DIST_MIN, DIST_MAX = 450, (CORR - 1) * TILE
 MOVE_MIN, PUSH_MIN, HEAL_MIN = 300, 100, 100   # units / units / HP: above walk jitter, setup rounding and regen ticks
 FILLER = "ShotgunGirl"                   # target-only slot filler when a battle has fewer than 10 brawlers to audit
 CLASSES = ("works", "partial", "unverified", "no_effect", "not_fired", "crash")   # best first
-P2, C2, J2, I2, HDR = 8, 23, 18, 12, 8   # state2 row sizes (deps/nbrl-env/py/state2.py)
+P2, C2, J2, I2, HDR = 8, 23, 18, 12, 8   # state2 row sizes (engine/py/state2.py)
 BOX_IDS = {16000120}
 
 

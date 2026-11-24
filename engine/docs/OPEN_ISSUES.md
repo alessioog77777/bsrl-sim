@@ -9,7 +9,7 @@ forward, a quirk of the simulator"). Labels are not affected (they come from the
 realistic and a model trained on them may learn "brawlers face down".
 
 What is known:
-* the player actions reach the game SIMULATION directly (`vendor/nbpc/instance.py` `step(actions=...)` -> game host `env.c`), not
+* the player actions reach the game SIMULATION directly (`py/nbpc/instance.py` `step(actions=...)` -> game host `env.c`), not
   through the client's touch input; `POSECAP_IDLE_LOCAL=1` routes the local player's input through the client instead (wall-clock
   timing, not repeatable) - untested for facing;
 * other players (bots) face forward too, so it is not only the local player's client-side prediction;
