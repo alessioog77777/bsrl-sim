@@ -9,6 +9,109 @@ vision models without retraining.
 The battles run in **nirkt's** battle host and environment, included under `deps/` (see Credits). `setup.sh` builds
 everything. Game files are not included: you supply them.
 
+## How it works
+
+### One decision
+
+The policy acts 10 times a second. About once a second the rule planner reads the same observation and picks an
+intent (or none = free play), with a readable reason. The intent goes into the observation's intent block.
+
+```mermaid
+flowchart LR
+    H["Game host<br/>nirkt's sim, many instances"] -->|"observation vec + state dump"| O
+    subgraph O["Observation (OBS v5.6)"]
+        direction TB
+        S["self · 8<br/>hp, ammo, super ready, bush, velocity"]
+        C["cond · 30<br/>my brawler's stats + 12 play-style sliders"]
+        I["intent · 11<br/>kind, target, radius, time left"]
+        E["entity rows · 64 × 36<br/>class, position, hp, velocity, area radius / kind,<br/>enemy brawler stats + known, wall / water between"]
+        G["grid · 25 × 25<br/>live tiles"]
+    end
+    O -->|"about 1 per second"| PL["Rule planner<br/>12 rules, first match wins<br/>intent + reason"]
+    PL -->|"intent"| I
+    O -->|"10 per second"| P["Policy<br/>encoders → GRU<br/>move · aim · attack · super"]
+    P --> A["Actions"] -->|"next step"| H
+    P -.->|"training only"| X["critic (true state)<br/>live value head<br/>aux: enemy position in 1 s, hit, gas, bush"]
+```
+
+### Training loop
+
+```mermaid
+flowchart LR
+    W["Collection workers<br/>(train_fast)"] -->|"rollouts"| B["Buffer"]
+    B --> U["PPO update<br/>+ KL anchor, aux loss"]
+    U -->|"new weights"| W
+    R["Reward<br/>placement, damage, survival<br/>+ slider terms × --slider-scale<br/>+ intent following (i_rew, ≤ 0.15)"] --> B
+    U -->|"frozen copy"| EV["Evals vs native AI<br/>presets · 7 hard scenarios ·<br/>planner vs free play"]
+    EV --> SC["scorecard.py"]
+    U --> V["viz.html dashboard<br/>charts + replays with planner reasons"]
+```
+
+Each training battle splits its agents: some follow planner intents (`--p-plan`), some random valid intents
+(`--p-rand-intent`), the rest play free. Evals and hard scenarios always play with intent none, so their results stay
+comparable across runs.
+
+### Planner rules, in priority order
+
+```mermaid
+flowchart TD
+    T(["planner tick"]) --> R1{"gas within 2 tiles?"}
+    R1 -- yes --> A1["move out of the gas"]
+    R1 -- no --> R2{"low hp and an enemy<br/>within its reach?"}
+    R2 -- yes --> A2["disengage: bush or away"]
+    R2 -- no --> R3{"known thrower behind a wall?"}
+    R3 -- yes --> A3["engage it or leave its range"]
+    R3 -- no --> R4{"known short-range enemy close,<br/>I outrange it?"}
+    R4 -- yes --> A4["keep my distance"]
+    R4 -- no --> R5{"two enemies fighting nearby?"}
+    R5 -- yes --> A5["third-party the low one or go away"]
+    R5 -- no --> R6{"2 teams left, gas in view?"}
+    R6 -- yes --> A6["hold the gas edge"]
+    R6 -- no --> R7{"mate too far?"}
+    R7 -- yes --> A7["regroup"]
+    R7 -- no --> R8{"weaker enemy, or one in range?"}
+    R8 -- yes --> A8["engage"]
+    R8 -- no --> R9{"cube or safe box?"}
+    R9 -- yes --> A9["farm"]
+    R9 -- no --> R10{"bush camper, no enemy?"}
+    R10 -- yes --> A10["hide in a bush"]
+    R10 -- no --> R11{"map edge in view?"}
+    R11 -- yes --> A11["explore away from it"]
+    R11 -- no --> A12["none: free play"]
+```
+
+Thresholds come from the sliders. Rules 3 and 4 need the enemy's brawler and skip enemies that were not identified.
+Example reasons: `Undertaker (melee, range 3) 4 tiles E: keeping my distance W`,
+`hp 30 %, Gunslinger 9 tiles N (reach 11 tiles): disengaging S`. A higher rule can replace a held intent early.
+
+How often each rule fires (31,053 planner calls, 5-minute live check, noisy observations, 0.65 ms per call):
+
+```mermaid
+xychart-beta
+    title "Share of planner calls per rule (%)"
+    x-axis ["none", "farm", "endgame", "gas", "regroup", "hide", "engage", "explore", "low hp", "keep away", "fight", "thrower wall"]
+    y-axis "% of calls" 0 --> 30
+    bar [28.9, 21.4, 10.3, 9.8, 9.6, 6.1, 5.4, 4.1, 3.0, 0.6, 0.4, 0.1]
+```
+
+### Entity row (36 columns)
+
+| Columns | Content | Since |
+|---|---|---|
+| 0-19 | present, class, dx / dy, hp, velocity, area radius / harms / helps / slows me | v5.3 |
+| 20-32 | the row's brawler stats (range, speed, reload, projectile speed, spread, bullets, thrown, melee, hp, super type, super range); a projectile carries its owner's | v5.6 |
+| 33 | brawler known (unknown = 13 zeros + 0) | v5.6 |
+| 34-35 | wall between us, water between us (on the noisy grid) | v5.6 |
+
+### Observation versions
+
+| Version | Change | Old checkpoints |
+|---|---|---|
+| v5.3 | live map tiles, area-effect radius and kind, cubes held | zero-padded, act the same |
+| v5.4 | sliders: aggressive replaces push; leash and gas_safe added (cond 28 → 30) | zero-padded, act the same |
+| v5.5 | intent block (11) at the tail of self | zero-padded, act the same |
+| v5.6 | enemy brawler identity and line of sight (entity rows 20 → 36) | zero-padded, act the same |
+
 ## What is here
 
 | File | What it does |
