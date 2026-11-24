@@ -8,10 +8,18 @@ native AI in solo / duo / trio battles (one boot, every agent native-controlled 
      (items.csv BattleRoyaleBuff, 18000009) near where it fell: libg's own death drop, fed the cubes held (env.c
      sd_mirror_cubes). A respawning brawler that goes out with its team's wipe has no body and drops nothing.
   3. protection: a respawned brawler comes back with spawn protection (state2 chars spawnProt, character +0x431).
+  4. storm (host log, NB_SD_DBG=1): every storm hit's percent of max HP follows gas_pct (Trio ramps after 1 s, Solo / Duo
+     after 5 s); heals inside the gas are halved (env.c gas_tick; logged as heal cuts).
+  5. --mods 3,5 (event_modifiers.csv Meteors, HealingMushrooms; showdown_mods.c through NB_SD_MODIFIERS): each meteor hit
+     takes 2000 HP (or the rest, or nothing while protected), one meteor at a time with its 3 s circle, and each mushroom
+     heal adds at most 1000 HP.
+  The WallSpawn shape (spawnfix.c, tiles closer than the area's Radius) is checked here on paper (wall_shape) and live by
+  `NB_SPAWNFIX_DBG=1 python -m super_audit --only Wally` ("wall shape ... N tiles").
 
 python -m showdown_check --check                   # the bookkeeping rules on made-up responses (no host)
-python -m showdown_check --n 2 --minutes 10        # live (boots the host)"""
-import argparse, collections, sys, time, numpy as np
+python -m showdown_check --n 2 --minutes 10        # live (boots the host)
+python -m showdown_check --n 2 --minutes 6 --mods 3,5   # live with meteors and healing mushrooms"""
+import argparse, collections, os, re, sys, time, numpy as np
 
 CUBE_ITEM = 18000009
 DROP_R = 1300         # cube items counted within this of where the brawler fell (spawner 0xb55b74: up to 1200 u in its last fallback)
@@ -43,6 +51,58 @@ def new_cubes(items, seen, x, y, r=DROP_R):
     return n
 
 
+def gas_pct(secs, team_size=1):
+    """storm hit, % of max HP (env.c gas_tick, one hit per second): 20, +5 per second after the ramp start, which is 5 s in
+    Solo / Duo and 1 s in Trio (#22 comment: wiki and patch notes)"""
+    ramp = 1 if team_size >= 3 else 5
+    return 20 + max(0.0, secs - ramp) * 5
+
+
+def wall_shape(radius):
+    """WallSpawn tiles (dx, dy) around the area's tile (spawnfix.c in_shape): tile centres closer than Radius"""
+    k = radius // 300 + 1
+    return {(dx, dy) for dx in range(-k, k + 1) for dy in range(-k, k + 1) if 90000 * (dx * dx + dy * dy) < radius * radius}
+
+
+MET_DMG, MET_WARN, MET_GAP_MIN, MUSH_HEAL = 2000, 60, 60, 1000   # showdown_mods.c
+
+
+def parse_log(lines):
+    """host log lines -> counters and the rule violations (storm hits, meteors, mushrooms) of the rules above"""
+    S = collections.Counter(); bad = []; last_impact = None
+    for ln in lines:
+        m = re.search(r"\[gas\] hit player \d+ group (\d+) tick \d+ secs ([\d.]+) pct ([\d.]+)", ln)
+        if m:
+            g, secs, pct = int(m[1]), float(m[2]), float(m[3]); S["gas hits g%d" % g] += 1
+            if abs(pct - gas_pct(secs, g)) > 0.11: bad.append(ln.strip())
+            if g >= 3 and secs > 1: S["trio ramped"] += 1
+            continue
+        if "[gas] heal cut" in ln: S["heal cuts"] += 1; continue
+        if "[sdmod] battle start" in ln: last_impact = None; continue
+        m = re.search(r"\[sdmod\] meteor hit ch \d+ hp (-?\d+) -> (-?\d+)", ln)
+        if m:
+            a, b = int(m[1]), int(m[2]); S["meteor hits"] += 1
+            # exact 2000, the rest, nothing (protected), or back to full hp (a grouped brawler knocked out into respawn,
+            # env.c); anything else is a victim's damage modifier (shield, damage reduce / received boost in my_root)
+            S["meteor " + ("exact" if b == a - MET_DMG else "lethal" if b <= 0 else "protected" if b == a else
+                           "knocked out" if b > a else "status-modified")] += 1
+            continue
+        m = re.search(r"\[sdmod\] meteor impact tick (\d+)", ln)
+        if m:
+            t = int(m[1]); S["meteors"] += 1
+            if last_impact is not None and t - last_impact < MET_WARN + MET_GAP_MIN: bad.append(ln.strip())
+            last_impact = t; continue
+        m = re.search(r"\[sdmod\] mushroom heal ch \d+ hp (-?\d+) -> (-?\d+)", ln)
+        if m:
+            a, b = int(m[1]), int(m[2]); S["mushroom heals"] += 1
+            if not 0 <= b - a <= MUSH_HEAL: bad.append(ln.strip())
+            continue
+        if "[sdmod] mushroom tick" in ln: S["mushrooms"] += 1
+    if S["meteor status-modified"] > 0.05 * max(1, S["meteor hits"]): bad.append("meteor hits off 2000 without a reason: %d of %d"
+                                                                             % (S["meteor status-modified"], S["meteor hits"]))
+    return S, bad
+
+
 def selfcheck():
     from types import SimpleNamespace as NS
     g = [1, 1, 2, 2, 3, 3, 0, 0, 4, 4]
@@ -57,12 +117,30 @@ def selfcheck():
              {"id": 3, "dataId": 18000000, "x": 100, "y": 100}]
     seen = set(); assert new_cubes(items, seen, 0, 0) == 1 and new_cubes(items, seen, 0, 0) == 0 and seen == {1}
     assert [drop_count(k) for k in (0, 2, 3, 14, 30)] == [1, 1, 2, 5, 5] and drop_count(9, 3) == 2
+    assert gas_pct(3, 1) == 20 and gas_pct(7, 2) == 30 and gas_pct(3, 3) == 30 and gas_pct(0, 3) == 20
+    assert wall_shape(600) == {(x, y) for x in (-1, 0, 1) for y in (-1, 0, 1)}          # Rosa's Grow Light: 3x3 (wiki)
+    assert wall_shape(400) == {(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)} and wall_shape(100) == {(0, 0)}
+    assert len(wall_shape(500)) == 9
+    S, bad = parse_log(["[gas] hit player 2 group 3 tick 900 secs 3.00 pct 30.0 max 6000 dmg 1800",
+                        "[gas] hit player 0 group 1 tick 900 secs 3.00 pct 20.0 max 6000 dmg 1200",
+                        "[sdmod] meteor impact tick 700 at 1,2: 1 hit", "[sdmod] meteor hit ch 5 hp 5000 -> 3000",
+                        "[sdmod] meteor hit ch 6 hp 1500 -> 0", "[sdmod] meteor impact tick 820 at 1,2: 0 hit",
+                        "[sdmod] mushroom heal ch 5 hp 3000 -> 4000"])
+    assert not bad and S["meteors"] == 2 and S["meteor hits"] == 2 and S["trio ramped"] == 1, (S, bad)
+    S, bad = parse_log(["[gas] hit player 2 group 3 tick 900 secs 3.00 pct 20.0 max 6000 dmg 1200",
+                        "[sdmod] meteor hit ch 5 hp 5000 -> 4000", "[sdmod] mushroom heal ch 5 hp 3000 -> 4500",
+                        "[sdmod] meteor impact tick 700 at 1,2: 1 hit", "[sdmod] meteor impact tick 760 at 1,2: 1 hit"])
+    assert len(bad) == 4 and S["meteor status-modified"] == 1, bad
+    S, bad = parse_log(["[sdmod] meteor hit ch 5 hp 1500 -> 7800"] * 30 + ["[sdmod] meteor hit ch 5 hp 5000 -> 4400"])
+    assert not bad and S["meteor knocked out"] == 30, (S, bad)
     print("showdown_check ok")
 
 
 def live(a):
     import env_v5 as E, state2 as S2
     ST = collections.Counter(); MISS = collections.Counter(); ENDS = []; DROPS = []; PROT = []
+    os.environ["NB_SD_DBG"] = "1"                                   # the host logs storm hits / events (checks 4, 5)
+    if a.mods: os.environ["NB_SD_MODIFIERS"] = a.mods
 
     class T(E.Env):
         def _start_battle(self, i, r):
@@ -107,6 +185,8 @@ def live(a):
     def battle_fn(rng, i):
         cfg = bf(rng, i); cfg["native_ctl"] = True; return cfg
     env = T(a.n, battle_fn, ticks=2, fair=True, max_ticks=a.max_ticks, want_state=True)
+    logs = {s.inst.log_path: 0 for s in env.I}
+    logs = {p: os.path.getsize(p) if os.path.exists(p) else 0 for p in logs}   # read only what this run writes
     rng = np.random.default_rng(a.seed); t0 = None
     try:
         while t0 is None or time.time() - t0 < a.minutes * 60:
@@ -126,6 +206,15 @@ def live(a):
     print("cube drops: %d falls, %d with the expected count; (held, seen, team size) %s" % (len(DROPS), ok_drop, collections.Counter(DROPS).most_common(10)))
     print("misses (fall, at the end, held, seen):", MISS.most_common(12))
     print("respawn protection flags:", collections.Counter(PROT), "| restarts", env.stats["restarts"])
+    lines = []
+    for p, off in logs.items():
+        with open(p, errors="replace") as f: f.seek(off); lines += f.readlines()
+    LS, bad = parse_log(lines)
+    print("storm and events (host log):", dict(LS), "| rule misses %d" % len(bad), bad[:5])
+    assert not bad, "storm / event rule misses"
+    assert sum(v for k, v in LS.items() if k.startswith("gas hits")), "no storm hit logged"
+    if a.mods and "3" in a.mods.split(","): assert LS["meteors"] and LS["meteor hits"], "no meteor fell or hit"
+    if a.mods and "5" in a.mods.split(","): assert LS["mushrooms"] and LS["mushroom heals"], "no mushroom healed"
     assert ENDS and all(e[3] <= 1 for e in ENDS), "a battle ended with more than one team left"
     assert all(e[1] - e[2] <= 4 for e in ENDS if e[2] is not None), "the end lags the last team"
     assert all(e[5] for e in ENDS if e[0] > 1 and e[3] == 1), "winner not on the last team"
@@ -140,5 +229,6 @@ if __name__ == "__main__":
     ap.add_argument("--n", type=int, default=2); ap.add_argument("--minutes", type=float, default=10)
     ap.add_argument("--p-team", type=float, default=0.75); ap.add_argument("--max-ticks", type=int, default=6000)
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--mods", default="", help="event modifier ids for the host (NB_SD_MODIFIERS), e.g. 3,5")
     a = ap.parse_args()
     selfcheck() if a.check else live(a)

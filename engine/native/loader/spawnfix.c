@@ -48,7 +48,7 @@ static void *g_mapview;
 static void on_mapview(uint64_t *c) { g_mapview = (void *)c[0]; }
 static long g_nwall_areas, g_nwall_tiles; static int g_last_ring[2] = {-1, -1};
 static int cell_id(uint8_t *tm, int x, int y) { if (!tm) return -1; uint8_t **c = (uint8_t **)PTR(tm, 0x20); uint8_t *ce = c ? c[y * I32(tm, 0xc4) + x] : NULL; return ce ? tile_id(PTR(ce, 0)) : -2; }
-void spawnfix_walldiag(const char *why) { if (g_last_ring[0] < 0 || !g_spawn_dbg) return; uint8_t *ts = g_sim ? PTR(g_sim, 0x68) : NULL, *tc = g_client_obj ? PTR(g_client_obj, 0xf8) : NULL; LOG("[spawnfix] walldiag %s tick %d: ring tile (%d,%d) sim %d client %d; (%d,%d) sim %d client %d dynlist sim %d client %d\\n", why, g_sim ? I32(g_sim, 0x10) : -1, g_last_ring[0] + 2, g_last_ring[1], cell_id(ts, g_last_ring[0] + 2, g_last_ring[1]), cell_id(tc, g_last_ring[0] + 2, g_last_ring[1]), g_last_ring[0] + 2, g_last_ring[1] + 1, cell_id(ts, g_last_ring[0] + 2, g_last_ring[1] + 1), cell_id(tc, g_last_ring[0] + 2, g_last_ring[1] + 1), ts ? I32(ts, 0x34) : -1, tc ? I32(tc, 0x34) : -1); }
+void spawnfix_walldiag(const char *why) { if (g_last_ring[0] < 0 || !g_spawn_dbg) return; uint8_t *ts = g_sim ? PTR(g_sim, 0x68) : NULL, *tc = g_client_obj ? PTR(g_client_obj, 0xf8) : NULL; LOG("[spawnfix] walldiag %s tick %d: shape tile (%d,%d) sim %d client %d; (%d,%d) sim %d client %d dynlist sim %d client %d\\n", why, g_sim ? I32(g_sim, 0x10) : -1, g_last_ring[0] + 1, g_last_ring[1], cell_id(ts, g_last_ring[0] + 1, g_last_ring[1]), cell_id(tc, g_last_ring[0] + 1, g_last_ring[1]), g_last_ring[0] + 1, g_last_ring[1] + 1, cell_id(ts, g_last_ring[0] + 1, g_last_ring[1] + 1), cell_id(tc, g_last_ring[0] + 1, g_last_ring[1] + 1), ts ? I32(ts, 0x34) : -1, tc ? I32(tc, 0x34) : -1); }
 static void *tile_by_code(int code) { return ((void *(*)(int))B(0xa50dec))(code); }
 static int tile_id(void *d) { return d ? I32(d, 0x20) : 0; }
 static int place_one(uint8_t *tm, void *data, int x, int y) {
@@ -74,19 +74,33 @@ static int wall_code_for(uint8_t *pr) {
 }
 /* The walls go again by themselves: the setter puts them on the tile map's dynamic list, and the game removes them after
  * the tile's Lifetime (tiles.csv: 200 ticks for every Wally* wall). Sprout audit, issue #21: 13 of 13 ring tiles open
- * again between placed + 199 and + 220. */
+ * again between placed + 199 and + 220.
+ * Shape (issue #21): every tile whose centre is closer than the area's Radius (+0x12c) to the centre of the area's tile.
+ * The one size with a published shape agrees: Rosa's Grow Light (BushGrowArea, Radius 600) grows a 3x3 of bushes (wiki).
+ * Sprout's WallyUltiArea (Radius 400) gives a plus of 5 tiles. [?] the server's rule is not in the client; the earlier
+ * ring 2 tiles out was a guess too. Tiles with all 4 neighbours in the shape get the Filler wall (code + 1), the rest the
+ * wall (both block alike; [?] which one the game draws where is a guess).
+ * Bush-grow areas (BushGrowArea, MutantBushGrowArea, TankBushGrowArea(Large): area_effects_skin rows 314, 692, 1024, 1025,
+ * the only skin rows whose Logic is one of them) grow ExtraBush (DynamicCode 3, no Lifetime: Rosa's bushes stay until
+ * destroyed) instead of the default wall code 1. */
+#define AREA_BUSH_CODE 3
+static int bush_area(uint8_t *d) {
+    int id = I32(d, 0x20);   /* the area's data id = its area_effects_skin row (17000292 logged for Sprout's WallyUltiArea) */
+    return id == 17000314 || id == 17000692 || id == 17001024 || id == 17001025;
+}
+static int in_shape(int dx, int dy, int r) { return 300L * 300 * (dx * dx + dy * dy) < (long)r * r; }
 static void wall_ring(uint8_t *a, uint8_t *d) {
     uint8_t *pr = (g_cur_proj && g_cur_tick == (g_sim ? I32(g_sim, 0x10) : -1)) ? (uint8_t *)g_cur_proj : NULL;
-    int code = wall_code_for(pr);
-    void *wall = tile_by_code(code), *fill = tile_by_code(code + 1);
-    int cx = I32(a, 0x38) / 300, cy = I32(a, 0x3c) / 300, n = 0;
+    int bush = bush_area(d), code = bush ? AREA_BUSH_CODE : wall_code_for(pr), r = I32(d, 0x12c);
+    if (r <= 0 || r > 3000) r = 400;    /* WallyUltiArea's Radius */
+    void *wall = tile_by_code(code), *fill = bush ? wall : tile_by_code(code + 1);
+    int cx = I32(a, 0x38) / 300, cy = I32(a, 0x3c) / 300, n = 0, k = r / 300 + 1;
     uint8_t *tm_sim = g_sim ? PTR(g_sim, 0x68) : NULL, *tm_cl = g_client_obj ? PTR(g_client_obj, 0xf8) : NULL;
     g_nwall_areas++;
-    for (int dy = -2; dy <= 2; dy++) for (int dx = -2; dx <= 2; dx++) {
-        int ring = (dx < 0 ? -dx : dx) > (dy < 0 ? -dy : dy) ? (dx < 0 ? -dx : dx) : (dy < 0 ? -dy : dy);
-        if (ring != 2) continue;
-        int corner = (dx == 2 || dx == -2) && (dy == 2 || dy == -2);
-        void *td = corner ? fill : wall;
+    for (int dy = -k; dy <= k; dy++) for (int dx = -k; dx <= k; dx++) {
+        if (!in_shape(dx, dy, r)) continue;
+        int inner = in_shape(dx + 1, dy, r) && in_shape(dx - 1, dy, r) && in_shape(dx, dy + 1, r) && in_shape(dx, dy - 1, r);
+        void *td = inner ? fill : wall;
         if (!td) continue;
         int ok = place_one(tm_sim, td, cx + dx, cy + dy);
         if (ok && tm_cl && tm_cl != tm_sim) place_one_force(tm_cl, td, cx + dx, cy + dy);
@@ -95,7 +109,7 @@ static void wall_ring(uint8_t *a, uint8_t *d) {
     }
     g_nwall_tiles += n; g_last_ring[0] = cx; g_last_ring[1] = cy;
     spawnfix_walldiag("placed");
-    if (g_spawn_dbg) LOG("[spawnfix] wall ring at tile %d,%d code %d: %d tiles (sim tm %p, client tm %p, mapview %p)\n", cx, cy, code, n, tm_sim, tm_cl, g_mapview);
+    if (g_spawn_dbg) LOG("[spawnfix] wall shape at tile %d,%d area %d radius %d code %d: %d tiles (sim tm %p, client tm %p, mapview %p)\n", cx, cy, I32(d, 0x20), r, code, n, tm_sim, tm_cl, g_mapview);
 }
 
 /* ---- items (BulletExplosionItem +0x80 / SpawnItem +0x110 of the area data): the item factory 0xb55684 is the one the
