@@ -33,7 +33,9 @@ def ready(s):
 
 def effect_dash(a, b): d = float(np.hypot(b["x"] - a["x"], b["y"] - a["y"])); return d >= DASH_MIN, "moved %.0f" % d
 def effect_heal(a, b): return b["hp"] > a["hp"], "hp %d -> %d" % (a["hp"], b["hp"])
-EFFECT = {"DASH": effect_dash, "HEAL": effect_heal}   # by GAD_* name; add one with each kind gadget.c implements
+def effect_spawn(a, b):   # an area at the brawler (gadget.c AREA): not in NbeResp; its effects: `super_audit --gadget`
+    return True, "use spent (area: super_audit --gadget)"
+EFFECT = {"DASH": effect_dash, "HEAL": effect_heal, "SPAWN": effect_spawn}   # by GAD_* name; add one with each kind gadget.c implements
 WANT = {"HEAL": lambda s: s["hp"] < 0.9 * s["max_hp"]}   # judged only when the effect can show (a heal needs missing hp)
 
 
@@ -76,7 +78,8 @@ def _check():
     assert judge(s(kind=P.GAD_HEAL), s(kind=P.GAD_HEAL, charges=2, used=1, cd=9)) == []
     assert effect(s(kind=P.GAD_HEAL), s(hp=3500))[0] and not effect(s(kind=P.GAD_HEAL), s(hp=2900))[0]
     assert not WANT["HEAL"](s(hp=4000)) and WANT["HEAL"](s(hp=3000))                    # fired at full hp: nothing to show
-    assert judge(s(kind=P.GAD_SPAWN), s(kind=P.GAD_SPAWN, charges=2, used=1, cd=9))[0].startswith("no effect test")
+    assert judge(s(kind=P.GAD_SPAWN), s(kind=P.GAD_SPAWN, charges=2, used=1, cd=9)) == []
+    assert judge(s(kind=P.GAD_PROJECTILE), s(kind=P.GAD_PROJECTILE, charges=2, used=1, cd=9))[0].startswith("no effect test")
     assert judge(s(cd=5), s(cd=4)) == [] and judge(s(cd=5), s(cd=4, used=1)) == ["not ready, yet a use was spent"]
     assert judge(s(kind=P.GAD_NONE, charges=0), s(kind=P.GAD_NONE, charges=0)) == []
     print("gadget_check self-check ok")
