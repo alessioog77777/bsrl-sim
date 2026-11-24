@@ -16,6 +16,14 @@ What changes (HISTORY 69):
   weights, so the PPO ratio covers it). Evals and checkpoints are only started between updates in this mode.
 Statistically the same algorithm, not bit-identical: every worker has its own battle / noise RNG streams, the rows
 of one forward come from whichever instances were ready, and actions are sampled by Gumbel-max (fast_act.sample).
+Non-acting heads (--vlive, --aux-w): as train_ppo (its helpers: targets / readouts in prepare(), losses in train()); the
+aux labels (env_v5.Env.aux_now) are computed in the workers next to priv and reach the main process in a second shared
+memory block; the replay readout (train_ppo.aux_readout of the recorded row) goes back with the actions.
+Intents (--intent-scale > 0, --p-plan, --eval-plan: train_ppo's flags): env_v5.Env.intents (and the rule planner) runs in
+the workers (train_ppo.policy_s, after the observation build), so the block reaches the main process inside s and both
+trainers share one implementation; the planner's reasons go into the worker's replay frames.
+Hard scenarios (--eval-scenarios): every worker records its scenario episodes (scenarios.Recorder) and sends their
+index entries; the main process writes replays/scn/index.json and, at the eval's end, scenarios.jsonl.
 progress.jsonl: all train_ppo fields; t_poll_build_act_rest = [main waiting for workers, build per worker (mean),
 act, rest] (workers run in parallel, so they no longer add up to the collect time) + "t_fast" (more timers) and
 "wall_dps" (learner decisions per wall second incl. the update).
@@ -43,6 +51,8 @@ def parse(argv=None):
     ap.add_argument("--kmix", default="1,2,3,4,5"); ap.add_argument("--brawler", default="Sniper", help="Sniper = Piper")
     ap.add_argument("--loc", default=None, help="Showdown location (default: the first of env_v5.locations())")
     ap.add_argument("--slider-scale", type=float, default=0.0, help="weight of the slider rewards (stage 1: off)")
+    from train_ppo import slider_flags, head_flags, scenario_flags, intent_flags
+    slider_flags(ap); head_flags(ap); scenario_flags(ap); intent_flags(ap)   # sliders; --vlive / --aux-w; --eval-scenarios; --intent-scale
     ap.add_argument("--reward-w", default="", help='JSON overrides of maenv.REWARD_W, e.g. {"taken": -0.25, "dealt": 0.3, "shots": -0.03} (HISTORY 77)')
     ap.add_argument("--noise", type=int, default=1, help="ObsV5 vision noise + latency")
     ap.add_argument("--eval-min", type=float, default=30.0); ap.add_argument("--eval-episodes", type=int, default=200)
@@ -72,20 +82,20 @@ def parse(argv=None):
     ap.add_argument("--gen", type=int, default=0, help="1 = instances boot generated layouts (env_v5.use_genmaps), played with --p-gen")
     ap.add_argument("--p-gen", type=float, default=0.5)
     a = ap.parse_args(argv)
-    if a.smoke: a.n, a.rollout, a.chunks, a.bc_updates, a.eval_episodes, a.evalb_episodes, a.hours = a.smoke_n, 2048, 64, 1, 4, 4, 0.2
+    if a.smoke: a.n, a.rollout, a.chunks, a.bc_updates, a.eval_episodes, a.evalb_episodes, a.hours, a.scenario_seeds = a.smoke_n, 2048, 64, 1, 4, 4, 0.2, 1
     a.workers = max(1, min(a.n, a.workers or (a.n + 1) // 2))
     return a
 
 
 # ------------------------------------------------------------------------------------------------ worker process
-def worker(w, lo, hi, a, loc, out, conn, shm, init):
+def worker(w, lo, hi, a, loc, out, conn, shm, init, ashm=None):
     """instances lo..hi-1 of the run (local index i = global lo + i). Loop: poll -> build -> rows into shm -> message ->
     wait for actions (+ control state) -> send. Never touches torch / CUDA."""
     signal.signal(signal.SIGTERM, signal.SIG_IGN); signal.signal(signal.SIGINT, signal.SIG_IGN)   # the main process stops us
     try:
         from nbpc import diversity as D
-        import env_v5 as E, obs_v5 as O, fast_obs as FO
-        from train_ppo import Recorder
+        import env_v5 as E, obs_v5 as O, fast_obs as FO, scenarios as SC
+        from train_ppo import Recorder, eval_tag, eval_intent, TR_X, policy_s, set_intents
         from fast_act import OBS_W, _OFF
         st = dict(init); evq = []; rng_b = np.random.default_rng(a.seed + 7 + 1000 * w)
         kmix = [int(x) for x in a.kmix.split(",")]; M = a.opp_slots; NW = a.workers
@@ -111,10 +121,11 @@ def worker(w, lo, hi, a, loc, out, conn, shm, init):
             tag = {"loc": locs[0], "chr": [a.brawler] * 10, "team_size": 1, "groups": [0] * 10}
             cfg = {"div": D.make_div(location=tag["loc"], chr=tag["chr"]), "tag": tag, "end": "agents"}
             if evq and not bc and i >= a.n - a.eval_n:   # evals stay on --brawler / the first location (comparable numbers)
-                sd, kd = evq.pop(0); b = kd == "evalb"
+                sd, kd, pre = evq.pop(0); b = kd == "evalb"
+                if kd == "evalscn": return SC.battle_cfg(pre)   # hard scenario (its own map / brawlers / teams)
                 if a.eval_team > 1: cfg = teams(cfg, tag, a.eval_team); tag = cfg["tag"]
                 return {**cfg, "seed": sd, "ctl": list(range(10)) if b else [0], "end": "player0",
-                        "tag": {**tag, "kind": kd, "opp": list(range(1, 10)) if b else []}}
+                        "tag": {**tag, "kind": kd, "opp": list(range(1, 10)) if b else [], "intent": eval_intent(kd), **eval_tag(a, pre)}}   # free play (evalp_plan: planner)
             if roster or len(locs) > 1 or gen:           # A3: random brawlers / map per training battle
                 g = gen.get(li) if li in gen and rng_b.random() < a.p_gen else None
                 lc = E.GEN_BASE if g else locs[int(rng_b.integers(len(locs)))]
@@ -148,39 +159,45 @@ def worker(w, lo, hi, a, loc, out, conn, shm, init):
 
         E.Env.slider_scale = a.slider_scale; E.Env.record = st["record"]
         E.Env.cube_k, E.Env.cube_gamma = a.cube_shaping, a.gamma
+        E.Env.slider_sample, E.Env.slider_norm = a.slider_sample, E.slider_norm(a.slider_norm); set_intents(a)
         env = WEnv(hi - lo, battle_fn, ticks=2, fair=True, max_ticks=a.max_ticks, verbose=True, seed=a.seed + 1000 * w, tag="pf%d_%d" % (os.getpid(), w),
                    reward_w=json.loads(a.reward_w) if a.reward_w else None)
         ob = FO.FastObsV5(noise=O.NOISE if a.noise else None, seed=a.seed + 1000 * w)
         rec = Recorder(out) if lo == 0 else None
+        srec = SC.Recorder(out) if a.eval_scenarios else None   # every scenario episode of this worker's instances
         X = np.frombuffer(shm, np.float32).reshape(-1, OBS_W); n_ep = 0; tw = np.zeros(4)   # poll / build / wait for main / messages
+        XA = np.frombuffer(ashm, np.float32).reshape(-1, E.AUX_W) if a.aux_w else None     # --aux-w: aux label rows
         while True:
             t0 = time.perf_counter()
             obs, ids, tr = env.poll(min_ready=min(a.min_ready or (hi - lo), hi - lo), max_wait=a.max_wait)
             t1 = time.perf_counter(); B = len(ids); msg = {"B": B}
             if B:
-                o = ob.build(obs["vec"], obs["grid"], env.last_meta, ids, cmd=env.cmd_vel(ids) if a.cmd_vel else None)
-                X[:B, :_OFF[1]] = np.concatenate([o["self"], env.cond(ids)], 1); X[:B, _OFF[1]:_OFF[2]] = o["ent"].reshape(B, -1)
+                o = ob.build(obs["vec"], obs["grid"], env.last_meta, ids, cmd=env.cmd_vel(ids) if a.cmd_vel else None, who=env.last_who)
+                X[:B, :_OFF[1]] = policy_s(env, ids, o); X[:B, _OFF[1]:_OFF[2]] = o["ent"].reshape(B, -1)   # s = self | cond | intent
                 X[:B, _OFF[2]:_OFF[3]] = o["grid"].reshape(B, -1); X[:B, _OFF[3]:_OFF[4]] = FO.priv_fast(env, ids)
                 kind = [t["kind"] for t in env.last_tags]; isev = np.char.startswith(np.array(kind), "eval")
                 opp = np.array([int(x) & 15 in t.get("opp", ()) for x, t in zip(ids, env.last_tags)], bool)
                 sl = np.array([t.get("slot", 0) for t in env.last_tags])
                 grp = np.where(~isev & ~opp, 0, np.where(isev & ~opp, 1, np.where(isev & opp, 2, 3 + sl)))   # learner / eval copy / base / league slot
                 msg.update(ids=ids, grp=grp.astype(np.int8), isbc=np.array([k == "bc" for k in kind]), dead=env.dead(ids))
+                if XA is not None: XA[:B] = env.aux_now(ids); msg["rec"] = rec.row(env, ids) if rec is not None else None
             tw[0] += t1 - t0; tw[1] += time.perf_counter() - t1
-            msg["tr"] = [(aid, rew, done, t.get("_act")) for (aid, rew, done, t, rank) in tr]
+            msg["tr"] = [(aid, rew, done, t.get("_act"), {k: t[k] for k in TR_X if k in t}) for (aid, rew, done, t, rank) in tr]
             msg["dropped"] = env.dropped; env.dropped = []
             msg["eps"] = env.episodes[n_ep:]; n_ep = len(env.episodes)
+            if srec is not None: msg["scn_rep"] = [srec.finish(r) for r in msg["eps"] if r.get("scn")]   # the main writes the index
             msg["busy"] = len(evq) + sum(s.state != "idle" and (s.cfg or {}).get("tag", {}).get("kind", "").startswith("eval") for s in env.I)
             msg.update(ack=st["ver"], restarts=env.stats["restarts"], tw=tw.tolist())
             if len(env.episodes) > 4096: del env.episodes[:2048]; n_ep = len(env.episodes)   # sent already; the main keeps them
             t2 = time.perf_counter(); conn.send(msg); rep = conn.recv(); tw[2] += time.perf_counter() - t2; tw[3] += 1
             if rep is None: break
-            A, ctl = rep
+            A, ctl, xr = rep
             if ctl:
                 evq.extend(ctl.pop("eval", [])); st.update(ctl)
                 env.record = st["record"]
                 if rec is not None and st.pop("rec_want", False): rec.want = True
-            if rec is not None and B: rec.frame(env, ids, o, A, st["upd"])
+            if rec is not None and B: rec.frame(env, ids, o, A, st["upd"], x=xr)
+            if srec is not None and B: srec.frame(env, ids, o, A)
             env.send(ids if B else [], A if B else [])   # also steps ready instances whose agents had no observation
         env.close()
     except EOFError:
@@ -215,9 +232,11 @@ def main(argv=None):
     torch.manual_seed(a.seed); np.random.seed(a.seed)
     from nbpc.maenv import REWARD_W, TERMS
     import env_v5 as E, obs_v5 as O
-    from train_ppo import Buffer, chunks, eval_summary
+    from train_ppo import Buffer, chunks, eval_summary, eval_items, eval_presets, eval_plan, split_params, gae, expl_var, live_targets, head_loss
+    from train_ppo import aux_targets, aux_readout, scenario_items, scenario_eval, intent_stats, load_opt
+    import scenarios as SC
     from fast_act import StackedActor, OBS_W, _OFF
-    NS = O.N_SELF + O.N_COND
+    NS = O.N_S
     out = os.path.join(E.WORK, "runs", a.run); os.makedirs(out, exist_ok=True)
     loc = a.loc or E.locations()[0]
     json.dump({**vars(a), "loc": loc, "reward_w": {**REWARD_W, **(json.loads(a.reward_w) if a.reward_w else {})}, "trainer": "train_fast"}, open(os.path.join(out, "config.json"), "w"), indent=1)
@@ -236,24 +255,28 @@ def main(argv=None):
     lname = [os.path.basename(p) if p else None for p in lpath]
     bc = lambda: upd < a.bc_updates
     NWk = a.workers; cut = np.linspace(0, a.n, NWk + 1).round().astype(int)
-    ctx = mp.get_context("fork"); procs, conns, shms = [], [], []
+    ctx = mp.get_context("fork"); procs, conns, shms, ashms = [], [], [], []
     init = {"bc": bc(), "lname": list(lname), "upd": upd, "record": a.bc_updates > 0, "ver": 0}
     for w in range(NWk):
         shm = mmap.mmap(-1, max(1, (cut[w + 1] - cut[w]) * 10) * OBS_W * 4)     # anonymous shared: up to 10 agents per instance
+        ashm = mmap.mmap(-1, max(1, (cut[w + 1] - cut[w]) * 10) * E.AUX_W * 4) if a.aux_w else None   # aux labels, same rows
         pc, cc = ctx.Pipe()
-        p = ctx.Process(target=worker, args=(w, int(cut[w]), int(cut[w + 1]), a, loc, out, cc, shm, init), daemon=True)
+        p = ctx.Process(target=worker, args=(w, int(cut[w]), int(cut[w + 1]), a, loc, out, cc, shm, init, ashm), daemon=True)
         p.start(); cc.close(); procs.append(p); conns.append(pc); shms.append(np.frombuffer(shm, np.float32).reshape(-1, OBS_W))
+        ashms.append(np.frombuffer(ashm, np.float32).reshape(-1, E.AUX_W) if ashm is not None else None)
     # ---- GPU side (after the fork)
     from model import Policy, HID, masked_kl, dist_logp_ent
-    dev = torch.device("cuda")
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")   # CPU: plumbing checks (--smoke) only
     def frozen(sd):
         m = Policy().to(dev).eval(); m.load_state_dict(sd, strict=False); [p.requires_grad_(False) for p in m.parameters()]
         return m
-    net = Policy().to(dev); opt = torch.optim.Adam(net.parameters(), lr=a.bc_lr, eps=1e-5); ref = bnet = enet = None
+    net = Policy().to(dev); ref = bnet = enet = None; main_p, x_p = split_params(net)   # x_p: the heads that never act (own Adam)
+    opt = torch.optim.Adam(main_p, lr=a.bc_lr, eps=1e-5); opt_x = torch.optim.Adam(x_p, lr=a.bc_lr, eps=1e-5)
     if ck:
         net.load_state_dict(ck["model"], strict=False)
-        try: opt.load_state_dict(ck["opt"])
-        except ValueError: print("optimizer state not loaded (new parameters): fresh Adam", flush=True)
+        if ck.get("obs_version") != O.OBS_VERSION:   # older inputs: the new columns load zero-padded (model.load_state_dict), same actions
+            print("checkpoint obs %s, this code %s: new input columns zero-padded" % (ck.get("obs_version", "< v5.4"), O.OBS_VERSION), flush=True)
+        load_opt(opt, ck["opt"], net=net); load_opt(opt_x, ck.get("opt_x"), "optimizer state of the non-acting heads", net=net)
         if ck.get("ref"): ref = frozen(ck["ref"])
         bnet = frozen(torch.load(a.base, map_location="cpu", weights_only=False)["model"] if a.base else ck["model"])
     ck = None
@@ -275,20 +298,24 @@ def main(argv=None):
     buf = Buffer(a.rollout + 8192)
     pending, traj, final, hid = {}, {}, set(), {}
     epf = open(os.path.join(out, "episodes.jsonl"), "a"); evf = open(os.path.join(out, "evals.jsonl"), "a")
+    evepf = open(os.path.join(out, "eval_episodes.jsonl"), "a")   # the policy's (player 0) eval rows: scorecard.py eval / per-preset groups
     prf = open(os.path.join(out, "progress.jsonl"), "a")
+    scf = open(os.path.join(out, "scenarios.jsonl"), "a") if a.eval_scenarios else None   # --eval-scenarios: one row per scenario eval
+    scef = open(os.path.join(out, "scenario_episodes.jsonl"), "a") if a.eval_scenarios else None
+    sidx = SC.ScnIndex(out) if a.eval_scenarios else None    # replays/scn/index.json (the workers write the replays)
     t0 = time.time(); n_ep = 0; ep_rows = []; stop = {"now": False}; z = np.zeros(HID, np.float32)
     signal.signal(signal.SIGTERM, lambda *_: stop.__setitem__("now", True))
     T = lambda x, dt=torch.float32: torch.as_tensor(x, device=dev).to(dt)
     th = {"t": None, "res": None}; t_wall = [time.time(), agent_steps]
 
     def save(path):
-        torch.save({"model": net.state_dict(), "opt": opt.state_dict(), "ref": ref.state_dict() if ref else None, "update": upd,
-                    "agent_steps": agent_steps, "args": vars(a), "loc": loc}, path)
+        torch.save({"model": net.state_dict(), "opt": opt.state_dict(), "opt_x": opt_x.state_dict(), "ref": ref.state_dict() if ref else None, "update": upd,
+                    "agent_steps": agent_steps, "args": vars(a), "loc": loc, "obs_version": O.OBS_VERSION}, path)
 
     def start_eval():
         nonlocal enet
         enet = frozen(anet.state_dict())
-        items = [(sd, "eval") for sd in range(1, a.eval_episodes + 1)] + [(sd, "evalb") for sd in range(1, a.evalb_episodes + 1)]
+        items = eval_items(a) + scenario_items(a, ev.get("n", 0), upd); ev.update(n=ev.get("n", 0) + 1, t_scn=None)
         cap = [w for w in range(NWk) if cut[w + 1] > a.n - a.eval_n] or list(range(NWk))   # workers with eval instances
         for j, it in enumerate(items): extra[cap[j % len(cap)]].setdefault("eval", []).append(it)
         push(); ev.update(active=True, update=upd, steps=agent_steps, t0=time.time(), n0=len(episodes), ver=ctl["ver"])
@@ -299,8 +326,10 @@ def main(argv=None):
         by = lambda kd: list({r["seed"]: r for r in episodes[ev["n0"]:] if r["tag"]["kind"] == kd and r["player"] == 0}.values())
         sm = {"update": ev["update"], "agent_steps": ev["steps"], "minutes": round((time.time() - t0) / 60, 1),
               "eval_s": round(time.time() - ev["t0"], 1), **eval_summary(by("eval")),
-              **{"b_" + k: v for k, v in eval_summary(by("evalb")).items() if k in ("episodes", "rank", "ci95", "win", "top3")}}
-        evf.write(json.dumps(sm) + "\n"); evf.flush(); print("[eval]", json.dumps(sm), flush=True)
+              **{"b_" + k: v for k, v in eval_summary(by("evalb")).items() if k in ("episodes", "rank", "ci95", "win", "top3")},
+              **eval_presets(episodes[ev["n0"]:]), **eval_plan(episodes[ev["n0"]:])}
+        evf.write(json.dumps(sm) + "\n"); evf.flush(); print("[eval]", json.dumps(sm), flush=True); evepf.flush()
+        if scf: scenario_eval(episodes[ev["n0"]:], ev, sm["minutes"], scf, scef)
         ev.update(active=False, t_last=time.time())
         epf.flush()   # scorecard.py (CPU, own process: the loop never waits) -> RUN/scorecard.json + one line in the log
         subprocess.Popen([sys.executable, os.path.join(HERE, "scorecard.py"), out], stdin=subprocess.DEVNULL)
@@ -308,35 +337,34 @@ def main(argv=None):
     def prepare():
         """GAE + the update's tensors (a copy: the buffer can be refilled while a thread trains on this)"""
         is_bc = bc(); n = buf.n
-        adv = np.zeros(n, np.float32); ret = np.zeros(n, np.float32)
-        for aid, rows in traj.items():                   # GAE; bootstrap = the value of the pending (next) row
-            nxt = 0.0 if aid in final else float(buf.val[pending[aid]]) if aid in pending else float(buf.val[rows[-1]]); last = 0.0
-            for j in rows[::-1]:
-                nt = 0.0 if buf.done[j] else 1.0
-                last = buf.rew[j] + a.gamma * nxt * nt - buf.val[j] + a.gamma * a.lam * nt * last
-                adv[j] = last; ret[j] = last + buf.val[j]; nxt = buf.val[j]
+        adv, ret = gae(traj, pending, final, buf.rew[:n], buf.val[:n], a.gamma, a.lam, buf.done[:n])   # bootstrap: the pending row
         use = [r for r in traj.values() if bool(buf.bc[r[0]]) == is_bc]
         C = torch.as_tensor(chunks(use, a.seq), device=dev); nrow = int((C >= 0).sum())
         g = {k: T(getattr(buf, k)[:n], dt) for k, dt in (("s", torch.float32), ("ent", torch.float32), ("grid", torch.uint8),
              ("h", torch.float32), ("priv", torch.float32), ("act", torch.long), ("logp", torch.float32), ("val", torch.float32))}
         rows = C[C >= 0].cpu().numpy()
-        expl = 1 - float(((ret[rows] - buf.val[rows]) ** 2).mean() / (ret[rows].var() + 1e-8)) if len(rows) else 0.0
+        expl = expl_var(ret[rows], buf.val[rows])
         acts = buf.act[rows].copy()
         pu = upd - a.bc_updates
         beta = 0.0 if ref is None else max(a.kl_floor, a.kl_beta * (1 - pu / max(1, a.kl_updates)))
+        X = {}; xrow = {}; tx = time.time()                # the heads that never act: targets, readouts (train_ppo helpers)
+        if a.vlive:
+            _, retl, xrow["expl_var_live"] = live_targets(a, net, g, buf, traj, pending, final, n, rows); X["RETL"] = T(retl)
+        if a.aux_w: X.update(aux_targets(a, net, g, buf, traj, final, n, rows, xrow, T))
+        if X: xrow["extra_s"] = round(time.time() - tx, 2)
         return {"is_bc": is_bc, "C": C, "nrow": nrow, "g": g, "ADV": T(adv), "RET": T(ret), "LIVE": T(~buf.dead[:n], torch.float32),
-                "expl": expl, "acts": acts, "beta": beta}
+                "expl": expl, "acts": acts, "beta": beta, "X": X, "xrow": xrow}
 
     def train(P_):
         """train_ppo's update loop, unchanged"""
-        tu = time.time(); is_bc, C, g, ADV, RET, LIVE, beta = P_["is_bc"], P_["C"], P_["g"], P_["ADV"], P_["RET"], P_["LIVE"], P_["beta"]
-        for pg_ in opt.param_groups: pg_["lr"] = a.bc_lr if is_bc else a.lr
-        stats = []; mb = min(a.chunks, len(C))
+        tu = time.time(); is_bc, C, g, ADV, RET, LIVE, beta, X = P_["is_bc"], P_["C"], P_["g"], P_["ADV"], P_["RET"], P_["LIVE"], P_["beta"], P_["X"]
+        for pg_ in opt.param_groups + opt_x.param_groups: pg_["lr"] = a.bc_lr if is_bc else a.lr
+        stats = []; xst = []; mb = min(a.chunks, len(C))
         for _ in range(a.epochs if mb else 0):
             perm = torch.randperm(len(C), device=dev)
             for s0 in range(0, len(C) - mb + 1, mb):
                 c = C[perm[s0:s0 + mb]]; mk = (c >= 0).flatten(); r = c.clamp(min=0); rf = r.flatten()[mk]
-                lg, v = net.seq(g["s"][r], g["ent"][r], g["grid"][r], g["h"][r[:, 0]], g["priv"][r])
+                lg, v, *xc = net.seq(g["s"][r], g["ent"][r], g["grid"][r], g["h"][r[:, 0]], g["priv"][r], feats=bool(X))
                 lg = [x[mk] for x in lg]; v = v[mk]
                 lp, ent, _ = dist_logp_ent(lg, g["act"][rf]); vl = 0.5 * ((v - RET[rf]) ** 2).mean()
                 lv = LIVE[rf]; lm = lambda x: (x * lv).sum() / lv.sum().clamp(min=1)
@@ -351,8 +379,12 @@ def main(argv=None):
                         kl = masked_kl([x[mk] for x in lr_], lg).mean()
                     loss = pg - a.ent * lm(ent) + beta * kl + 0.5 * vl
                     st = [pg.item(), vl.item(), ent.mean().item(), kl.item(), ((ratio - 1).abs() > a.clip).float().mean().item()]
-                opt.zero_grad(set_to_none=True); loss.backward(); torch.nn.utils.clip_grad_norm_(net.parameters(), 0.5); opt.step()
+                if X: hl, hs = head_loss(net, xc[0][mk], rf, X, a); loss = loss + hl; xst.append(hs)
+                opt.zero_grad(set_to_none=True); opt_x.zero_grad(set_to_none=True); loss.backward()
+                torch.nn.utils.clip_grad_norm_(main_p, 0.5); opt.step()
+                if X: torch.nn.utils.clip_grad_norm_(x_p, 0.5); opt_x.step()
                 stats.append(st)
+        for k in sorted({k for d in xst for k in d}): P_["xrow"][k] = round(float(np.mean([d[k] for d in xst if k in d])), 5)
         P_["stats"] = stats; P_["update_s"] = time.time() - tu
         return P_
 
@@ -400,6 +432,8 @@ def main(argv=None):
         for k in sorted({r["tag"]["kind"] for r in ok}): row["rank_" + k] = mean([r["rank"] for r in ok if r["tag"]["kind"] == k])
         row["pfsp"] = {os.path.basename(p)[:-3]: [round(pfr(p), 2), pf.get(os.path.basename(p), [0, 0])[1]] for p in pool}
         for k in TERMS: row["t_" + k] = mean([r["terms"][k] for r in recent])
+        if a.intent_scale: row.update(intent_stats(recent))
+        row.update({k: (round(v, 4) if isinstance(v, float) else v) for k, v in P_["xrow"].items()})
         prf.write(json.dumps(row) + "\n"); prf.flush()
         print(json.dumps({k: v for k, v in row.items() if not k.endswith("_hist") and k != "pfsp"}), flush=True)
         if upd % 5 == 0: save(os.path.join(out, "ckpt_last.pt"))
@@ -433,21 +467,24 @@ def main(argv=None):
                     if "error" in m_: raise RuntimeError("worker %d failed:\n%s" % (w, m_["error"]))
                     msgs.append((w, m_)); waiting.add(w); ack[w], busy[w], restarts[w] = m_["ack"], m_["busy"], m_["restarts"]; tw[w] = m_["tw"]
                 for w, m_ in msgs:
-                    for (aid, rew, done, lab) in m_["tr"]:
+                    for (aid, rew, done, lab, tx_) in m_["tr"]:
                         j = pending.pop(aid, None)
                         if done: hid.pop(aid, None)
                         if j is None: continue
                         buf.rew[j] = rew; buf.done[j] = done; buf.complete[j] = True
+                        buf.rew_int[j] = tx_.get("i_rew", 0.0)
                         if buf.bc[j] and lab is not None: buf.act[j] = lab
                         elif buf.bc[j]: continue                 # a BC row without a label (recording went off): not trained on
                         traj.setdefault(aid, []).append(j)
+                        buf.te[j] = tx_.get("te", 0.0)
                         if done: final.add(aid)
                     for aid in m_["dropped"]: pending.pop(aid, None); hid.pop(aid, None)
-                live = [(w, m_) for w, m_ in msgs if m_["B"]]; acts_by = {}
+                live = [(w, m_) for w, m_ in msgs if m_["B"]]; acts_by = {}; xr_by = {}
                 if live:
                     ids = np.concatenate([m_["ids"] for _, m_ in live]); grp = np.concatenate([m_["grp"] for _, m_ in live]).astype(np.int64)
                     isbc = np.concatenate([m_["isbc"] for _, m_ in live]); dead = np.concatenate([m_["dead"] for _, m_ in live])
                     X = np.concatenate([shms[w][:m_["B"]] for w, m_ in live]); B = len(ids)
+                    XA = np.concatenate([ashms[w][:m_["B"]] for w, m_ in live]) if a.aux_w else None
                     h = np.stack([hid.get(int(x), z) for x in ids])
                     tq = time.perf_counter()
                     A, lp, v, h2 = actor.act_block([anet, enet, bnet] + lnets, grp, X, h)
@@ -457,17 +494,26 @@ def main(argv=None):
                     if m.any():
                         Xm = X[m]
                         rows = buf.add(s=Xm[:, :NS], ent=Xm[:, _OFF[1]:_OFF[2]].reshape(-1, O.N_ENT, O.F_ENT), grid=Xm[:, _OFF[2]:_OFF[3]].reshape(-1, O.G, O.G),
-                                       h=h[m], priv=Xm[:, _OFF[3]:_OFF[4]], act=A[m], logp=lp[m], val=v[m], bc=isbc[m], dead=dead[m])
+                                       h=h[m], priv=Xm[:, _OFF[3]:_OFF[4]], act=A[m], logp=lp[m], val=v[m], bc=isbc[m], dead=dead[m],
+                                       **(E.aux_split(XA[m]) if XA is not None else {}))
                         for aid, j in zip(ids[m], rows): pending[int(aid)] = int(j)
                         agent_steps += int(m.sum()); dec_n += int(m.sum())
                     off = 0
-                    for w, m_ in live: acts_by[w] = A[off:off + m_["B"]]; off += m_["B"]
+                    for w, m_ in live:
+                        acts_by[w] = A[off:off + m_["B"]]
+                        if m_.get("rec") is not None:            # --aux-w: the aux heads' readout of the row the worker records
+                            q = off + m_["rec"]; xq = X[q:q + 1]
+                            xr_by[w] = aux_readout(anet, T(xq[:, :NS]), T(xq[:, _OFF[1]:_OFF[2]].reshape(1, O.N_ENT, O.F_ENT)),
+                                                   T(xq[:, _OFF[2]:_OFF[3]].reshape(1, O.G, O.G), torch.uint8), T(h[q:q + 1]))
+                        off += m_["B"]
                 for w, m_ in msgs:
                     c_ = None
                     if sent[w] != ctl["ver"]:
                         c_ = {k: v_ for k, v_ in ctl.items()}; c_.update(extra[w]); extra[w] = {}; sent[w] = ctl["ver"]
-                    conns[w].send((acts_by.get(w), c_)); waiting.discard(w)
-                for w, m_ in msgs: episodes.extend(m_["eps"])
+                    conns[w].send((acts_by.get(w), c_, xr_by.get(w))); waiting.discard(w)
+                for w, m_ in msgs:
+                    episodes.extend(m_["eps"])
+                    if m_.get("scn_rep"): sidx.add(m_["scn_rep"]); ev["t_scn"] = time.time()
                 for r in episodes[n_ep:]:
                     tg = r["tag"]                            # PFSP score: only battles whose snapshot stayed loaded to the end
                     if (tg["kind"] == "sp" and r["player"] in tg["opp"] and tg.get("snap") and tg["snap"] == lname[tg["slot"]]
@@ -475,6 +521,7 @@ def main(argv=None):
                         e = pf.setdefault(tg["snap"], [5.5, 0]); e[0] += 0.02 * (r["rank"] - e[0]); e[1] += 1
                     if not r["tag"]["kind"].startswith("eval") and r["player"] not in r["tag"].get("opp", ()):
                         ep_rows.append(r); epf.write(json.dumps(r) + "\n")
+                    elif r["tag"]["kind"].startswith("eval") and r["player"] == 0 and r["tag"]["kind"] != "evalscn": evepf.write(json.dumps(r) + "\n")
                 n_ep = len(episodes)
                 if ev["active"]: finish_eval()
                 elif not a.overlap_update and not bc() and time.time() - ev["t_last"] > a.eval_min * 60: start_eval()

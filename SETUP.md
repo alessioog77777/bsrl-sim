@@ -31,6 +31,8 @@ Changes made to nirkt's code, all recorded in `host/`:
 - `host/training_round.patch`: team groups, summons and area effects in the observation, per-instance map folders,
   teammate respawn.
 - `host/fair_view.patch`: camera view window (measured trapezoid, per-episode zoom, teammates never bush-hidden).
+- `host/live_state.patch`: live map tiles in `F_MAP` and the observation grid (a destroyed wall / bush reads as open),
+  area effects' data id in item feature 5 (obs_v5 looks up radius and kind), power cubes lost at a team knock-out.
 - `maenv.py` and `fair.py` copied from `deps/nbrl-env/py/nbpc` into `deps/bulletlabels/vendor/nbpc`, so one `nbpc`
   package holds the host side and the environment side.
 - The game download link removed from `deps/bulletlabels/setup.sh` (this repo's `setup.sh` downloads it instead).
@@ -39,8 +41,8 @@ What `setup.sh` does: system packages (APT list at its top), builds the host as 
 ARM64 binary, runs under qemu), builds nirkt's patched qemu (~5 min; if that fails, `env.sh` uses the system
 `qemu-aarch64`, about 2x slower, same results), creates `.venv`, downloads (unless `APK=` is given), unpacks and checks the game files.
 
-`env.sh` finds all of it under `deps/`. Each path can be overridden: `BULLETLABELS`, `NBRL`, `SIM_WORK` (runs and
-generated maps, default `work/`), `SIM_VENV`.
+`env.sh` finds all of it under `deps/`. Each path can be overridden: `BULLETLABELS`, `NBRL`, `SIM_WORK` (runs and the
+downloaded game build, default `work/`), `SIM_VENV`.
 
 ## Troubleshooting
 - **Nothing printed after start.** `MAEnv` retries a failed boot forever without a message. Boot one `nbpc.instance`
@@ -50,7 +52,5 @@ generated maps, default `work/`), `SIM_VENV`.
 - **Variables come out empty.** `env.sh` must have LF line endings (CRLF breaks every variable). From Windows, pass
   scripts to `wsl.exe ... bash -s` on stdin.
 - **Slow start.** One boot takes 60-90 s. Batch your checks into one run.
-- **A generated map crashes its instance (exit 139).** Layouts with a payload-track tile crash at boot.
-  `env_v5.use_genmaps` skips them.
 - **The fire head never uses gadgets or hypercharge.** The host cannot trigger them, so actions are none / attack /
   super.

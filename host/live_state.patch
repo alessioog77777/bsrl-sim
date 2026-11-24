@@ -1,0 +1,77 @@
+# live_state (bsrl-sim): live map tiles, area effects' data id in item feature 5, cubes lost at a team knock-out.
+# Applies on top of training_round.patch (deps/bulletlabels = nirkt/bulletlabels @ 52184b2 + training_round.patch + this).
+diff --git a/native/loader/encode.c b/native/loader/encode.c
+index 3f56262..79a4c23 100644
+--- a/native/loader/encode.c
++++ b/native/loader/encode.c
+@@ -183,9 +183,12 @@ int enc_encode(const EncMap *m, const EncState *s, int pidx, float *vec, float *
+     for (int k = 0; k < s->nit && n < 4096; k++) {
+         const int32_t *r = s->it + k * I2;
+         double dx = (r[3] - mx) / R_SCALE, dy = (r[4] - my) / R_SCALE;
+-        /* rl round: [4] = 1 showdown bomb or enemy area effect (data 17xxxxxx = area_effects_skin), -1 area effect of my team */
++        /* rl round: [4] = 1 showdown bomb or enemy area effect (data 17xxxxxx = area_effects_skin), -1 area effect of my team;
++         * area round: [5] of those rows = data id - 16999999 (area skin row + 1, items row + 1000001: radius / kind tables
++         * in Python), of the other items z / 1500 as before */
+         int area = r[1] / 1000000 == 17, mine = area && r[2] >= 0 && team_of(s, r[2]) == myteam;
+-        double v[6] = {1.0, dx, dy, (double)(r[1] == CUBE_ITEM), mine ? -1.0 : (double)(area || r[1] == BOMB_ITEM || r[1] == BOMB_BOX_ITEM), (r[5] > 0 ? r[5] : 0) / 1500.0};
++        int ae = area || r[1] == BOMB_ITEM || r[1] == BOMB_BOX_ITEM;
++        double v[6] = {1.0, dx, dy, (double)(r[1] == CUBE_ITEM), mine ? -1.0 : (double)ae, ae ? (double)(r[1] - 16999999) : (r[5] > 0 ? r[5] : 0) / 1500.0};
+         rows[n].key = dx * dx + dy * dy; rows[n].seq = n; for (int j = 0; j < 6; j++) rows[n].v[j] = (float)v[j]; n++;
+     }
+     qsort(rows, n, sizeof *rows, cmprow);
+diff --git a/native/loader/env.c b/native/loader/env.c
+index 7ef0ca5..3f81f00 100644
+--- a/native/loader/env.c
++++ b/native/loader/env.c
+@@ -285,7 +285,8 @@ int snap2(void *sim, int32_t *out, int cap, void *cmgr) {
+     out[1] = k; out[3] = np; out[4] = nch; out[5] = npj; out[6] = nit;
+     return k;
+ }
+-/* map tile data ids (x + width*y) + FNV-1a hash (the agent's snap_map) */
++/* map tile data ids (x + width*y) + FNV-1a hash (the agent's snap_map). area round: the cell's current data (+0: Open once a
++ * wall / bush is destroyed) instead of its battle-start data (+8), so F_MAP and the encoder's grid follow the live map */
+ static uint32_t snap_map(void *sim, int32_t *out, int cap, int *wh) {
+     uint32_t hash = 2166136261u; wh[0] = wh[1] = 0;
+     void *m = sim ? PTR(sim, 0x68) : NULL; if (!m) return 0;
+@@ -293,7 +294,7 @@ static uint32_t snap_map(void *sim, int32_t *out, int cap, int *wh) {
+     if (w < 1 || hh < 1 || w * hh > 16384 || w * hh > cap) return 0;
+     void **tiles = PTR(m, 0x20); if (!tiles) return 0;
+     for (int i = 0; i < w * hh; i++) {
+-        void *t = tiles[i], *d = t ? PTR(t, 8) : NULL; int id = d ? I32(d, 0x20) : NIL;
++        void *t = tiles[i], *d = t ? (PTR(t, 0) ? PTR(t, 0) : PTR(t, 8)) : NULL; int id = d ? I32(d, 0x20) : NIL;
+         out[i] = id; hash = (hash ^ (uint32_t)id) * 16777619u;
+     }
+     wh[0] = w; wh[1] = hh;
+@@ -354,6 +355,11 @@ static uint64_t my_root(void *victim, int a1, int dmg, int a3, int a4, void *att
+     if (vchar && mode3) record_event(victim, attacker, before, I32(victim, 0x3c4));
+     if (ow >= 0 && I32(victim, 0x3c4) <= 0 && resp_mate(E.sim, ow)) {   /* knocked out while a teammate lives */
+         E.resp_at[ow] = I32(E.sim, 0x10) + RESP_TICKS; E.resp_ai[ow] = U8(victim, 0x469); E.resp_n++;
++        /* area round: it loses its power cubes (Duo Showdown: a respawned brawler starts at 0 cubes) and their +400 max HP
++         * each; cubes0 moves with it so NbePlayer.cubes (picked up this step) stays >= 0. shortcut: they vanish (not dropped) */
++        for (int c = 0; c < E.ncube; c++) if (E.cube_id[c] == I32(victim, 8) && E.cube_n[c] > 0) {
++            I32(victim, 0x3c8) -= 400 * E.cube_n[c]; E.cubes0[ow] -= E.cube_n[c]; E.cube_n[c] = 0;
++        }
+         I32(victim, 0x3c4) = I32(victim, 0x3c8); U8(victim, 0x469) = 0; I32(victim, 0x38) = PARK_X; I32(victim, 0x3c) = PARK_Y;
+     }
+     E.charge_level = saved_level;
+diff --git a/native/loader/nbenv_proto.h b/native/loader/nbenv_proto.h
+index 986374c..686e705 100644
+--- a/native/loader/nbenv_proto.h
++++ b/native/loader/nbenv_proto.h
+@@ -93,6 +93,7 @@ typedef struct {
+ typedef struct {          /* per player slot, reward bookkeeping of THIS step (the phone env's info.terms) */
+     int32_t present, char_id, alive, hp, max_hp, x, y;
+     int32_t damage_dealt, damage_taken, gas_damage, kills, hits, box_damage, cubes, cubes_total, gas_ticks, in_gas;
++                          /* cubes = picked up this step; cubes_total = held now (all picked up, 0 after a team knock-out) */
+     int32_t bomb_damage;  /* PC extra: leap-bomb damage dealt (the phone agent applies it from JS: not in damage_dealt) */
+     int32_t eliminated, elim_rank, elim_tick, elim_gas; /* elimination tracker (rank 10 = first out) */
+     int32_t leaping, super_charge, super_max, ammo;
+@@ -112,7 +113,7 @@ typedef struct {
+     int32_t steps_in_frame, frame;
+     int32_t us_step, us_state, us_wait;  /* timing of the last step (microseconds) */
+     int32_t njumps; int32_t jumps[NBE_MAXP][5];   /* active leaps: char id, t, T, x1, y1 */
+-    int32_t ncubes; int32_t cubes[NBE_MAXP][2];   /* char id, cubes held */
++    int32_t ncubes; int32_t cubes[NBE_MAXP][2];   /* char id, cubes held (= NbePlayer.cubes_total) */
+     int32_t reserved[8];  /* [0] latched storm step used by this step, [1] storm latch phase, [2] env steps since the reset observation,
+                              [3] client tick (client mode), [4] pixel format of the pixel block (cmd reserved[2]),
+                              [5] lead-aim corrections since the reset (lead_mask), [6] AI attack calls of lead players left unchanged */

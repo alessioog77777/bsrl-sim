@@ -3,13 +3,22 @@
     python scorecard.py RUN [--last 3000]     # RUN = $SIM_WORK/runs/<run> (or a path); CPU only, reads files
     -> one summary line on stdout, details in RUN/scorecard.json
 
-From episodes.jsonl (every finished agent: training + evals), grouped by battle kind (eval / evalb / train),
+From episodes.jsonl (every finished training agent) + eval_episodes.jsonl (the policy's eval rows), grouped by battle kind (eval / evalb / evalp:<preset> / evalp_plan / train),
 team size and brawler:
   place      own placement; in teams the team's (best member rank among that battle's rows)
   win, top   share placing 1st / in the top half of the teams
   trade      damage dealt / damage taken (sim term units)
   hit, dps   hits / shots, damage per shot (ammo efficiency: wasted shots lower it)
   cubes, alive_s, gas   cubes picked, seconds survived, share killed by the gas
+  behaviour  (rows with env_v5 "beh" counters) shares of alive time hidden by a bush / engaged / in gas / near it, mate 1.5-4
+             tiles / < 1 tile (share of time with a mate), range ratio, damage per minute, cubes held at the end
+Presets (eval kind evalp, train --eval-presets): per preset the metrics above, the paired difference to balanced on
+  the same seeds (mean, SE) and a pass rule per style (PASS_RULES; every preset: place within 0.5 of balanced); a rule
+  whose metric is undefined there (mate metrics in solo evals) is listed as n/a, not failed.
+Intents (rows with env_v5 "intents"): per group the follow rate (achieved / started) per intent kind and the planner's
+  rule census {rule: [picked, started, preempted]} (eval kind evalp_plan = player 0 on the rule planner, --eval-plan).
+Slider slopes (training rows, sampled weights): OLS of each per-episode metric on the slider weights -> slope and SE per
+  (slider, metric); "own" = each slider's own term per minute (s_<slider>): t < 2 = the slider changes nothing.
 From replays/*.json (one learner battle per update, true positions):
   lead       slope of (aim - bearing) on the ideal lead offset (target's true velocity, own projectile speed):
              0 = shoots where the target is, 1 = leads perfectly; aim_err = median |aim - ideal| in degrees
@@ -51,12 +60,96 @@ def ep_stats(rows):
             "top": round(float((pl <= teams / 2).mean()), 3), "trade": round(S("dealt") / max(S("taken"), 1e-6), 3),
             "hit": round(S("hits") / max(S("shots"), 1.0), 3), "dps": round(S("dealt") / max(S("shots"), 1.0), 3),
             "cubes": round(S("cubes") / len(ok), 2), "alive_s": round(float(np.mean([r["ticks"] for r in ok])) * TICK_S, 1),
-            "gas": round(float(np.mean([r["storm_death"] for r in ok])), 3)}
+            "gas": round(float(np.mean([r["storm_death"] for r in ok])), 3),
+            **{k: round(_nm(m.get(k, float("nan")) for m in bm), 4) for k in ("hidden", "engaged", "band", "clump", "range", "dealt_min", "cubes_end")
+               for bm in [[beh_metrics(r) for r in ok]] if any(bm)}}
 
 
 def kind_of(r):
-    k = (r.get("tag") or {}).get("kind", "")
-    return k if k in ("eval", "evalb") else "train"
+    t = r.get("tag") or {}; k = t.get("kind", "")
+    return "evalp:%s" % t.get("preset") if k == "evalp" else k if k in ("eval", "evalb", "evalp_plan") else "train"
+
+
+def intent_report(rows):
+    """{group: {"follow": {kind: achieved / started}, "n": {kind: [started, achieved, timeout, invalid]}, "rules": {rule:
+    [picked, started, preempted]}}} per battle group (kind_of) of the rows with env_v5 "intents" (intents on)"""
+    out = {}
+    for r in rows:
+        if "intents" not in r: continue
+        g = out.setdefault(kind_of(r), {"n": {}, "rules": {}})
+        for k, v in r["intents"].items(): g["n"][k] = [x + y for x, y in zip(g["n"].get(k, [0] * 4), v)]
+        for k, v in (r.get("plan_rules") or {}).items(): g["rules"][k] = [x + y for x, y in zip(g["rules"].get(k, [0] * 3), v)]
+    for g in out.values(): g["follow"] = {k: round(v[1] / v[0], 3) for k, v in g["n"].items() if v[0]}
+    return out
+
+
+STEP_S = 0.1   # env step (2 ticks)
+
+
+def beh_metrics(r):
+    """per-episode behaviour metrics from env_v5's counters (row["beh"]) and slider terms; nan when undefined"""
+    b = r.get("beh")
+    if not b: return {}
+    al = max(b["alive"], 1.0); mt = b["mate"]; nan = float("nan"); mins = al * STEP_S / 60.0
+    out = {"hidden": b["hidden"] / al, "bush": b["bush"] / al, "engaged": b["engaged"] / al, "gas": b["gas"] / al,
+           "band": b["mate_band"] / mt if mt else nan, "clump": b["clump"] / mt if mt else nan,
+           "range": b["range_ratio"] / b["near"] if b["near"] else nan, "dealt_min": b["dealt"] / mins, "cubes_end": b["cubes_end"],
+           "gas_near": b.get("gas_near", 0.0) / al}
+    for k, v in r["terms"].items():
+        if k.startswith("s_"): out[k + "_min"] = v / mins
+    return out
+
+
+# per style: (metric, op, k, how): preset mean op (balanced mean x k | + k)
+PASS_RULES = {"bush_camper": [("hidden", ">=", 1.5, "x")], "aggressive": [("engaged", ">=", 1.3, "x"), ("dealt_min", ">", 1.0, "x")],
+              "cube_farmer": [("cubes_end", ">=", 1.3, "x"), ("gas", "<=", 0.005, "+")], "team_player": [("band", ">=", 1.2, "x"), ("clump", "<=", 0.02, "+")],
+              "marksman": [("range", ">=", 1.1, "x")], "third_partier": [("s_third_party_min", ">=", 1.3, "x")]}
+PLACE_TOL = 0.5   # a style may cost at most half a rank on average
+
+
+def _nm(xs):
+    xs = np.array([x for x in xs if x == x], float)
+    return float(xs.mean()) if len(xs) else float("nan")
+
+
+def preset_report(rows):
+    """{preset: {metric: mean, "d_<metric>": [paired mean diff vs balanced, SE], "pass": bool, "why": [...]}} of evalp rows"""
+    ev = [r for r in rows if (r.get("tag") or {}).get("kind") == "evalp" and r["player"] == 0 and r["rank"] is not None and not r["restart"]]
+    tp = team_place(ev); by = collections.defaultdict(dict)
+    for r in ev:
+        m = beh_metrics(r); m["place"] = tp[(r["seed"], r["player"])]; by[r["tag"]["preset"]][r["seed"]] = m
+    base = by.get("balanced", {}); out = {}
+    for p, seeds in sorted(by.items()):
+        keys = sorted({k for m in seeds.values() for k in m}); o = {k: round(_nm(m.get(k, float("nan")) for m in seeds.values()), 4) for k in keys}
+        o["n"] = len(seeds)
+        for k in keys:
+            d = [seeds[s][k] - base[s][k] for s in seeds if s in base and k in base[s] and seeds[s][k] == seeds[s][k] and base[s][k] == base[s][k]]
+            if len(d) > 1: o["d_" + k] = [round(float(np.mean(d)), 4), round(float(np.std(d, ddof=1) / np.sqrt(len(d))), 4)]
+        if p != "balanced" and base:
+            bm = {k: _nm(m.get(k, float("nan")) for m in base.values()) for k in keys}; why = []; na = []
+            for k, op, f, how in PASS_RULES.get(p, []) + [("place", "<=", PLACE_TOL, "+")]:
+                tgt = bm.get(k, float("nan")) * f if how == "x" else bm.get(k, float("nan")) + f; v = o.get(k, float("nan"))
+                if not (v == v and tgt == tgt): na.append(k); continue   # undefined here (mate metrics in solo evals)
+                if not (v >= tgt if op == ">=" else v > tgt if op == ">" else v <= tgt): why.append("%s %.3f %s %.3f" % (k, v, op, tgt))
+            o["pass"], o["why"], o["n/a"] = not why, why, na
+        out[p] = o
+    return out
+
+
+def slider_slopes(rows):
+    """OLS per metric on [1, slider weights] over training rows -> {metric: {slider: [slope, SE]}}, + "own" t-values"""
+    tr = [r for r in rows if kind_of(r) == "train" and r.get("sliders") and r.get("beh")]
+    if len(tr) < 30: return {"n": len(tr)}
+    names = [k[2:] for k in tr[0]["terms"] if k.startswith("s_")]
+    X = np.c_[np.ones(len(tr)), np.array([r["sliders"] for r in tr], float)]; M = [beh_metrics(r) for r in tr]; out = {"n": len(tr)}
+    for k in sorted({k for m in M for k in m}):
+        y = np.array([m.get(k, float("nan")) for m in M], float); ok = np.isfinite(y)
+        if ok.sum() < X.shape[1] + 10: continue
+        b, *_ = np.linalg.lstsq(X[ok], y[ok], rcond=None); res = y[ok] - X[ok] @ b
+        cov = (res @ res) / max(1, ok.sum() - X.shape[1]) * np.linalg.pinv(X[ok].T @ X[ok]); se = np.sqrt(np.maximum(np.diag(cov), 0))
+        out[k] = {n: [round(float(b[i + 1]), 5), round(float(se[i + 1]), 5)] for i, n in enumerate(names)}
+    out["own_t"] = {n: round(out["s_%s_min" % n][n][0] / max(out["s_%s_min" % n][n][1], 1e-12), 1) for n in names if "s_%s_min" % n in out}
+    return out
 
 
 def replay_stats(frames, chr_, groups, stats_of):
@@ -100,6 +193,8 @@ def summarize_leads(li, la):
 
 def scorecard(run, last=3000, stats_of=None):
     rows = [json.loads(l) for l in open(os.path.join(run, "episodes.jsonl"))][-last:]
+    ev = os.path.join(run, "eval_episodes.jsonl")           # the trainers' eval rows (player 0), not in episodes.jsonl
+    if os.path.exists(ev): rows += [json.loads(l) for l in open(ev)][-last:]
     out = {"run": os.path.basename(os.path.normpath(run)), "rows": len(rows), "groups": {}}
     by = collections.defaultdict(list)
     for r in rows:
@@ -114,6 +209,7 @@ def scorecard(run, last=3000, stats_of=None):
         c = json.load(open(fn)); a, b, r_ = replay_stats(c["frames"], c["chr"], c.get("groups") or [0] * 10, stats_of)
         li += a; la += b; rg += r_
     out["replays"] = {**summarize_leads(li, la), "range": round(float(np.median(rg)), 3) if rg else None}
+    out["presets"] = preset_report(rows); out["slopes"] = slider_slopes(rows); out["intents"] = intent_report(rows)
     return out
 
 
@@ -138,6 +234,28 @@ def _check():
              "terms": {"dealt": 2, "taken": 1, "hits": 1, "shots": 2, "cubes": 1}, "tag": {"kind": "k1", "team_size": 3, "groups": g}}
             for p, rk, g in ((0, 5, [1, 1, 0] + [0] * 7), (1, 2, [1, 1, 0] + [0] * 7))]
     s = ep_stats(rows); assert s["place"] == 2 and s["trade"] == 2 and s["hit"] == 0.5, s
+    rng = np.random.default_rng(0); names = ["bush_camp", "collect", "push"]
+    def row(kind, preset, seed, w, hidden, engaged, rank=5):   # 1000 alive steps; s_<slider> terms
+        beh = {"alive": 1000, "bush": 300, "hidden": hidden * 1000, "engaged": engaged * 1000, "gas": 10, "mate": 0, "mate_band": 0, "clump": 0,
+               "mate_tiles": 0, "near": 100, "range_ratio": 80, "dealt": 6.0, "box": 2.0, "cubes_max": 3, "cubes_end": 2}
+        return {"seed": seed, "player": 0, "rank": rank, "truncated": False, "restart": False, "ticks": 2000, "storm_death": 0, "sliders": w,
+                "terms": {"dealt": 6, "taken": 3, "hits": 9, "shots": 20, "cubes": 2, **{"s_" + k: hidden * w[0] if k == "bush_camp" else 0.1 for k in names}},
+                "tag": {"kind": kind, "preset": preset, "groups": [0] * 10}, "beh": beh}
+    ev = [row("evalp", "balanced", sd, [1, 1, 1], 0.1, 0.2) for sd in range(20)] + \
+         [row("evalp", "bush_camper", sd, [2, 1, 0], 0.2 + 0.01 * rng.random(), 0.15, rank=5 + (sd % 2) * 0.5) for sd in range(20)] + \
+         [row("evalp", "aggressive", sd, [0, 1, 2], 0.05, 0.22) for sd in range(20)]
+    pr = preset_report(ev)
+    assert pr["bush_camper"]["pass"] and not pr["aggressive"]["pass"] and pr["aggressive"]["why"][0].startswith("engaged"), pr["aggressive"]
+    assert pr["bush_camper"]["n/a"] == [] and preset_report([{**r, "tag": {**r["tag"], "preset": "team_player" if r["tag"]["preset"] == "aggressive" else r["tag"]["preset"]}} for r in ev])["team_player"]["n/a"] == ["band", "clump"]
+    assert abs(pr["bush_camper"]["d_hidden"][0] - 0.105) < 0.01 and pr["bush_camper"]["n"] == 20 and "pass" not in pr["balanced"]
+    W = rng.uniform(0, 2, (300, 3)); tr = [row("k1", None, k, list(w), 0.1 + 0.05 * w[0] + 0.01 * rng.normal(), 0.2) for k, w in enumerate(W)]
+    sl = slider_slopes(tr)
+    assert abs(sl["hidden"]["bush_camp"][0] - 0.05) < 0.005 and abs(sl["hidden"]["push"][0]) < 0.005, sl["hidden"]
+    assert sl["own_t"]["bush_camp"] > 10 and kind_of(ev[0]) == "evalp:balanced" and ep_stats(ev[:20])["hidden"] == 0.1
+    ir = intent_report([{"tag": {"kind": "evalp_plan"}, "intents": {"farm": [4, 3, 1, 0]}, "plan_rules": {"farm": [5, 4, 1]}},
+                        {"tag": {"kind": "evalp_plan"}, "intents": {"farm": [2, 0, 0, 2], "gas": [1, 1, 0, 0]}},
+                        {"tag": {"kind": "k1"}, "intents": {}}, {"tag": {"kind": "eval"}}])
+    assert ir["evalp_plan"]["follow"] == {"farm": 0.5, "gas": 1.0} and ir["evalp_plan"]["rules"] == {"farm": [5, 4, 1]} and set(ir) == {"evalp_plan", "train"}, ir
     print("scorecard ok")
 
 
@@ -155,3 +273,9 @@ if __name__ == "__main__":
         print("scorecard %s: place %s win %s trade %s hit %s dps %s cubes %s alive %ss | lead %s aim_err %s range %s -> %s" % (
             sc["run"], ev.get("place"), ev.get("win"), ev.get("trade"), ev.get("hit"), ev.get("dps"), ev.get("cubes"),
             ev.get("alive_s"), rp.get("lead"), rp.get("aim_err"), rp.get("range"), os.path.join(run, "scorecard.json")))
+        if sc["presets"]:
+            print("presets: " + ", ".join("%s %s (place %s%s%s)" % (p, "PASS" if v.get("pass") else "-" if "pass" not in v else "FAIL", v.get("place"),
+                                                                 "; " + "; ".join(v["why"]) if v.get("why") else "",
+                                                                 "; n/a " + ", ".join(v["n/a"]) if v.get("n/a") else "") for p, v in sc["presets"].items()))
+        for g, v in sc["intents"].items(): print("intents %s: follow %s%s" % (g, v["follow"], "; planner rules %s" % v["rules"] if v["rules"] else ""))
+        if sc["slopes"].get("own_t"): print("slider own-term t (< 2 = no effect):", sc["slopes"]["own_t"])

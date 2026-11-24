@@ -4,17 +4,39 @@
     python -m obs_v5 --live     # + 1 instance, 300 decisions: real MAEnv observations through the builder
 
     ob = ObsV5()                                     # one per MAEnv
-    o = ob.build(obs["vec"], obs["grid"], env.last_meta, ids)
+    o = ob.build(obs["vec"], obs["grid"], env.last_meta, ids, who=env.last_who)
     o["self"] (B, 8)   hp fraction, ammo 0-1, super / gadget / hypercharge ready, in bush, own velocity x, y
-    o["ent"]  (B, 39, 16)  present | class one-hot (ENT) | dx, dy (10 tiles, x right / y down) | vx, vy (tiles/tick) | hp fraction
+    o["ent"]  (B, 39, 36)  present | class one-hot (ENT) | dx, dy (10 tiles, x right / y down) | vx, vy (tiles/tick) | hp fraction
+                       | area effects: radius (10 tiles), harms me, helps me, slows me (0 for every other class)
+                       | identity (ID0 20..33): brawler_stats (13) of the row's brawler (a player row) or of the projectile's
+                         owner + known (1 = identity given; unknown = 13 zeros + 0; summons, boxes, cubes, areas: zeros)
+                       | line of sight (LOS 34, 35; enemy / teammate rows): wall_between, water_between on o["grid"]
     o["grid"] (B, 25, 25) uint8  seg class id (SEG) per tile around the player, UNKNOWN outside the camera view
-    cond(brawler, sliders, team_size, cubes, left) (28,)  own brawler stats + behaviour weights + team size + HUD numbers
+    cond(brawler, sliders, team_size, cubes, left) (30,)  own brawler stats + behaviour weights + team size + HUD numbers
+    preset_vec(name) (12,)  the slider weights of a named play-style mode (PRESETS: balanced, bush_camper, aggressive, ...)
+    intent block (N_INT 11): one-hot of INTENTS 1..7 | dx, dy | radius | time left (intent.encode; env_v5.Env.intents)
+    policy input s = cat[self (8), cond (30), intent (11)] (N_S = 49; S_INT = 38 = the block's offset)
 
 Source = the host's state2 vector + grid after nbpc.fair (already camera- and bush-limited). Needs the rl-round
 host `nbhost_rl` (enemy features 14 / 15 = summon / on my team, self 18 = hypercharge fraction, grid channel 0 =
-tiles.csv row + 1); with an older host teammates read as enemies and the tiles are wrong.
-shortcut: area effects have no radius / kind (one class per side), the host dumps no gadget state (self 3 stays 0), and faded_bush / power_box tiles are
-render states the tile map does not have; add them to snap2 / encode.c when the policy needs them.
+tiles.csv row + 1, item feature 5 of an area effect / bomb = its data id - 16999999); with an older host teammates read as
+enemies, the tiles are wrong and area effects have no radius / kind. The grid follows the live map (live_state host: a
+destroyed wall or bush reads as the open tile it became).
+Identity (v5.6): `who` (B, N_ENT, 3) int = per row the owner player (-1 none), its brawler's id_lut row (-1) and its side
+(WHO_FOE 0 / WHO_MATE 1 / WHO_ME 2), from env_v5.Env.last_who (the host's state dump, matched to the rows by position).
+Clean: every row with an owner is known. Noisy (NOISE id_*, per episode = per battle): a player's identity is known or
+not, and a known enemy may be given a wrong brawler, both FIXED per player for the battle (live keeps them per track);
+a projectile row's owner is linked per row and decision. who=None: every identity unknown. Summons stay unknown (live
+cannot tie a bear / turret to its owner's countdown name).
+Line of sight: LOS_N samples on the straight line from my tile centre to the row's (noisy) position, my tile and its
+tile left out; wall_between = a projectile-blocking class (_BLOCK_PJ), water_between = movement-only (_BLOCK_MV), on the
+grid the policy gets (seg / HUD / bleed noise included; UNKNOWN blocks nothing); computed per frame before the latency.
+Area effects (item rows with feature 4 != 0): radius and kind come from the game's tables through the data id (_area_lut:
+area_effects_skin -> area_effects_logic Radius / Type / Damage / status effects; a bomb item through its TriggerAreaEffect),
+relative to the observer: an enemy (or neutral bomb) area harms / slows me, an area of my team helps me.
+shortcut: the host dumps no gadget state (self 3 stays 0), and faded_bush / power_box tiles are render states the tile map
+does not have; add them to snap2 / encode.c when the policy needs them.
+shortcut: an area effect's radius is its table Radius (no ExpandOnDistance growth), and DontShowToEnemy areas stay visible.
 shortcut: no box size (the sim has none; a per-class constant adds nothing to the one-hot); add with the agent adapter.
 """
 import functools, os, sys
@@ -28,12 +50,36 @@ SEG = ("floor", "indestructible", "destructible_wall", "fragile_wall", "bush", "
 UNKNOWN = len(SEG)
 ENT = ("enemy", "teammate", "enemy_summon", "teammate_summon", "power_box", "power_cube", "enemy_projectile",
        "teammate_projectile", "enemy_area_effect", "teammate_area_effect")
-SLIDERS = ("bush_camp", "collect", "protect", "retreat", "kite", "peek", "focus", "push", "third_party", "bush_control")
-N_SELF, N_ENT, F_ENT, G = 8, F.EN_K + F.PJ_K + F.BX_K + F.IT_K, 1 + len(ENT) + 5, 25
-XY, VEL, HP = 1 + len(ENT), 3 + len(ENT), 5 + len(ENT)
+SLIDERS = ("bush_camp", "collect", "protect", "retreat", "kite", "peek", "focus", "aggressive", "third_party", "bush_control",
+           "leash", "gas_safe")
+# v5.3: + 4 area-effect columns (RAD, HARM, HELP, SLOW) at the end of each entity row; v5.4: slider 7 push -> aggressive,
+# + sliders leash / gas_safe at the end of cond (COND_SLIDERS); v5.5: + the intent block (N_INT) at the end of s
+OBS_VERSION = "v5.6"
+# per-second goals (intent.py, behaviour design 4): block = one-hot of kinds 1..7 (none = all zeros) | dx, dy (10-tile
+# units, clip +-2.5) | radius / 10 tiles | time left 1 -> 0. s = cat[self, cond, intent]: at the tail, so an older
+# checkpoint's vec.0 zero-pads those columns and free play (none) is exactly its input; v5.6: + identity (14) and line of
+# sight (2) columns at the end of each entity row (model inserts their zero input weights before the lead columns)
+INTENTS = ("none", "move_to", "avoid", "hold", "engage", "farm", "regroup", "hide")
+N_INT = len(INTENTS) - 1 + 4
+I_XY, I_RAD, I_LEFT = len(INTENTS) - 1, len(INTENTS) + 1, len(INTENTS) + 2   # block columns after the one-hot
+N_SELF, N_ENT, G = 8, F.EN_K + F.PJ_K + F.BX_K + F.IT_K, 25
+XY, VEL, HP, RAD = 1 + len(ENT), 3 + len(ENT), 5 + len(ENT), 6 + len(ENT)   # RAD, RAD + 1..3 = radius, harms / helps / slows me
+F_ENT_V52 = 1 + len(ENT) + 5             # entity row width up to v5.2 (model.load_state_dict pads old checkpoints)
+F_ENT_V55 = 1 + len(ENT) + 9             # entity row width v5.3 .. v5.5
+N_ID = 13 + 1                            # identity block: brawler_stats (13) + known
+ID0, ID_KNOWN, LOS = F_ENT_V55, F_ENT_V55 + 13, F_ENT_V55 + N_ID   # LOS = wall_between, LOS + 1 = water_between
+F_ENT = LOS + 2
+WHO_FOE, WHO_MATE, WHO_ME = 0, 1, 2      # who[..., 2]: side of the row's owner seen from the observer
 N_COND = 13 + len(SLIDERS) + 3 + 2      # + own cubes, teams / players left (Showdown HUD; BSRL brain/hud.py live)
+N_COND_V53 = 28                          # cond width up to v5.3 (10 sliders); the 2 newer sliders sit at the end
+# cond index of each slider (order SLIDERS): the first 10 after the 13 stats, the ones added later at the end, so an older
+# checkpoint's input weights zero-pad at the end (model.load_state_dict) and act the same
+COND_SLIDERS = np.r_[13:23, N_COND_V53:N_COND]
+N_S = N_SELF + N_COND + N_INT            # policy vector input s = cat[self, cond, intent]; S_INT = the intent block's offset
+S_INT = N_SELF + N_COND
 LEFT0 = {1: 10, 2: 5, 3: 4}              # teams left at the start by team size (sim trio = 3 x 3 + 1 solo, live 4 x 3)
 _S, _E = SEG.index, ENT.index
+_AREA_C = [ENT.index("enemy_area_effect"), ENT.index("teammate_area_effect")]
 
 # Ranges, sampled once per episode. Measured by rl/measure_noise.py on the v6 models (HISTORY 61): 0 .. 2 x measured.
 VEL_K = 3   # entity velocity = mean of the last <= VEL_K matched one-decision differences (then an EMA 1 / VEL_K): one
@@ -54,7 +100,13 @@ NOISE = {"jitter": (0.0, 0.039),   # box centre sigma, 10-tile units (measured .
          "fp": (0.0, 0.060),       # chance per empty slot and decision of a false detection (measured .030)
          "seg": (0.0, 0.137),      # chance per visible tile and decision of a wrong class (measured .068)
          "latency": (1, 2),        # decisions between the frame and the action (inclusive)
-         "bleed": (0.0, 0.0)}      # factor on BLEED_ROW x BLEED_CLS: off, v6 labels / models show 0.3-0.7 % (HISTORY 61)
+         "bleed": (0.0, 0.0),      # factor on BLEED_ROW x BLEED_CLS: off, v6 labels / models show 0.3-0.7 % (HISTORY 61)
+         # identity (v5.6). GUESSES until the live reader (countdown name OCR + nickname per track) is measured:
+         "id_known": (0.2, 1.0),       # chance per enemy player and battle that its brawler is known (the countdown only
+                                       # shows the players on screen then; a track lost and re-found keeps its name)
+         "id_known_mate": (0.8, 1.0),  # the same for a teammate (lobby / countdown show the team; on screen together)
+         "id_wrong": (0.0, 0.05),      # chance per known enemy and battle that it is given a wrong brawler (OCR / name match)
+         "pj_owner_known": (0.3, 1.0)} # chance per projectile row and decision that it is linked to its shooter (by origin)
 
 # measured miss chance per class, det_v6 vs labels on 1000 val frames (HISTORY 61), ENT order
 DROP_CLS = np.array([.079, .085, .198, .101, .032, .241, .527, .457, .449, .263], np.float32)
@@ -93,8 +145,51 @@ def _tile_lut():
     return lut
 
 
-def from_state2(vec, grid, meta):
-    """fair state2 vec (B, 436), grid (B, 6, 25, 25), meta (B, 5) = x, y, tick, W, H (MAEnv.last_meta) -> clean obs"""
+AREA_ITEM0 = 1000000   # item feature 5 code: 1 + area_effects_skin row (17xxxxxx), AREA_ITEM0 + 1 + items row (18xxxxxx)
+_HARM_T = {"Damage", "Dot", "DamageAndStatusEffect", "HealAndDamage", "HotAndDot", "DelayedDamage", "BulletExplosion", "Stun", "Pushback"}
+_HELP_T = {"Heal", "Hot", "HealRegen", "HealAndDamage", "HotAndDot", "DamageBoost", "ExtraSuperCharge"}
+
+
+@functools.lru_cache(None)
+def _area_lut():
+    """(n, 4) float32 per item feature-5 code (index: area skin row + 1, then AREA_ITEM0 rows from index NA): radius / 3000
+    (10-tile units, as dx / dy), harms enemies, helps allies, slows enemies; row 0 / unknown = 0. From area_effects_skin
+    (Logic) -> area_effects_logic (Radius, Type, Damage) + status_effects_logic of StatusEffectEnemy / Ally; an item
+    through its TriggerAreaEffect (the bomb's explosion)."""
+    named = lambda f: [r for r in D._rows(f) if r.get("Name")]
+    lg = {r["Name"]: r for r in named("area_effects_logic.csv")}; se = {r["Name"]: r for r in named("status_effects_logic.csv")}
+    num = lambda r, k: int((r.get(k) or "0").split(";")[0] or 0)   # one row has Radius '720;1200' (first = the base)
+
+    def row(L):
+        if L is None: return [0.0] * 4
+        en, al = se.get(L.get("StatusEffectEnemy"), {}), se.get(L.get("StatusEffectAlly"), {})
+        harm = L.get("Type") in _HARM_T or num(L, "Damage") > 0 or num(en, "Damage") > 0 or en.get("FullStun", "").lower() == "true"
+        help_ = L.get("Type") in _HELP_T or any(num(al, k) > 0 for k in ("Healing", "SpeedBoostPercent", "SpeedBoostAbsolute", "DamageBoostPercent", "ShieldPercent"))
+        slow = num(en, "SpeedReducePercent") > 0 or num(en, "SpeedReduceAbsolute") > 0
+        return [num(L, "Radius") / 3000.0, harm, help_, slow]
+    sk, items = named("area_effects_skin.csv"), named("items.csv")
+    lut = np.zeros((1 + len(sk) + 1 + len(items), 4), np.float32)
+    for k, r in enumerate(sk): lut[1 + k] = row(lg.get(r.get("Logic") or r["Name"]))
+    skl = {r["Name"]: r.get("Logic") or r["Name"] for r in sk}   # TriggerAreaEffect names a skin row or a logic row
+    for k, r in enumerate(items):
+        t = r.get("TriggerAreaEffect"); lut[1 + len(sk) + 1 + k] = row(lg.get(t) or lg.get(skl.get(t)))
+    return lut, 1 + len(sk)
+
+
+def area_feats(code, side):
+    """(..., 4) entity columns RAD.. of item rows: feature-5 code (host data id - 16999999), side = item feature 4
+    (1 enemy / neutral, -1 my team) -> radius, harms me, helps me, slows me"""
+    lut, na = _area_lut(); c = np.rint(code).astype(np.int64)
+    i = np.where(c > AREA_ITEM0, na + np.clip(c - AREA_ITEM0, 0, len(lut) - na - 1), np.clip(c, 0, na - 1))
+    f = lut[i].copy(); foe = side > 0.5
+    f[..., 1] *= foe; f[..., 3] *= foe; f[..., 2] *= side < -0.5
+    return f
+
+
+def from_state2(vec, grid, meta, who=None, derived=True):
+    """fair state2 vec (B, 436), grid (B, 6, 25, 25), meta (B, 5) = x, y, tick, W, H (MAEnv.last_meta), who (B, N_ENT, 3)
+    (module doc; None = identities unknown) -> clean obs (every row with an owner known). derived=False: identity and
+    line-of-sight columns left 0 (the noisy build computes them itself)"""
     B = len(vec)
     s = np.zeros((B, N_SELF), np.float32)
     s[:, 0] = vec[:, 0]; s[:, 1] = np.minimum(vec[:, 2], 1.0); s[:, 2] = vec[:, 5] >= 1.0; s[:, 5] = vec[:, 8]
@@ -121,6 +216,8 @@ def from_state2(vec, grid, meta):
     it = it.copy(); it[..., 0] *= (it[..., 3] > 0.5) | (np.abs(it[..., 4]) > 0.5)  # other items are not detected classes
     # item 4: 1 = showdown bomb or enemy area effect, -1 = area effect of my team (nbhost_rl encode.c)
     fill(k, it, np.select([it[..., 3] > 0.5, it[..., 4] < -0.5], [_E("power_cube"), _E("teammate_area_effect")], _E("enemy_area_effect")))
+    area = (it[..., 0] > 0.5) & (it[..., 3] < 0.5) & (np.abs(it[..., 4]) > 0.5)
+    ent[:, k:k + F.IT_K, RAD:RAD + 4] = area_feats(it[..., 5], it[..., 4]) * area[..., None]
 
     g = _tile_lut()[grid[:, 0]]
     g[(grid[:, 3] > 0) & (g == _S("floor"))] = _S("poison")
@@ -128,7 +225,66 @@ def from_state2(vec, grid, meta):
     rx, ry = _cam(meta)
     seen = (np.abs(rx) < F.VIEW_X)[:, None, :] & ((ry > -F.VIEW_UP) & (ry < F.VIEW_DOWN))[:, :, None]
     g[~seen] = UNKNOWN
+    if not derived: return {"self": s, "ent": ent, "grid": g}
+    if who is not None:
+        w = np.asarray(who); ok = (w[..., 1] >= 0) & (ent[..., 0] > 0.5)
+        ent[..., ID0:ID0 + 13] = id_lut()[1][np.where(ok, w[..., 1], -1)]; ent[..., ID_KNOWN] = ok
+    ent[..., LOS:LOS + 2] = los(ent, g)
     return {"self": s, "ent": ent, "grid": g}
+
+
+# line of sight (v5.6): projectile-blocking classes (BlocksMovement + BlocksProjectiles in tiles.csv: every wall class,
+# bouncer, gravity, Fragile; power_box = a live render state of the boxes) vs movement-only (water, rope fence)
+_BLOCK_PJ = np.isin(np.arange(len(SEG) + 1), [SEG.index(n) for n in ("indestructible", "destructible_wall", "fragile_wall", "bouncer",
+                                                                     "gravity", "power_box", "destructible")])
+_BLOCK_MV = np.isin(np.arange(len(SEG) + 1), [SEG.index(n) for n in ("water", "rope_fence")])
+LOS_N = 32                                 # samples per line: <= 0.5 tile apart up to 16 tiles (the view's diagonal)
+_LOS_T = ((np.arange(LOS_N) + 0.5) / LOS_N).astype(np.float32)
+
+
+def los(ent, g):
+    """(B, N_ENT, 2) float32 wall_between, water_between of the present enemy / teammate rows of ent (B, N_ENT, F_ENT)
+    on the seg grid g (B, G, G): any sample of the line from my tile centre (cell 12.5, 12.5) to the row's dx, dy on a
+    _BLOCK_PJ / _BLOCK_MV tile, my own tile and the row's tile left out; 0 for every other row"""
+    out = np.zeros(ent.shape[:2] + (2,), np.float32)
+    m = (ent[..., 0] > 0.5) & (ent[..., 1:1 + len(ENT)].argmax(-1) <= _E("teammate"))
+    bi, ki = np.nonzero(m)
+    if not len(bi): return out
+    d = ent[bi, ki, XY:XY + 2] * np.float32(10.0)                                        # tiles, (x, y)
+    c = np.floor(np.float32(G / 2) + d[:, None, :] * _LOS_T[None, :, None]).astype(np.int64)   # (n, LOS_N, 2) cells
+    end = np.floor(np.float32(G / 2) + d).astype(np.int64)
+    ok = ((c >= 0) & (c < G)).all(-1) & ~(c == G // 2).all(-1) & ~(c == end[:, None]).all(-1)
+    t = g[bi[:, None], np.clip(c[..., 1], 0, G - 1), np.clip(c[..., 0], 0, G - 1)]
+    out[bi, ki, 0] = (_BLOCK_PJ[t] & ok).any(1); out[bi, ki, 1] = (_BLOCK_MV[t] & ok).any(1)
+    return out
+
+
+def id_draws(n, r):
+    """per-episode identity draws (ObsV5._episode / FastObsV5._episode, after the older draws, same order): known chance
+    enemy / mate, wrong chance, projectile link chance, then per player slot (16) u_known, u_wrong and the wrong pick
+    offset (1 .. n_heroes - 1, never the true one). Keys missing from the noise dict: identity perfect"""
+    nh = len(id_lut()[0])
+    return (r.uniform(*n.get("id_known", (1, 1))), r.uniform(*n.get("id_known_mate", (1, 1))), r.uniform(*n.get("id_wrong", (0, 0))),
+            r.uniform(*n.get("pj_owner_known", (1, 1))), r.random(16), r.random(16), r.integers(1, max(nh, 2), 16))
+
+
+_PJ_ROW = (np.arange(N_ENT) >= F.EN_K) & (np.arange(N_ENT) < F.EN_K + F.PJ_K)   # ent slots of the projectile block
+
+
+def noisy_id(ent, who, eps_id, link):
+    """identity columns in place on noisy rows: eps_id = per row of the batch its id_draws tuple, link (B, N_ENT)
+    uniforms of this decision (projectile owner linked iff < its chance). A player's identity (known, given brawler) is a
+    function of the episode draws only, so it stays fixed for the battle; me: always known, never wrong; mates: never wrong"""
+    names, lut = id_lut(); nh = len(names)
+    pk_en, pk_m, pw, ppj = (np.array([e[i] for e in eps_id], np.float32) for i in range(4))
+    uk, uw, pick = (np.stack([e[i] for e in eps_id]) for i in (4, 5, 6))
+    w = np.asarray(who); q = np.clip(w[..., 0], 0, 15).astype(np.int64); hero, side = w[..., 1].astype(np.int64), w[..., 2]
+    tk = lambda a: np.take_along_axis(a, q, 1)
+    kp = (side == WHO_ME) | (tk(uk) < np.where(side == WHO_MATE, pk_m[:, None], pk_en[:, None]))
+    wrong = (side == WHO_FOE) & (tk(uw) < pw[:, None])
+    given = np.where(wrong, (hero + tk(pick)) % max(nh, 1), hero)
+    known = (hero >= 0) & (w[..., 0] >= 0) & (ent[..., 0] > 0.5) & kp & (~_PJ_ROW[None] | (side == WHO_ME) | (link < ppj[:, None]))
+    ent[..., ID0:ID0 + 13] = lut[np.where(known, given, -1)]; ent[..., ID_KNOWN] = known
 
 
 def _cam(meta):
@@ -168,22 +324,24 @@ class ObsV5:
         self.noise, self.rng, self.ep, self.ticks = noise, np.random.default_rng(seed), {}, ticks   # ticks per decision (Env)
 
     def _episode(self, aid):
-        """agent id -> [jitter, drop, fp, seg, latency, frames, last decision's detections, bleed factor, drop_cls factor]"""
+        """agent id -> [jitter, drop, fp, seg, latency, frames, last decision's detections, bleed factor, drop_cls factor,
+        identity draws (id_draws)]"""
         e = self.ep.get(aid)
         if e is None:
             n, r = self.noise, self.rng
             e = self.ep[aid] = [r.uniform(*n["jitter"]), r.uniform(*n["drop"]), r.uniform(*n["fp"]), r.uniform(*n["seg"]),
                                 int(r.integers(n["latency"][0], n["latency"][1] + 1)), [], None, r.uniform(*n.get("bleed", (0, 0))),
-                                r.uniform(*n.get("drop_cls", (0, 0)))]
+                                r.uniform(*n.get("drop_cls", (0, 0))), id_draws(n, r)]
             if len(self.ep) > 4096:   # shortcut: ended episodes are never reported here, so drop the oldest half
                 for k in list(self.ep)[:2048]: del self.ep[k]
         return e
 
-    def build(self, vec, grid, meta, ids, cmd=None):
+    def build(self, vec, grid, meta, ids, cmd=None, who=None):
         """cmd (B, 2) tiles / tick (sim_plan A2, train_fast --cmd-vel): own velocity = the commanded move, as the agent gets
         it live (BSRL brain / play_live: move direction x brawler speed); entity velocities then carry the same error
-        (live: matched position difference + commanded own velocity). Noisy path only."""
-        o = from_state2(vec, grid, meta)
+        (live: matched position difference + commanded own velocity). Noisy path only. who (B, N_ENT, 3): the rows'
+        owners (env_v5.Env.last_who; module doc), None = every identity unknown."""
+        o = from_state2(vec, grid, meta, who, derived=self.noise is None or not len(ids))
         if self.noise is None or not len(ids):
             return o
         r, B = self.rng, len(ids)
@@ -200,12 +358,15 @@ class ObsV5:
         ent[here & (r.random(here.shape) < pd)] = 0.0
         nse = r.normal(size=(B, N_ENT, 2)).astype(np.float32) * jit[:, None, None] * ent[..., :1]
         ent[..., XY:XY + 2] += nse
+        rj = r.normal(size=(B, N_ENT)).astype(np.float32) * jit[:, None] * (ent[..., RAD] > 0)   # radius from the drawn ring:
+        ent[..., RAD] = np.maximum(ent[..., RAD] + rj, 0.0)                                       # the centre's sigma (not measured)
         n = int(false.sum())
         if n:
             row = np.zeros((n, F_ENT), np.float32); row[:, 0] = 1.0
-            row[np.arange(n), 1 + r.integers(len(ENT), size=n)] = 1.0
+            fc = r.integers(len(ENT), size=n); row[np.arange(n), 1 + fc] = 1.0
             row[:, XY] = r.uniform(-1.5, 1.5, n); row[:, XY + 1] = r.uniform(-F.VIEW_UP, F.VIEW_DOWN, n) / F.R
             row[:, HP] = r.random(n)
+            row[:, RAD] = np.isin(fc, _AREA_C) * r.uniform(0.1, 0.5, n)   # a false area effect: a 300-1500 radius, no kind
             ent[false] = row
         hud = hud_mask(meta, r); g[hud] = UNKNOWN          # the seg model labels the HUD controls 'ui'
         bl = np.array([e[7] for e in eps], np.float32)
@@ -215,6 +376,10 @@ class ObsV5:
         g[bleed] = front[bleed]
         wrong = (g != UNKNOWN) & (r.random(g.shape) < seg[:, None, None])
         g[wrong] = r.integers(len(SEG), size=int(wrong.sum()))
+        link = r.random((B, N_ENT))                       # identity (v5.6): projectile owner links of this decision
+        if who is None: ent[..., ID0:ID0 + N_ID] = 0.0
+        else: noisy_id(ent, np.where(here[..., None], who, -1), [e[9] for e in eps], link)   # false detections: unknown
+        ent[..., LOS:LOS + 2] = los(ent, g)               # on the noisy rows / grid of this frame
         # velocity as the agent gets it: the difference of two noisy detections, 0 for one not matched to the last decision
         on, cls = ent[..., 0] > 0.5, ent[..., 1:1 + len(ENT)].argmax(-1)
         move = (ent[..., VEL:VEL + 2] - o["self"][:, None, 6:8]) * (self.ticks / 10)   # tiles/tick -> 10-tile units per decision
@@ -258,12 +423,65 @@ def brawler_stats(name):
     return np.minimum(v, 2.0)    # a few rows are far out (a 29000-speed projectile, 120-tile supers)
 
 
+@functools.lru_cache(None)
+def hero_names():
+    """playable brawlers = Hero rows that own cards (drops transforms, bosses and the hashed unreleased rows), table order
+    (env_v5.heroes = these minus skip.json)"""
+    import re
+    owners = {r["Target"] for r in D._rows("cards.csv")}
+    return tuple(n for n, (_, r) in D.table("characters.csv").items()
+                 if r.get("Type") == "Hero" and r.get("Disabled") != "true" and n in owners and not re.fullmatch(r"[0-9a-f]{40}", n))
+
+
+@functools.lru_cache(None)
+def id_lut():
+    """(names, (n + 1, 13) float32): the brawlers an identity can name (hero_names) and their brawler_stats; the last row
+    (index -1) = zeros = unknown. id_row(name) / id_row_of_data(characters data id) -> row, -1 if not a hero"""
+    names = hero_names()
+    return names, np.concatenate([np.stack([brawler_stats(n) for n in names]), np.zeros((1, 13), np.float32)]).astype(np.float32)
+
+
+@functools.lru_cache(None)
+def _id_rows():
+    t = D.table("characters.csv"); names = id_lut()[0]
+    return {n: k for k, n in enumerate(names)}, {t[n][0]: k for k, n in enumerate(names)}
+
+
+def id_row(name):
+    return _id_rows()[0].get(name, -1)
+
+
+def id_row_of_data(data_id):
+    return _id_rows()[1].get(int(data_id), -1)
+
+
+# play-style modes: slider weights (0-2) per named preset, sliders not listed = 1.0 (the uniform sampler's mean).
+# Inference: cond(..., sliders=preset_vec(name)). 2 = the style's own sliders, 0-0.5 = what the style gives up.
+PRESETS = {
+    "balanced": {},
+    "bush_camper": {"bush_camp": 2, "collect": .5, "retreat": 1.5, "aggressive": 0, "third_party": 1.5, "bush_control": .5, "gas_safe": 1.5},
+    "aggressive": {"bush_camp": 0, "collect": .5, "retreat": .5, "kite": .3, "peek": .5, "focus": 2, "aggressive": 2, "third_party": .5,
+                   "bush_control": .5, "gas_safe": .5},
+    "cube_farmer": {"bush_camp": .5, "collect": 2, "protect": .5, "retreat": 1.5, "peek": .5, "aggressive": .3, "leash": .5, "gas_safe": 1.5},
+    "third_partier": {"protect": .5, "kite": 1.5, "focus": 1.5, "aggressive": .3, "third_party": 2, "leash": .5},
+    "marksman": {"bush_camp": .5, "protect": .5, "retreat": 1.5, "kite": 2, "peek": 1.5, "aggressive": 0, "leash": .5},
+    "team_player": {"bush_camp": .5, "collect": .5, "protect": 2, "focus": 2, "third_party": .5, "bush_control": .5, "leash": 2},
+}
+
+
+def preset_vec(name):
+    """(len(SLIDERS),) float32 slider weights of a PRESETS entry"""
+    p = PRESETS[name]
+    return np.array([p.get(k, 1.0) for k in SLIDERS], np.float32)
+
+
 def cond(brawler, sliders, team_size=1, cubes=0, left=None):
-    """conditioning vector: brawler stats (13) + slider weights 0-2 (10, order SLIDERS) + team size 1-3 one-hot
-    + own power cubes / 10 (max 2) + teams (solo: players) left / 10, the two Showdown HUD numbers"""
-    t = np.zeros(3, np.float32); t[team_size - 1] = 1.0
+    """conditioning vector: brawler stats (13) + slider weights 0-2 (the first 10 of SLIDERS) + team size 1-3 one-hot
+    + own power cubes / 10 (max 2) + teams (solo: players) left / 10, the two Showdown HUD numbers + the later sliders
+    (leash, gas_safe). COND_SLIDERS = each slider's index."""
+    t = np.zeros(3, np.float32); t[team_size - 1] = 1.0; w = np.asarray(sliders, np.float32)
     hud = np.array([min(cubes, 20) / 10.0, (LEFT0[team_size] if left is None else left) / 10.0], np.float32)
-    return np.concatenate([brawler_stats(brawler), np.asarray(sliders, np.float32), t, hud])
+    return np.concatenate([brawler_stats(brawler), w[:10], t, hud, w[10:]])
 
 
 def _check():
@@ -278,7 +496,9 @@ def _check():
     grid[:, 0] = tile("Open")
     row(F.PJ0, F.PJ_F, 0, [1, 0.1, 0.1, 1, 0, 1, 0]); row(F.PJ0, F.PJ_F, 1, [1, 0.2, 0.1, 0, 1, 0, 1])
     row(F.BX0, F.BX_F, 0, [1, 0.3, 0.3, 0.6])
-    row(F.IT0, F.IT_F, 0, [1, 0.4, 0, 1, 0]); row(F.IT0, F.IT_F, 1, [1, 0.4, 0, 0, 1]); row(F.IT0, F.IT_F, 2, [1, 0.4, 0, 0, 0]); row(F.IT0, F.IT_F, 3, [1, 0.4, 0, 0, -1])
+    lut, na = _area_lut(); slow = int(np.nonzero(lut[1:na, 3])[0][0]) + 1        # codes: 1 Brock_def_atk_area (damage, 450), 155 Heal
+    row(F.IT0, F.IT_F, 0, [1, 0.4, 0, 1, 0]); row(F.IT0, F.IT_F, 1, [1, 0.4, 0, 0, 1, 1]); row(F.IT0, F.IT_F, 2, [1, 0.4, 0, 0, 0]); row(F.IT0, F.IT_F, 3, [1, 0.4, 0, 0, -1, 155])
+    row(F.IT0, F.IT_F, 4, [1, 0.4, 0, 0, 1, slow]); row(F.IT0, F.IT_F, 5, [1, 0.4, 0, 0, -1, 1]); row(F.IT0, F.IT_F, 6, [1, 0.4, 0, 0, 1, AREA_ITEM0 + 1 + 35])
     grid[0, 0, 12, 13] = tile("Indestructible"); grid[0, 0, 12, 14] = tile("Forest"); grid[0, 3, 12, 14] = 1
     grid[0, 0, 12, 15] = tile("Wall1"); grid[0, 0, 12, 16] = tile("Water"); grid[0, 0, 12, 17] = tile("RopeFence")
     grid[0, 3, 5, 5] = 1; grid[0, 4, 3, 3] = 1; grid[0, 0, 3, 3] = 0
@@ -288,9 +508,14 @@ def _check():
     e = o["ent"][0]; cls = lambda k: ENT[int(e[k, 1:1 + len(ENT)].argmax())]
     got = [(k, cls(k)) for k in np.nonzero(e[:, 0])[0]]
     assert got == [(0, "enemy"), (1, "teammate"), (2, "enemy_summon"), (3, "teammate_summon"), (9, "teammate_projectile"),
-                   (10, "enemy_projectile"), (25, "power_box"), (31, "power_cube"), (32, "enemy_area_effect"), (34, "teammate_area_effect")], got
-    assert np.allclose(e[0, XY:], [0.5, -0.2, 40 / 300, 0, 0.8]) and np.allclose(e[10, VEL:VEL + 2], [0, 200 / 300])
-    assert e[:, 1:1 + len(ENT)].sum() == 10 and not o["ent"][1].any()
+                   (10, "enemy_projectile"), (25, "power_box"), (31, "power_cube"), (32, "enemy_area_effect"), (34, "teammate_area_effect"), (35, "enemy_area_effect"),
+                   (36, "teammate_area_effect"), (37, "enemy_area_effect")], got
+    assert np.allclose(e[0, XY:RAD], [0.5, -0.2, 40 / 300, 0, 0.8]) and np.allclose(e[10, VEL:VEL + 2], [0, 200 / 300])
+    assert e[:, 1:1 + len(ENT)].sum() == 13 and not o["ent"][1].any()
+    # area columns: radius, harms / helps / slows me; an area of my team never harms me; the Piper bomb = its explosion
+    assert np.allclose(e[32, RAD:RAD + 4], [0.15, 1, 0, 0]) and np.allclose(e[34, RAD:RAD + 4], [800 / 3000, 0, 1, 0]), (e[32, RAD:RAD + 4], e[34, RAD:RAD + 4])
+    assert e[35, RAD] > 0 and e[35, RAD + 3] == 1 and np.allclose(e[36, RAD:RAD + 4], [0.15, 0, 0, 0]) and np.allclose(e[37, RAD:RAD + 4], [0.2, 1, 0, 0])
+    assert not e[:32, RAD:RAD + 4].any() and lut[1:na, 0].mean() > 0.1 and lut[1:na, 1:].sum(0).min() > 50   # every kind occurs in the tables
     g = o["grid"][0]
     assert (g[12, 13], g[12, 14], g[5, 5], g[3, 3], g[12, 12]) == (_S("indestructible"), _S("bush"), _S("poison"),
                                                                  _S("out_of_bounds"), _S("floor"))
@@ -317,13 +542,15 @@ def _check():
         n = nz.build(vec, grid, meta, ids)
         assert all(n[k].shape == o[k].shape and n[k].dtype == o[k].dtype for k in o) and n["grid"].max() <= UNKNOWN
         assert not ((n["grid"] == UNKNOWN) & (o["grid"] != UNKNOWN) & ~hud).any() and (n["grid"][o["grid"] == UNKNOWN] == UNKNOWN).all() and np.array_equal(n["self"], o["self"])
+        ar = np.isin(n["ent"][..., 1:1 + len(ENT)].argmax(-1), _AREA_C) & (n["ent"][..., 0] > 0)   # radius only on area rows, >= 0
+        assert (n["ent"][..., RAD] >= 0).all() and not n["ent"][~ar][:, RAD:RAD + 4].any() and (n["ent"][ar][:, RAD] > 0).mean() > 0.9
         on = n["ent"][0, :, 0] > 0; was = o["ent"][0, :, 0] > 0
         kept += (on & was).sum(); fps += (on & ~was).sum(); flips += (n["grid"] != o["grid"]).mean()
         if on[0]: d.append(n["ent"][0, 0, XY] - 0.5)
         back += on[0] and not on0; vback += on[0] and not on0 and n["ent"][0, 0, VEL:VEL + 2].any()
         on0 = on[0]
     assert back > 50 and vback <= 3, (back, vback)       # back after a drop: no velocity (rare: matched to a false positive)
-    assert 0.4 < kept / (300 * 9) < 0.6 and 0.15 < fps / (300 * (N_ENT - 9)) < 0.25, (kept, fps)
+    assert 0.4 < kept / (300 * 13) < 0.6 and 0.15 < fps / (300 * (N_ENT - 13)) < 0.25, (kept, fps)
     assert 0.1 < flips / 300 < 0.2 and 0.02 < np.std(d) < 0.04, (flips, np.std(d))
     dc = ObsV5(noise=dict(hi, jitter=(0, 0), drop=(0, 0), drop_cls=(2, 2), fp=(0, 0), seg=(0, 0)))   # per-class miss chance
     was = o["ent"][0, :, 0] > 0; pk = 1 - np.minimum(1, 2 * DROP_CLS[o["ent"][0, was, 1:1 + len(ENT)].argmax(-1)])
@@ -349,11 +576,76 @@ def _check():
     assert st.shape == (len(hs), 13) and np.isfinite(st).all() and st.min() >= 0 and st.max() <= 2, (st.min(), st.max())
     assert np.allclose(brawler_stats("ShotgunGirl")[[0, 1, 3, 6, 7, 8]], [23 / 30, 0.77, 3100 / 4000, 0, 0, 0.39])
     assert brawler_stats("Barkeep")[6] == 1 and brawler_stats("Undertaker")[7] == 1
-    c = cond("Sniper", np.ones(10), 3)
-    assert c.shape == (N_COND,) and c[-3] == 1 and c[-5] == 0 and c[-2] == 0 and abs(c[-1] - 0.4) < 1e-6
-    assert np.allclose(cond("Sniper", np.ones(10), 1, cubes=3, left=7)[-2:], [0.3, 0.7])
-    print("obs_v5 ok: %d brawlers, %d thrown, %d melee, cond %d, ent %dx%d" % (
-        len(hs), st[:, 6].sum(), st[:, 7].sum(), N_COND, N_ENT, F_ENT))
+    c = cond("Sniper", np.ones(len(SLIDERS)), 3)
+    assert c.shape == (N_COND,) and c[25] == 1 and c[23] == 0 and c[26] == 0 and abs(c[27] - 0.4) < 1e-6
+    assert np.allclose(cond("Sniper", np.ones(len(SLIDERS)), 1, cubes=3, left=7)[26:28], [0.3, 0.7])
+    w = np.arange(len(SLIDERS), dtype=np.float32) / 10; c = cond("Sniper", w, 2)
+    assert np.allclose(c[COND_SLIDERS], w) and N_COND == 30 and len(COND_SLIDERS) == len(SLIDERS) and np.allclose(c[:13], brawler_stats("Sniper"))
+    assert c[:N_COND_V53].shape == (28,) and np.allclose(c[13:23], w[:10]) and c[24] == 1   # the v5.3 layout is the first 28
+    assert set(PRESETS) >= {"balanced", "bush_camper", "aggressive", "cube_farmer"} and all(set(v) <= set(SLIDERS) for v in PRESETS.values())
+    pv = np.stack([preset_vec(k) for k in PRESETS])
+    assert pv.shape == (len(PRESETS), len(SLIDERS)) and pv.min() >= 0 and pv.max() <= 2 and (preset_vec("balanced") == 1).all()
+    assert preset_vec("bush_camper")[SLIDERS.index("bush_camp")] == 2 and len({tuple(r) for r in pv}) == len(PRESETS)
+    assert N_INT == 11 and len(INTENTS) == 8 and INTENTS[0] == "none" and N_S == N_SELF + N_COND + N_INT == 49 and S_INT == 38
+    assert (I_XY, I_RAD, I_LEFT) == (7, 9, 10) and OBS_VERSION == "v5.6"
+    assert (F_ENT_V55, ID0, ID_KNOWN, LOS, F_ENT) == (20, 20, 33, 34, 36)
+    _check_id(vec, grid, meta)
+    print("obs_v5 ok (%s): %d brawlers, %d thrown, %d melee, cond %d, intent %d, s %d, ent %dx%d" % (
+        OBS_VERSION, len(hs), st[:, 6].sum(), st[:, 7].sum(), N_COND, N_INT, N_S, N_ENT, F_ENT))
+
+
+def _check_id(vec, grid, meta):
+    """v5.6 identity + line of sight: true stats + known 1 when given, zeros + 0 when not, fixed per battle under noise,
+    wrong picks never the truth, projectile links per decision; wall_between / water_between on a synthetic grid"""
+    names, lut = id_lut(); nh = len(names)
+    assert lut.shape == (nh + 1, 13) and not lut[-1].any() and id_row("ShotgunGirl") == 0 and id_row("Boss") == -1
+    assert id_row_of_data(D.table("characters.csv")["Sniper"][0]) == id_row("Sniper") and id_row_of_data(16000120) == -1
+    who = np.full((2, N_ENT, 3), -1, np.int16)
+    who[0, 0] = [3, id_row("Sniper"), WHO_FOE]; who[0, 1] = [5, id_row("BullDude"), WHO_MATE]
+    who[0, 9] = [0, id_row("ShotgunGirl"), WHO_ME]; who[0, 10] = [3, id_row("Sniper"), WHO_FOE]   # own / enemy projectile
+    o = from_state2(vec, grid, meta, who); e = o["ent"][0]
+    for k, n in ((0, "Sniper"), (1, "BullDude"), (9, "ShotgunGirl"), (10, "Sniper")):
+        assert np.array_equal(e[k, ID0:ID0 + 13], brawler_stats(n)) and e[k, ID_KNOWN] == 1, k
+    assert not e[2:9, ID0:ID0 + N_ID].any() and not e[11:, ID0:ID0 + N_ID].any() and not o["ent"][1, :, ID0:].any()   # summons, boxes, areas: 0
+    assert not from_state2(vec, grid, meta)["ent"][..., ID0:ID0 + N_ID].any()                  # who None: every identity unknown
+    # line of sight: me at cell (12, 12); a wall 2 tiles right, water 3 tiles down, nothing up-left
+    g = np.zeros((1, G, G), np.uint8); g[0, 12, 14] = _S("indestructible"); g[0, 15, 12] = _S("water"); g[0, 9, 9] = _S("rope_fence")
+    en = np.zeros((1, N_ENT, F_ENT), np.float32); en[0, :6, 0] = 1
+    for k, c, xy in ((0, "enemy", (0.5, 0)), (1, "teammate", (0, 0.5)), (2, "enemy", (0.5, -0.5)), (3, "enemy", (0.2, 0)),
+                     (4, "power_box", (0.5, 0)), (5, "enemy", (-0.55, -0.55))):
+        en[0, k, 1 + _E(c)] = 1; en[0, k, XY:XY + 2] = xy
+    L = los(en, g)[0]                                     # 5 right: wall on the line; 5 down: water only; up-right: clear;
+    assert L[:6].tolist() == [[1, 0], [0, 1], [0, 0], [0, 0], [0, 0], [0, 1]], L[:6]   # 2 right = on the wall: own tile left out;
+    g2 = g.copy(); g2[0, 12, 14] = _S("bush"); g2[0, 12, 13] = UNKNOWN                   # a box: no line; a rope fence up-left
+    assert not los(en, g2)[0, 0].any() and los(en, g2)[0, 1, 1] == 1 and _BLOCK_PJ[[_S("destructible_wall"), _S("fragile_wall"), _S("bouncer")]].all()
+    assert not _BLOCK_PJ[[_S("water"), _S("rope_fence"), _S("bush"), UNKNOWN]].any() and _BLOCK_MV.sum() == 2
+    assert np.array_equal(o["ent"][..., LOS:], los(o["ent"], o["grid"])) and o["ent"][0, 0, LOS] == 1   # enemy 0: the Indestructible at 12, 13
+    # noisy: per battle fixed identity, per decision projectile links
+    q0 = {k: (0.0, 0.0) for k in NOISE if not k.startswith(("id_", "pj_"))}; q0["latency"] = (0, 0)
+    nz = dict(q0, id_known=(0.5, 0.5), id_known_mate=(0.9, 0.9), id_wrong=(1, 1), pj_owner_known=(0.5, 0.5))
+    W = np.full((1, N_ENT, 3), -1, np.int16); v1, g1, m1 = vec[:1], grid[:1], meta[:1]
+    W[0, 0] = [3, id_row("Sniper"), WHO_FOE]; W[0, 1] = [5, id_row("BullDude"), WHO_MATE]; W[0, 10] = [3, id_row("Sniper"), WHO_FOE]
+    W[0, 9] = [0, id_row("ShotgunGirl"), WHO_ME]
+    ob = ObsV5(noise=nz, seed=4); kn = {0: [], 1: [], 9: [], 10: []}; st0 = set(); per = []
+    for aid in range(16, 16 + 16 * 400, 16):              # 400 battles of agent 0, 6 decisions each
+        ks = []
+        for t in range(6):
+            e = ob.build(v1, g1, m1, [aid], who=W)["ent"][0]; ks.append([e[k, ID_KNOWN] for k in kn])
+            if e[0, ID_KNOWN]: st0.add((aid, e[0, ID0:ID0 + 13].tobytes()))
+            if e[1, ID_KNOWN]: assert np.array_equal(e[1, ID0:ID0 + 13], brawler_stats("BullDude"))   # mates: never wrong
+            if e[0, ID_KNOWN]: assert not np.array_equal(e[0, ID0:ID0 + 13], brawler_stats("Sniper"))  # id_wrong 1: never the truth
+            assert e[9, ID_KNOWN] == 1 and np.array_equal(e[9, ID0:ID0 + 13], brawler_stats("ShotgunGirl"))   # mine: always
+            assert e[10, ID_KNOWN] <= e[0, ID_KNOWN] and (not e[10, ID_KNOWN] or np.array_equal(e[10, ID0:ID0 + 13], e[0, ID0:ID0 + 13]))
+            assert not e[[2, 3, 25, 31], ID0:ID0 + N_ID].any()
+        ks = np.array(ks); per.append(ks)
+        assert (ks[:, :3] == ks[:1, :3]).all()            # players: fixed for the battle
+    per = np.array(per)
+    assert len({a for a, _ in st0}) == len(st0) and 0.44 < per[:, 0, 0].mean() < 0.56 and 0.85 < per[:, 0, 1].mean() < 0.95, per[:, 0, :2].mean(0)
+    pjv = per[per[:, 0, 0] > 0][:, :, 3]
+    assert 0.42 < pjv.mean() < 0.58 and (pjv.min(1) != pjv.max(1)).mean() > 0.8, pjv.mean()   # links: per decision
+    assert not ObsV5(noise=nz).build(v1, g1, m1, [16])["ent"][..., ID0:ID0 + N_ID].any()
+    perfect = ObsV5(noise=q0, seed=1).build(v1, g1, m1, [16], who=W)["ent"][0]                # no id_* keys: identity perfect
+    assert np.array_equal(perfect[:, ID0:ID0 + N_ID], from_state2(v1, g1, m1, W)["ent"][0, :, ID0:ID0 + N_ID])
 
 
 def _live(decisions=300):
@@ -370,7 +662,8 @@ def _live(decisions=300):
                 want = [[a == b or (gr[a] and gr[a] == gr[b]) for b in range(10)] for a in range(10)]
                 assert same == want, (gr, tm)
                 print("teams ok: groups %s -> teams %s" % (gr, tm), flush=True)
-            t0 = time.perf_counter(); o = ob.build(obs["vec"], obs["grid"], env.last_meta, ids); t += time.perf_counter() - t0
+            t0 = time.perf_counter(); o = ob.build(obs["vec"], obs["grid"], env.last_meta, ids, who=env.last_who); t += time.perf_counter() - t0
+            _live_who(env, obs["vec"], ids, o, seen)
             assert all(np.isfinite(v).all() for v in o.values()) and o["self"][:, :2].max() <= 1.0, o["self"].max(0)
             assert np.abs(o["ent"][..., XY:XY + 2]).max() < 2.0 and o["grid"].max() <= UNKNOWN
             for c in o["ent"][..., 1:1 + len(ENT)].sum((0, 1)).nonzero()[0]: seen[ENT[c]] += 1
@@ -380,7 +673,33 @@ def _live(decisions=300):
                                     rng.integers(0, 360, len(ids)), rng.integers(0, 8, len(ids))], 1))
     finally:
         env.close()
-    print("live ok: %d decisions, %.0f us per decision, polls with class: %s" % (n, t / n * 1e6, dict(seen)))
+    print("live ok: %d decisions, %.0f us per decision, polls with class: %s" % (n, t / n * 1e6, {k: v for k, v in seen.items() if not k.startswith("id:")}))
+    idc = {k[3:]: v for k, v in seen.items() if k.startswith("id:")}; print("identity / line of sight:", idc)
+    assert idc.get("player_rows", 0) > 100 and idc.get("player_owned", 0) == idc["player_rows"] and not idc.get("bad", 0), idc
+    assert idc.get("pj_rows", 0) > 100 and idc.get("pj_owned", 0) >= 0.98 * idc["pj_rows"] and idc.get("summon_owned", 0) == 0 and idc.get("other_owned", 0) == 0, idc
+
+
+def _live_who(env, vec, ids, o, c):
+    """--live: Env.last_who against the true state: every brawler row of the enemy block has its owner, on the side its
+    feature 15 says, at the owner's true position, with the tag's brawler; summons none; projectiles their owner (own =
+    feature 5); the clean identity columns = the owner's stats"""
+    w = env.last_who; B = len(ids); en = vec[:, F.EN0:F.EN0 + F.EN_K * F.EN_F].reshape(B, F.EN_K, F.EN_F)
+    pj = vec[:, F.PJ0:F.PJ0 + F.PJ_K * F.PJ_F].reshape(B, F.PJ_K, F.PJ_F); by = {s.battle: s for s in env.I}
+    for b, a in enumerate(ids):
+        s = by[int(a) >> 4]; p = int(a) & 15; r = s.inst.resp; chr_ = s.cfg["tag"]["chr"]
+        for k in np.flatnonzero(en[b, :, 0] > 0.5):
+            q, h, sd = (int(x) for x in w[b, k])
+            if en[b, k, 14] > 0.5: c["id:summon_rows"] += 1; c["id:summon_owned"] += q >= 0; continue
+            c["id:player_rows"] += 1; c["id:player_owned"] += q >= 0
+            if q < 0: continue
+            pos = np.hypot(r.pl[p].x + en[b, k, 1] * F.R - r.pl[q].x, r.pl[p].y + en[b, k, 2] * F.R - r.pl[q].y)
+            c["id:bad"] += int(sd != (WHO_MATE if en[b, k, 15] > 0.5 else WHO_FOE) or h != id_row(chr_[q]) or pos > 1.0 or q == p)
+            c["id:bad"] += int(not np.array_equal(o["ent"][b, k, ID0:ID0 + 13], id_lut()[1][h]) or o["ent"][b, k, ID_KNOWN] != 1)
+            c["id:wall_between"] += int(o["ent"][b, k, LOS]); c["id:water_between"] += int(o["ent"][b, k, LOS + 1])
+        for k in np.flatnonzero(pj[b, :, 0] > 0.5):
+            q, sd = int(w[b, F.EN_K + k, 0]), int(w[b, F.EN_K + k, 2]); c["id:pj_rows"] += 1; c["id:pj_owned"] += q >= 0
+            if q >= 0: c["id:bad"] += int((sd == WHO_ME) != (pj[b, k, 5] > 0.5)); c["id:pj_mate"] += sd == WHO_MATE
+        c["id:other_owned"] += int((w[b, F.EN_K + F.PJ_K:, 0] >= 0).sum())
 
 
 if __name__ == "__main__":

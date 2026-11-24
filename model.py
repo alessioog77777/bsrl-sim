@@ -1,6 +1,6 @@
 """Policy for the ObsV5 observation: entity set + seg-class grid + self / conditioning vector -> GRU -> heads.
 
-    net = Policy(); logits, v, h = net(s, ent, grid, h)      # one decision; s = cat[self (8), cond (26)], h (B, HID)
+    net = Policy(); logits, v, h = net(s, ent, grid, h)      # one decision; s = cat[self (8), cond (30), intent (11)], h (B, HID)
     logits, v = net.seq(s, ent, grid, h0)                     # (N, L, ...) chunks from stored h0 -> flat (N * L) outputs
     logits = move 17 | fire 3 (none / attack / super) | aim 360 (pointer over visible enemies / boxes + free) | distance 8
 
@@ -12,6 +12,31 @@ Stage 2 (BSRL v2 plan), both zero-initialised so s3 / s4 checkpoints act the sam
   where a shot fired now meets it, and the flight time; own projectile speed = cond stats[3].
 * per-brawler embedding `hemb` (a learned trunk bias per hero): the hero is found by matching cond's 13 stats against
   the `hero_stats` table (add_heroes; saved in the checkpoint, rows never reorder), unknown = the last row.
+Obs v5.3 (obs_v5.OBS_VERSION): 4 area-effect columns at the end of the observation's entity row, before the lead columns;
+load_state_dict zero-pads v5.2 checkpoints there (same outputs).
+Obs v5.4: cond grew by 2 sliders (leash, gas_safe) at its end = the end of `s`; the generic pad zero-fills those
+`vec.0` input columns of a v5.3 checkpoint (same outputs; slot 7 push -> aggressive keeps its column).
+Obs v5.5: the intent block (obs_v5.N_INT, intent.py) at the end of `s`; its `vec.0` input columns start at zero (a fresh
+Policy draws the same weights as before plus zero columns) and the generic pad zero-fills them for a v5.4 checkpoint,
+which then acts the same whatever the block holds (free play = an all-zero block = the old input exactly).
+Obs v5.6: identity (14) + line-of-sight (2) columns at the end of the observation's entity row (obs_v5.ID0 .. F_ENT):
+their input weights in ent.0 / cand.0 / aux.fut.0 are inserted as zero columns before the lead columns (a fresh Policy
+draws the v5.5 weights under a given seed, then the zero columns are put in), and pad_param inserts them the same way
+into a v5.5 / v5.4 / v5.3 checkpoint's weights (load_state_dict) and Adam moments (train_ppo.load_opt): same outputs.
+Heads the actor never runs (NONACT; fast_act / act_stacked skip them, old checkpoints load with strict=False and get
+fresh ones; built on their own RNG stream, so Policy() under a given seed has the acting weights it had without them):
+* live value `vl` (trainer --vlive): MLP on the detached cat[x, h], no priv, so it works live (priv does not exist
+  there) and never changes the policy; zero-initialised. Target: the return without the intent reward.
+* aux heads `aux` (trainer --aux-w; labels from the sim's true state at train time only, env_v5.AUX): fut = each
+  enemy-block slot's position 1 s ahead (the slot's seen position + a zero-initialised offset: it starts at "stays
+  where seen"), hit = P(enemy damage taken in the next 1 s), gas = gas margin, bush = P(an enemy hidden in a bush within
+  5 tiles) per 45-degree sector. On cat[x, h] NOT detached: their gradients shape the encoders / trunk / GRU, never
+  the policy or value heads (separate modules).
+
+    lg, v, xc = net.seq(s, ent, grid, h0, priv, feats=True)  # + xc = cat[x, h] (N * L, d + HID) for the heads below
+    vl = net.value_live(xc)                                   # (N * L,)
+    xc = net.row_feats(s, ent, grid, h)                       # cat[x, h'] of single decisions from their stored h (no grad)
+    aux = net.aux_out(xc, ent, s); loss, per_head = aux_losses(aux, labels)
 """
 import numpy as np
 import torch
@@ -21,10 +46,16 @@ import obs_v5 as O
 from models4 import UnfoldConv2d, dist_logp_ent      # nirkt (MIOpen-safe conv; masked log-prob / entropy / sampling)
 
 NVEC, HID, PRIV = [17, 3, 360, 8], 256, 40
+NONACT = ("vl.", "aux.")                              # parameter prefixes acting never uses (skipped by fast_act / act_stacked)
+AUX_SLOTS = 9                                         # fut head: the enemy block (ent 0-8)
+AUX_REL = {"fut": 1.0, "hit": 0.5, "gas": 0.5, "bush": 0.5}   # relative aux loss weights (behaviour design 5; x --aux-w)
 _CAND = list(range(0, 9)) + list(range(25, 31))       # ent slots that can be aimed at: the enemy block + the power boxes
 _FOE = [1 + O.ENT.index(c) for c in ("enemy", "enemy_summon", "power_box")]
 N_LEAD, HMAX, N_STAT = 2, 160, 13                     # lead columns; hero table rows (+1 unknown); cond's brawler stats
 F_IN = O.F_ENT + N_LEAD                               # entity row width the network sees
+ENT_IN = ("ent.0.weight", "cand.0.weight", "aux.fut.0.weight")   # input = [x part] | obs row | lead (pad_param)
+_OLD_ROW = {O.F_ENT_V52: (O.F_ENT_V52, 0), O.F_ENT_V52 + N_LEAD: (O.F_ENT_V52, N_LEAD),   # old input width after the x part
+            O.F_ENT_V55 + N_LEAD: (O.F_ENT_V55, N_LEAD)}                               # -> (obs row, lead) (v5.2 / v5.3-v5.5)
 _PSPEED = 4000 / 300 / 20                             # cond stats[3] (projectile Speed / 4000, units/s) -> tiles / tick
 LAT = 3.0                                             # ticks between the frame and the shot: obs_v5 NOISE latency 1-2 decisions x 2
 
@@ -34,7 +65,7 @@ def lead(ent, s):
     meets it, and the flight time / 2 s. 0 for other rows, melee and targets faster than the shot. The frame is LAT ticks
     old when the shot leaves (obs latency 1-2 decisions, sim and live), so the foe is first moved on by its velocity
     relative to ours (s3 aimed behind movers: scorecard lead slope -0.41, HISTORY 82).
-    ent (..., N_ENT, F_ENT): dx, dy in 10-tile units, vx, vy tiles / tick; s (..., N_SELF + N_COND), self[6:8] own velocity."""
+    ent (..., N_ENT, F_ENT): dx, dy in 10-tile units, vx, vy tiles / tick; s (..., N_S), self[6:8] own velocity."""
     p0 = ent[..., O.XY:O.XY + 2] * 10.0; v = ent[..., O.VEL:O.VEL + 2]
     p = p0 + (v - s[..., None, 6:8]) * LAT
     sp = (s[..., O.N_SELF + 3] * _PSPEED)[..., None]
@@ -44,6 +75,29 @@ def lead(ent, s):
     q = p + v * t[..., None]
     sn = (p0[..., 0] * q[..., 1] - p0[..., 1] * q[..., 0]) / (torch.sqrt((p0 * p0).sum(-1) * (q * q).sum(-1)) + 1e-6)
     return torch.stack([sn, t / 40.0], -1) * ok[..., None]
+
+
+def _widen(lin, old_row):
+    """insert zero input columns into Linear lin (input = [x part] | obs row (old_row wide) | lead) so its obs row is
+    O.F_ENT wide; no RNG draw"""
+    w = lin.weight; at = w.shape[1] - N_LEAD
+    lin.weight = nn.Parameter(torch.cat([w[:, :at], w.new_zeros(w.shape[0], O.F_ENT - old_row), w[:, at:]], 1)); lin.in_features = lin.weight.shape[1]
+
+
+def pad_param(name, v, o):
+    """an old checkpoint's tensor v (a weight or its Adam moment) for this net's parameter o (same name) -> o's shape:
+    the entity-input matrices (ENT_IN) get the newer obs-row columns as zeros between the old row and the lead columns,
+    any other grown tensor zero-pads at the end of each dim (new inputs at the tail: s / cond / intent). v unchanged when
+    it already fits or cannot be padded."""
+    if v.shape == o.shape or v.dim() != o.dim() or not all(a <= b for a, b in zip(v.shape, o.shape)): return v
+    if name in ENT_IN and v.dim() == 2 and v.shape[0] == o.shape[0]:
+        pre = o.shape[1] - F_IN; row, n_lead = _OLD_ROW.get(v.shape[1] - pre, (None, None))
+        assert row is not None, (name, tuple(v.shape))
+        t = torch.zeros_like(o); t[:, :pre + row] = v[:, :pre + row]
+        if n_lead: t[:, -N_LEAD:] = v[:, -N_LEAD:]
+        return t
+    t = torch.zeros_like(o); t[tuple(slice(0, n) for n in v.shape)] = v
+    return t
 
 
 def hero_index(s, table):
@@ -59,21 +113,36 @@ class Policy(nn.Module):
         self.emb = nn.Embedding(O.UNKNOWN + 1, 8)
         self.grid = nn.Sequential(UnfoldConv2d(8, 32, 3, 2, 1), nn.ReLU(), UnfoldConv2d(32, 64, 3, 2, 1), nn.ReLU(),
                                   nn.Flatten(), nn.Linear(64 * 7 * 7, 256), nn.ReLU())
-        self.ent = nn.Sequential(nn.Linear(F_IN, 128), nn.ReLU(), nn.Linear(128, 128), nn.ReLU())
+        F55 = O.F_ENT_V55 + N_LEAD                       # v5.5 width: the same draws as before, v5.6 columns put in after
+        self.ent = nn.Sequential(nn.Linear(F55, 128), nn.ReLU(), nn.Linear(128, 128), nn.ReLU())
         self.vec = nn.Sequential(nn.Linear(O.N_SELF + O.N_COND, 128), nn.ReLU())
+        with torch.no_grad():                            # + the intent columns (v5.5), zero: same draws as before, same start
+            v0 = self.vec[0]; v0.weight = nn.Parameter(torch.cat([v0.weight, v0.weight.new_zeros(128, O.N_INT)], 1)); v0.in_features = O.N_S
         self.trunk = nn.Sequential(nn.Linear(512, d), nn.ReLU())
         self.hemb = nn.Embedding(HMAX + 1, d); nn.init.zeros_(self.hemb.weight)
         self.register_buffer("hero_stats", torch.full((HMAX, N_STAT), 1e4))   # empty rows match nothing
         self.gru = nn.GRUCell(d, HID)
         self.pi = nn.Linear(d + HID, 17 + 3 + 8); self.v = nn.Linear(d + HID, 1)
-        self.cand = nn.Sequential(nn.Linear(d + HID + F_IN, 128), nn.ReLU(), nn.Linear(128, 3))
+        self.cand = nn.Sequential(nn.Linear(d + HID + F55, 128), nn.ReLU(), nn.Linear(128, 3))
         self.vp = nn.Sequential(nn.Linear(d + HID + PRIV, 256), nn.ReLU(), nn.Linear(256, 1))
         nn.init.zeros_(self.vp[2].weight); nn.init.zeros_(self.vp[2].bias)
         self.free = nn.Linear(d + HID, 360); self.free_score = nn.Linear(d + HID, 1)
         nn.init.orthogonal_(self.pi.weight, 0.01); nn.init.zeros_(self.pi.bias); nn.init.zeros_(self.free.weight)
-        with torch.no_grad():   # the lead columns start unused
+        with torch.no_grad():   # the identity / line-of-sight columns (v5.6) start at zero, the lead columns unused
+            _widen(self.ent[0], O.F_ENT_V55); _widen(self.cand[0], O.F_ENT_V55)
             self.ent[0].weight[:, O.F_ENT:] = 0; self.cand[0].weight[:, -N_LEAD:] = 0
         self.register_buffer("bins", torch.arange(360).float())
+        with torch.random.fork_rng(devices=[]):          # own CPU stream: the acting weights' draws stay as before
+            torch.default_generator.manual_seed((torch.initial_seed() + 1) % 2 ** 63)
+            self.vl = nn.Sequential(nn.Linear(d + HID, 256), nn.ReLU(), nn.Linear(256, 1))   # live value (no priv)
+            nn.init.zeros_(self.vl[2].weight); nn.init.zeros_(self.vl[2].bias)
+
+        with torch.random.fork_rng(devices=[]):          # aux heads, own stream too (128 wide: small next to the grid conv)
+            torch.default_generator.manual_seed((torch.initial_seed() + 2) % 2 ** 63)
+            mlp = lambda i, o: nn.Sequential(nn.Linear(i, 128), nn.ReLU(), nn.Linear(128, o))
+            self.aux = nn.ModuleDict({"fut": mlp(d + HID + F55, 2), "hit": mlp(d + HID, 1), "gas": mlp(d + HID, 1), "bush": mlp(d + HID, 8)})
+            nn.init.zeros_(self.aux["fut"][2].weight); nn.init.zeros_(self.aux["fut"][2].bias)
+            with torch.no_grad(): _widen(self.aux["fut"][0], O.F_ENT_V55)
 
     def add_heroes(self, stats):
         """put each (13,) stats row not in the table yet into the next free row (order-stable across resumes) -> count"""
@@ -88,14 +157,14 @@ class Policy(nn.Module):
         return int((t[:, 0] < 1e3).sum())
 
     def load_state_dict(self, sd, strict=True, **kw):
-        """old checkpoints: the entity input weights grew by the lead columns -> zero-padded (same outputs); no hemb ->
-        zeros (a reused league slot must not keep the previous snapshot's rows; the hero table may stay)"""
+        """old checkpoints: grown inputs zero-padded in place (pad_param: the entity input weights by the lead columns,
+        the area-effect columns (v5.3) and the identity / line-of-sight columns (v5.6), between the observation's row and
+        the lead columns; s / cond / intent at the tail) = same outputs; no hemb -> zeros (a reused league slot must not
+        keep the previous snapshot's rows; the hero table may stay)"""
         own = self.state_dict(); sd = dict(sd)
         if "hemb.weight" not in sd: sd["hemb.weight"] = torch.zeros_like(own["hemb.weight"])
         for k, v in sd.items():
-            o = own.get(k)
-            if o is not None and v.shape != o.shape and v.dim() == o.dim() and all(a <= b for a, b in zip(v.shape, o.shape)):
-                t = torch.zeros_like(o); t[tuple(slice(0, n) for n in v.shape)] = v; sd[k] = t
+            if k in own: sd[k] = pad_param(k, v, own[k])
         return super().load_state_dict(sd, strict=strict, **kw)
 
     def encode(self, s, ent, grid):
@@ -126,13 +195,47 @@ class Policy(nn.Module):
         (mv, fi, ai, di), v = self.heads(torch.cat([x, h], -1), ent, s, priv)
         return (mv, mask_super(fi, s), ai, di), v, h
 
-    def seq(self, s, ent, grid, h, priv=None):
+    def seq(self, s, ent, grid, h, priv=None, feats=False):
+        """feats: also return xc = cat[x, h] (N * L, d + HID), the input of value_live / the aux heads"""
         N, L = s.shape[:2]; f = lambda t: t.flatten(0, 1)
         x = self.encode(f(s), f(ent), f(grid)).view(N, L, -1); hs = []
         for t in range(L):
             h = self.gru(x[:, t], h); hs.append(h)
-        (mv, fi, ai, di), v = self.heads(f(torch.cat([x, torch.stack(hs, 1)], -1)), f(ent), f(s), None if priv is None else f(priv))
-        return (mv, mask_super(fi, f(s)), ai, di), v
+        xc = f(torch.cat([x, torch.stack(hs, 1)], -1))
+        (mv, fi, ai, di), v = self.heads(xc, f(ent), f(s), None if priv is None else f(priv))
+        return ((mv, mask_super(fi, f(s)), ai, di), v, xc) if feats else ((mv, mask_super(fi, f(s)), ai, di), v)
+
+    def value_live(self, xc):
+        """(N,) live value from cat[x, h]: no priv, detached input (a probe: its loss reaches only `vl`)"""
+        return self.vl(xc.detach()).squeeze(-1)
+
+    def aux_out(self, xc, ent, s):
+        """aux predictions from cat[x, h] (not detached) and the entity rows (N, N_ENT, F_ENT): fut (N, 9, 2) each
+        enemy-block slot's position in 1 s relative to my position now (10-tile units), hit (N,) logit of P(enemy damage
+        taken in the next 1 s), gas (N,) gas margin / 10 tiles, bush (N, 8) logits per sector (env_v5.AUX "be")"""
+        e = ent[:, :AUX_SLOTS]; e = torch.cat([e, lead(e, s)], -1); N, K, _ = e.shape
+        fut = e[..., O.XY:O.XY + 2] + self.aux["fut"](torch.cat([xc[:, None].expand(N, K, xc.shape[-1]), e], -1))
+        return {"fut": fut, "hit": self.aux["hit"](xc)[:, 0], "gas": self.aux["gas"](xc)[:, 0], "bush": self.aux["bush"](xc)}
+
+    @torch.no_grad()
+    def row_feats(self, s, ent, grid, h):
+        """cat[x, h'] of single decisions from their stored GRU input state h (the acting math; the trainers' pass over a
+        rollout and the replay readout)"""
+        x = self.encode(s, ent, grid)
+        return torch.cat([x, self.gru(x, h)], -1)
+
+
+def aux_losses(out, lab):
+    """masked aux losses (Policy.aux_out vs train_ppo.aux_labels) -> (sum of AUX_REL x loss, {head: loss}). lab: fut
+    (N, 9, 2) + fut_m (N, 9), hit (N,) + hit_m (N,), gas (N,), bush (N, 8), m (N,) = rows with labels (alive). Huber
+    delta 0.1 = 1 tile (fut, gas), BCE (hit, bush multi-label)"""
+    mm = lambda x, m: (x * m).sum() / m.sum().clamp(min=1)
+    m = lab["m"]
+    L = {"fut": mm(F.huber_loss(out["fut"], lab["fut"], reduction="none", delta=0.1).sum(-1), lab["fut_m"] * m[:, None]),
+         "hit": mm(F.binary_cross_entropy_with_logits(out["hit"], lab["hit"], reduction="none"), lab["hit_m"] * m),
+         "gas": mm(F.huber_loss(out["gas"], lab["gas"], reduction="none", delta=0.1), m),
+         "bush": mm(F.binary_cross_entropy_with_logits(out["bush"], lab["bush"], reduction="none").mean(-1), m)}
+    return sum(AUX_REL[k] * v for k, v in L.items()), L
 
 
 def mask_super(fi, s):
@@ -157,6 +260,11 @@ class _Act(nn.Module):
 _ACT_META = None
 
 
+def acting_params(net):
+    """name -> parameter of a Policy, without the heads acting never runs (NONACT)"""
+    return {k: v for k, v in net.named_parameters() if not k.startswith(NONACT)}
+
+
 def act_stacked(nets, xs):
     """one vmapped forward for several Policies (different weights) on their own row sets (speed round, HISTORY 68: the
     per-net loop paid ~8 ms of fixed GPU cost per net). nets: list of Policy; xs: list of (s, ent, grid, h, priv) device
@@ -167,7 +275,7 @@ def act_stacked(nets, xs):
     acts = [_Act(n) for n in nets]
     if _ACT_META is None: _ACT_META = _Act(Policy()).to("meta")
     st = lambda ds: {k: torch.stack([d[k].detach() for d in ds]) for k in ds[0]}   # detached: the learner has grads, frozen nets not
-    P, Bf = st([dict(a.named_parameters()) for a in acts]), st([dict(a.named_buffers()) for a in acts])
+    P, Bf = st([{"p." + k: v for k, v in acting_params(n).items()} for n in nets]), st([dict(a.named_buffers()) for a in acts])
     Bm = max(x[0].shape[0] for x in xs)
     pad = lambda t: torch.cat([t, t.new_zeros((Bm - t.shape[0],) + t.shape[1:])]) if t.shape[0] < Bm else t
     X = [torch.stack([pad(x[i]) for x in xs]) for i in range(5)]
@@ -187,7 +295,7 @@ def masked_kl(ref, new):
 
 def _check():
     torch.manual_seed(0); net = Policy(); N, L = 3, 4
-    s = torch.randn(N, L, O.N_SELF + O.N_COND); ent = torch.zeros(N, L, O.N_ENT, O.F_ENT)
+    s = torch.randn(N, L, O.N_S); ent = torch.zeros(N, L, O.N_ENT, O.F_ENT)
     grid = torch.randint(0, O.UNKNOWN + 1, (N, L, O.G, O.G), dtype=torch.uint8)
     ent[:, :, 0, 0] = 1; ent[:, :, 0, 1 + O.ENT.index("enemy")] = 1; ent[:, :, 0, O.XY] = 0.3      # an enemy straight right
     ent[:, :, 1, 0] = 1; ent[:, :, 1, 1 + O.ENT.index("teammate")] = 1; ent[:, :, 1, O.XY + 1] = 0.3   # a teammate below
@@ -206,13 +314,56 @@ def _check():
     lp, en, a = dist_logp_ent(lg2); assert a.shape == (N * L, 4) and torch.isfinite(lp).all()
     assert masked_kl(lg2, lg2).abs().max() < 1e-5
     (lp.mean() + v2.mean()).backward()
+    _check_aux(net, s, ent, grid)
+    _check_live(net, s, ent, grid, pv)
     _check_stage2()
     print("model ok: %d parameters" % sum(x.numel() for x in net.parameters()))
 
 
+def _check_live(net, s, ent, grid, pv):
+    """vl: zero at init, its loss reaches only vl.*, feats / row_feats are the acting features, acting ignores NONACT"""
+    N = s.shape[0]; h0 = torch.zeros(N, HID); net.zero_grad(set_to_none=True)
+    lg, v, xc = net.seq(s, ent, grid, h0, pv, feats=True); lg0, v0 = net.seq(s, ent, grid, h0, pv)
+    assert all(torch.equal(a, b) for a, b in zip(lg, lg0)) and torch.equal(v, v0) and xc.shape == (s.shape[0] * s.shape[1], 512 + HID)
+    assert torch.allclose(net.row_feats(s[:, 0], ent[:, 0], grid[:, 0], h0), xc.view(N, -1, xc.shape[-1])[:, 0], atol=1e-6)
+    vl = net.value_live(xc); assert not vl.any()
+    ((vl - 1.0) ** 2).mean().backward()
+    assert all(p.grad is None for k, p in net.named_parameters() if not k.startswith("vl.")) and net.vl[2].weight.grad.abs().sum() > 0
+    xs = [(s[:, 0], ent[:, 0], grid[:, 0], h0, pv[:, 0])]
+    with torch.no_grad():
+        r0 = act_stacked([net], xs)
+        for k, p in net.named_parameters():
+            if k.startswith(NONACT): p.normal_(0, 0.5)
+        r1 = act_stacked([net], xs)
+    assert all(torch.equal(a, b) for a, b in zip(list(r0[0]) + [r0[1], r0[2]], list(r1[0]) + [r1[1], r1[2]])), "acting reads a non-acting head"
+    assert not any(k.startswith(NONACT) for k in acting_params(net)) and len(acting_params(net)) < len(dict(net.named_parameters()))
+
+
+def _check_aux(net, s, ent, grid):
+    """aux heads: shapes, fut starts at the seen position, masked labels do not count, the loss reaches the encoders /
+    GRU and the aux heads but no policy / value head"""
+    N, L = s.shape[:2]; f = lambda t: t.flatten(0, 1); net.zero_grad(set_to_none=True)
+    xc = net.seq(s, ent, grid, torch.zeros(N, HID), feats=True)[2]; out = net.aux_out(xc, f(ent), f(s)); M = N * L
+    assert out["fut"].shape == (M, AUX_SLOTS, 2) and out["hit"].shape == out["gas"].shape == (M,) and out["bush"].shape == (M, 8)
+    assert torch.equal(out["fut"], f(ent)[:, :AUX_SLOTS, O.XY:O.XY + 2])          # zero-init offset: "stays where seen"
+    g = torch.Generator().manual_seed(3); r = lambda *sh: torch.rand(*sh, generator=g)
+    lab = {"fut": r(M, AUX_SLOTS, 2), "fut_m": (r(M, AUX_SLOTS) < 0.5).float(), "hit": (r(M) < 0.3).float(), "hit_m": (r(M) < 0.8).float(),
+           "gas": r(M), "bush": (r(M, 8) < 0.1).float(), "m": torch.ones(M)}
+    lab["m"][0] = 0; tot, per = aux_losses(out, lab)
+    lab2 = dict(lab); lab2["fut"] = torch.where(lab["fut_m"][..., None] > 0, lab["fut"], lab["fut"] + 5)   # masked: anything
+    lab2["hit"] = torch.where(lab["hit_m"] > 0, lab["hit"], 1 - lab["hit"]); lab2["gas"] = lab["gas"].clone(); lab2["gas"][0] = 9.0
+    tot2, per2 = aux_losses(out, lab2)
+    assert torch.allclose(tot, tot2) and all(torch.isfinite(v) and v > 0 for v in per.values()), (per, per2)
+    tot.backward()
+    grads = {k: p.grad is not None and p.grad.abs().sum() > 0 for k, p in net.named_parameters()}
+    for k in ("ent.0.weight", "grid.0.weight", "vec.0.weight", "trunk.0.weight", "gru.weight_ih", "aux.fut.2.weight", "aux.bush.0.weight"):
+        assert grads[k], k
+    assert not any(v for k, v in grads.items() if k.split(".")[0] in ("pi", "v", "vp", "cand", "free", "free_score", "vl")), [k for k, v in grads.items() if v]
+
+
 def _check_stage2():
     """lead hint math; an old-format checkpoint (no lead columns / hero table) acts the same after loading; hero rows"""
-    s = torch.zeros(1, O.N_SELF + O.N_COND); s[0, O.N_SELF + 3] = 1.0                    # shot 0.667 tiles / tick
+    s = torch.zeros(1, O.N_S); s[0, O.N_SELF + 3] = 1.0                    # shot 0.667 tiles / tick
     ent = torch.zeros(1, O.N_ENT, O.F_ENT); ent[0, :2, 0] = 1; ent[0, :2, 1 + O.ENT.index("enemy")] = 1
     ent[0, :2, O.XY] = 0.3; ent[0, 0, O.VEL + 1] = 0.12                                  # 3 tiles right, slot 0 walks down
     ld = lead(ent, s)[0]; sp = 4000 / 6000                                               # slot 0: brute-force intercept
@@ -224,14 +375,25 @@ def _check_stage2():
     t0 = 3.0 / (sp ** 2 - 0.12 ** 2) ** 0.5
     assert abs(lead(ent, s2)[0, 0, 0] - 0.12 * t0 / np.hypot(3.0, 0.12 * t0)) < 1e-3
     torch.manual_seed(1); N, L = 2, 3
-    s = torch.randn(N, L, O.N_SELF + O.N_COND); s[..., O.N_SELF:O.N_SELF + N_STAT] = s[:, :1, O.N_SELF:O.N_SELF + N_STAT]
+    s = torch.randn(N, L, O.N_S); s[..., O.N_SELF:O.N_SELF + N_STAT] = s[:, :1, O.N_SELF:O.N_SELF + N_STAT]
     s[..., O.N_SELF + 3] = 1.0                                                            # one hero per sequence
     ent = torch.zeros(N, L, O.N_ENT, O.F_ENT); ent[..., :3, 0] = 1; ent[..., :3, 1 + O.ENT.index("enemy")] = 1
     ent[..., :3, O.XY:O.HP] = torch.randn(N, L, 3, 4) * 0.2
     grid = torch.randint(0, O.UNKNOWN + 1, (N, L, O.G, O.G), dtype=torch.uint8); h0 = torch.zeros(N, HID)
-    a = Policy(); nn.init.normal_(a.pi.weight, std=0.1); ref = a.seq(s, ent, grid, h0)[0]
+    ent[..., :3, O.RAD:] = torch.rand(N, L, 3, O.F_ENT - O.RAD)                          # new inputs present: an old net ignores them
+    a = Policy(); nn.init.normal_(a.pi.weight, std=0.1); na = O.F_ENT - O.F_ENT_V52; pre = a.cand[0].weight.shape[1] - F_IN
+    with torch.no_grad():                                                                 # a v5.2 net: lead used, no area columns
+        nn.init.normal_(a.ent[0].weight[:, O.F_ENT:], std=0.3); nn.init.normal_(a.cand[0].weight[:, -N_LEAD:], std=0.3)
+        a.ent[0].weight[:, O.F_ENT_V52:O.F_ENT] = 0; a.cand[0].weight[:, pre + O.F_ENT_V52:pre + O.F_ENT] = 0
+        a.vec[0].weight[:, O.N_SELF + O.N_COND_V53:] = 0                                 # and v5.3's cond (28: no leash / gas_safe)
+    ref = a.seq(s, ent, grid, h0)[0]
     old = {k: v for k, v in a.state_dict().items() if k not in ("hemb.weight", "hero_stats")}
-    old["ent.0.weight"] = old["ent.0.weight"][:, :O.F_ENT]; old["cand.0.weight"] = old["cand.0.weight"][:, :-N_LEAD]
+    v52 = lambda w, p: torch.cat([w[:, :p + O.F_ENT_V52], w[:, p + O.F_ENT:]], 1)        # the v5.2 layout: row 16 | lead 2
+    old["ent.0.weight"] = v52(old["ent.0.weight"], 0); old["cand.0.weight"] = v52(old["cand.0.weight"], pre)
+    old["vec.0.weight"] = old["vec.0.weight"][:, :O.N_SELF + O.N_COND_V53]; assert O.N_COND - O.N_COND_V53 == 2
+    assert old["ent.0.weight"].shape[1] == O.F_ENT_V52 + N_LEAD and O.F_ENT_V55 - O.F_ENT_V52 == 4 and na == 20
+    c = Policy(); c.load_state_dict({**old, "ent.0.weight": old["ent.0.weight"][:, :O.F_ENT_V52]}, strict=False)   # pre-lead format
+    assert torch.equal(c.ent[0].weight[:, :O.F_ENT_V52], a.ent[0].weight[:, :O.F_ENT_V52]) and not c.ent[0].weight[:, O.F_ENT_V52:].any()
     b = Policy(); b.load_state_dict(old, strict=False)
     assert b.add_heroes(s[:, 0, O.N_SELF:O.N_SELF + N_STAT]) == N and b.add_heroes(s[:1, 0, O.N_SELF:O.N_SELF + N_STAT]) == N
     got = b.seq(s, ent, grid, h0)[0]
@@ -239,6 +401,64 @@ def _check_stage2():
     assert (hero_index(s, b.hero_stats) < N).all() and (hero_index(torch.randn(4, s.shape[-1]), b.hero_stats) == HMAX).all()
     nn.init.normal_(b.hemb.weight, std=0.5)
     assert max((x - y).abs().max().item() for x, y in zip(ref, b.seq(s, ent, grid, h0)[0])) > 1e-3   # the embedding is used
+    _check_v55(ent, grid, h0)
+    _check_v56(ent, grid, h0)
+
+
+def _check_v55(ent, grid, h0):
+    """obs v5.5: a v5.4 checkpoint (vec.0 without the intent columns) acts the same with a zero and with any intent block;
+    a fresh Policy's intent columns start at zero and get a gradient"""
+    torch.manual_seed(2); N, L = ent.shape[:2]
+    assert not Policy().vec[0].weight[:, O.S_INT:].any() and Policy().vec[0].weight.shape == (128, O.N_S)
+    s = torch.randn(N, L, O.N_S); s[..., O.N_SELF + 3] = 1.0; s0 = s.clone(); s0[..., O.S_INT:] = 0   # free play: block zero
+    a = Policy(); nn.init.normal_(a.pi.weight, std=0.1)
+    old = dict(a.state_dict()); old["vec.0.weight"] = old["vec.0.weight"][:, :O.S_INT]          # the v5.4 layout: 38 columns
+    with torch.no_grad(): nn.init.normal_(a.vec[0].weight[:, O.S_INT:], std=0.3)               # a v5.5 net that reads the block
+    b = Policy(); b.load_state_dict(old, strict=False); assert not b.vec[0].weight[:, O.S_INT:].any()
+    ref, got0, got = a.seq(s0, ent, grid, h0)[0], b.seq(s0, ent, grid, h0)[0], b.seq(s, ent, grid, h0)[0]
+    d = lambda x, y: max((u - v).abs().max().item() for u, v in zip(x, y))
+    assert d(ref, got0) < 1e-6 and d(got0, got) < 1e-6, "v5.4 checkpoint acts differently"
+    assert d(ref, a.seq(s, ent, grid, h0)[0]) > 1e-3                                           # the block is an input
+    b.zero_grad(); b.seq(s, ent, grid, h0)[0][0].sum().backward(); assert b.vec[0].weight.grad[:, O.S_INT:].abs().sum() > 0
+
+
+
+def _check_v56(ent, grid, h0):
+    """obs v5.6: a v5.5 checkpoint (entity rows 20 wide + lead, aux fut included) acts the same whatever the identity /
+    line-of-sight columns hold, its lead / aux weights land on the lead columns; a fresh Policy's new columns are zero and
+    get a gradient; pad_param on an Adam moment = the weight's layout"""
+    torch.manual_seed(5); N, L = ent.shape[:2]; d = 512 + HID
+    fresh = Policy(); n_new = O.F_ENT - O.F_ENT_V55
+    for k in ENT_IN:
+        w = fresh.state_dict()[k]; pre = w.shape[1] - F_IN
+        assert not w[:, pre + O.F_ENT_V55:pre + O.F_ENT].any() and w.shape[1] == pre + F_IN, k
+    s = torch.randn(N, L, O.N_S); s[..., O.N_SELF + 3] = 1.0
+    e0 = ent.clone(); e0[..., O.ID0:] = 0; e1 = ent.clone(); e1[..., :5, O.ID0:] = torch.rand(N, L, 5, n_new) * 2
+    e1[..., :5, O.ID_KNOWN] = 1
+    a = Policy(); nn.init.normal_(a.pi.weight, std=0.1)
+    with torch.no_grad():
+        for k in ENT_IN:                                  # a v5.5 net: lead used, no identity columns
+            w = dict(a.named_parameters())[k]; pre = w.shape[1] - F_IN
+            nn.init.normal_(w[:, -N_LEAD:], std=0.3); w[:, pre + O.F_ENT_V55:pre + O.F_ENT] = 0
+        nn.init.normal_(a.aux["fut"][2].weight, std=0.3)
+    cut = lambda w: torch.cat([w[:, :w.shape[1] - F_IN + O.F_ENT_V55], w[:, w.shape[1] - N_LEAD:]], 1)   # the v5.5 layout
+    old = {k: (cut(v) if k in ENT_IN else v) for k, v in a.state_dict().items()}
+    assert old["ent.0.weight"].shape[1] == O.F_ENT_V55 + N_LEAD and old["aux.fut.0.weight"].shape[1] == d + O.F_ENT_V55 + N_LEAD
+    b = Policy(); b.load_state_dict(old, strict=False)
+    assert all(torch.equal(a.state_dict()[k], b.state_dict()[k]) for k in ENT_IN)             # lead weights back on the lead columns
+    ref = a.seq(s, e0, grid, h0, feats=True); got = b.seq(s, e1, grid, h0, feats=True)
+    dd = lambda x, y: max((u - v).abs().max().item() for u, v in zip(x, y))
+    assert dd(ref[0], got[0]) < 1e-6 and (ref[2] - got[2]).abs().max() < 1e-6, "v5.5 checkpoint acts differently"
+    fa = lambda n, e, xc: n.aux_out(xc, e.flatten(0, 1), s.flatten(0, 1))["fut"]
+    assert (fa(a, e0, ref[2]) - fa(b, e1, got[2])).abs().max() < 1e-6                         # aux fut reads the same columns
+    with torch.no_grad(): nn.init.normal_(a.ent[0].weight[:, O.ID0:O.F_ENT], std=0.3)
+    assert dd(ref[0], a.seq(s, e1, grid, h0)[0]) > 1e-3                                       # the new columns are inputs
+    b.zero_grad(); b.seq(s, e1, grid, h0)[0][0].sum().backward(); assert b.ent[0].weight.grad[:, O.ID0:O.F_ENT].abs().sum() > 0
+    m = torch.randn_like(old["cand.0.weight"])               # an Adam moment of the v5.5 layout
+    pm = pad_param("cand.0.weight", m, b.cand[0].weight); pre = pm.shape[1] - F_IN
+    assert torch.equal(pm[:, :pre + O.F_ENT_V55], m[:, :pre + O.F_ENT_V55]) and torch.equal(pm[:, -N_LEAD:], m[:, -N_LEAD:]) and not pm[:, pre + O.F_ENT_V55:pre + O.F_ENT].any()
+    v = torch.randn(128, O.S_INT); pv = pad_param("vec.0.weight", v, b.vec[0].weight)       # tail inputs: the generic pad
+    assert torch.equal(pv[:, :O.S_INT], v) and not pv[:, O.S_INT:].any()
 
 
 if __name__ == "__main__":
