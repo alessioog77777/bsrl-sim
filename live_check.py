@@ -2,7 +2,7 @@
   1. team reward (Env._finish_step hold-back): teammates' final transitions share team_place == (10 - best member rank) / 9;
   2. area effects (nbhost_rl encode.c item feature 4: 1 = bomb / enemy area, -1 = my team's area) reach the observation;
   3. generated maps (--gen k instances on $SIM_WORK/genmaps) play without restarts;
-  4. teammate respawn (host, 15 s): knock-outs with a living mate come back at a mate's position, play on (can be
+  4. teammate respawn (host, 17 s): knock-outs with a living mate come back at a mate's position, play on (can be
      knocked out again), dead steps carry terms["dead"] = 1 and a zero observation;
   5. HUD (obs_v5 noisy path, measured hud_ui.npy): tiles hidden live match the measured chance;
   6. live map: destroyed walls / bushes leave the slider masks (Env.MAP_EVERY) and read as open in the observation grid;

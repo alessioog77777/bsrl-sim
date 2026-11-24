@@ -72,6 +72,9 @@ static int wall_code_for(uint8_t *pr) {
     for (int i = 0; g_wall_codes[i].skin_proj; i++) if (g_wall_codes[i].skin_proj == id) return g_wall_codes[i].code;
     return 1;
 }
+/* The walls go again by themselves: the setter puts them on the tile map's dynamic list, and the game removes them after
+ * the tile's Lifetime (tiles.csv: 200 ticks for every Wally* wall). Sprout audit, issue #21: 13 of 13 ring tiles open
+ * again between placed + 199 and + 220. */
 static void wall_ring(uint8_t *a, uint8_t *d) {
     uint8_t *pr = (g_cur_proj && g_cur_tick == (g_sim ? I32(g_sim, 0x10) : -1)) ? (uint8_t *)g_cur_proj : NULL;
     int code = wall_code_for(pr);

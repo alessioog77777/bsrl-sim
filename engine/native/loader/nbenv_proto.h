@@ -109,7 +109,7 @@ typedef struct {
     int32_t status;       /* 0 ok, <0 error (see err) */
     int32_t tick, done, result, local_index, generation, alive, hud_left;
     int32_t local_rank;   /* elimination tracker rank of the local player (0 while alive and the match runs) */
-    int32_t winner;       /* player index of the last survivor (-1) */
+    int32_t winner;       /* player index of the last survivor; teams: the last team's lowest-index player (-1) */
     uint32_t map_hash; int32_t map_w, map_h, map_written;
     int32_t state_ints, rec_n, rec_lost, pix_bytes, pix_w, pix_h, obs_written;
     int32_t cam_valid; float cam_x, cam_y;
