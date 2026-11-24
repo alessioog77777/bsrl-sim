@@ -112,9 +112,10 @@ def expected(name):
     items = [x for x in [s.get("SpawnedItem")] + [r.get("SpawnItem") for r in ps] if x]
     charge = bt == "Charge"
     if charge or bt in ("Blink", "BlinkReturn", "BlinkToPlaceholder", "BlinkToProjectile", "FlyJump"): ex.append("move")
-    if bt == "ChangeCharacter": ex.append("change")
+    turns = bt == "ChangeCharacter" or (charge and bool(s.get("SummonedCharacters")))   # Bonnie / Moe: the charge ends in the other form
+    if turns: ex.append("change")
     if projs: ex.append("projectile")
-    if bt == "ChangeCharacter": summons = []   # SummonedCharacters is the character it turns into, not a summon
+    if turns: summons = []   # SummonedCharacters is the character it turns into, not a summon
     if summons: ex.append("summon")
     if areas: ex.append("area")
     if items: ex.append("item")
