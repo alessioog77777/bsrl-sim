@@ -9,7 +9,9 @@ players 0-4 shoot in phase A, players 5-9 in phase B; in each phase every shoote
 wide corridor of open tiles in at least two directions, spots >= SPACING apart; A and B use different spots) with one
 enemy target at distance d along a corridor. Per phase: teleport + heal everyone and end spawn protection; the target fires
 one normal attack at the shooter (so a self-heal is visible); fill the shooters' supers; fire the super (fire 2, aim at the
-target, super_dist = d / CastingRange, a charge aims ~1 tile past the target); watch WATCH ticks.
+target, super_dist = d / CastingRange, a charge aims ~1 tile past the target); watch WATCH ticks. A super the player steers
+while it runs (FlyJump, Ww) has its shooter walk towards the target once its CastingTime is over (moves sent while it
+casts are dropped), so its "move" is plain walking.
 Measured per shooter (state2 dump each step, attributed by owner player index): super consumed (charge < half of max),
 damage = target HP lost (or the shooter's NbeResp damage_dealt summed over the watch steps: the host reports it per step), own max displacement (dash / jump / charge; host `leaping` flag), target max
 displacement (pushback / pull), own HP gain (only when the pre-damage hit), new projectiles / summons / area effects
@@ -111,9 +113,10 @@ def expected(name):
     items = [x for x in [s.get("SpawnedItem")] + [r.get("SpawnItem") for r in ps] if x]
     charge = bt == "Charge"
     if charge or bt in ("Blink", "BlinkReturn", "BlinkToPlaceholder", "BlinkToProjectile", "FlyJump"): ex.append("move")
-    if bt == "ChangeCharacter": ex.append("change")
+    turns = bt == "ChangeCharacter" or (charge and bool(s.get("SummonedCharacters")))   # Bonnie / Moe: the charge ends in the other form
+    if turns: ex.append("change")
     if projs: ex.append("projectile")
-    if bt == "ChangeCharacter": summons = []   # SummonedCharacters is the character it turns into, not a summon
+    if turns: summons = []   # SummonedCharacters is the character it turns into, not a summon
     if summons: ex.append("summon")
     if areas: ex.append("area")
     if items: ex.append("item")
@@ -137,7 +140,9 @@ def expected(name):
     # a BulletExplosion area at the brawler (Hank) spreads its children over 360 degrees from world angle 0 (spawnfix.c: no
     # parent projectile): the target stands on angle 0, not between two children
     east = not projs and any(r.get("Type") == "BulletExplosion" for r in alog)
-    return {"skill": sk_name, "type": bt, "kind": kind, "range": cr if cr > 0 else 2600.0, "charge": charge, "ring": ring, "east": east, "expect": ex,
+    steer = bt in ("FlyJump", "Ww")   # the brawler moves under its player's control while the super runs: walk it to the target
+    return {"skill": sk_name, "type": bt, "kind": kind, "range": cr if cr > 0 else 2600.0, "charge": charge, "ring": ring, "east": east,
+            "steer": steer, "cast": _num(s, "CastingTime"), "expect": ex,
             "projectiles": projs, "summons": summons, "areas": areas, "items": items, "notes": notes}
 
 
@@ -426,14 +431,18 @@ class Auditor:
                         if min(np.hypot(row[3] - m["tx0"], row[4] - m["ty0"]), np.hypot(row[3] - m["x0"], row[4] - m["y0"])) < 2000:
                             m["foreign_near"] = True
             if n >= WATCH: break
+            acts = dict(idle)
+            for j, s, t in run:   # steered supers (FlyJump, Ww): once cast, the shooter walks to the target (16 joystick directions)
+                p, q = r.pl[s], r.pl[t]; inf = self.info[j.name]
+                if inf.get("steer") and n * 50 > inf.get("cast", 0) + 100 and q.alive and np.hypot(q.x - p.x, q.y - p.y) > 150:
+                    acts[s] = (int(round(np.degrees(np.arctan2(q.y - p.y, q.x - p.x)) / 22.5)) % 16, 0, 0.0, 0.0)
             if POST_HIT and n >= POST_HIT and not any("ph_hp0" in M[j] for j, _, _ in run):   # shield / status supers: hit again
-                acts = dict(idle)
                 for j, s, t in run:
                     M[j]["ph_hp0"] = int(r.pl[s].hp); M[j]["ph_hp_min"] = int(r.pl[s].hp); M[j]["ph_tick"] = n
                     acts[t] = (-1, 1, (geo[j]["aim"] + 180.0) % 360, 0.0)
                 r = stp(acts, 1); n += 1
             else:
-                r = stp(); n += STEP
+                r = stp(acts); n += STEP
             for j, s, t in run:
                 if "ph_hp0" in M[j]: M[j]["ph_hp_min"] = min(M[j]["ph_hp_min"], int(r.pl[s].hp))
         out = []
