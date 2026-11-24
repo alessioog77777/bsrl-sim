@@ -101,7 +101,9 @@ void battle_fix_install(void) {
     LOG("[battle-fix] installed: ability/element writers, element repair, 4 null guards\n");
 }
 extern void spawnfix_status(void) __attribute__((weak));
+extern void superfix_status(void) __attribute__((weak));
 void battle_fix_status(void) {
     if (spawnfix_status) spawnfix_status();
+    if (superfix_status) superfix_status();
     LOG("[battle-fix] ability fields %ld, elements %ld, characters populated %ld, guards %ld/%ld\n", g_abil, g_elem, g_populated, g_guard[0], g_guard[1]);
 }

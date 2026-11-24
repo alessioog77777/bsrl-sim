@@ -104,17 +104,22 @@ def expected(name):
     areas = [a for a in (s.get("AreaEffectObject"), s.get("AreaEffectObject2")) if a]
     areas += [a for r in ps for a in (r.get("SpawnAreaEffectObject"), r.get("SpawnAreaEffectObject2")) if a]
     alog = [T["alog"].get(T["askin"].get(a, {}).get("Logic") or a, {}) for a in areas]
+    chain = [r.get(k) for r in alog for k in ("ChainAreaEffect", "ChainAreaEffect2", "ChainAreaEffect3") if r.get(k)]
+    alog += [T["alog"].get(T["askin"].get(a, {}).get("Logic") or a, {}) for a in chain]   # an area's follow-up area
     summons = [x for x in (s.get("SummonedCharacters") or "").split(";") if x] + [r["SpawnCharacter"] for r in pl if r.get("SpawnCharacter")]
     items = [x for x in [s.get("SpawnedItem")] + [r.get("SpawnItem") for r in ps] if x]
     charge = bt == "Charge"
     if charge or bt in ("Blink", "BlinkReturn", "BlinkToPlaceholder", "BlinkToProjectile", "FlyJump"): ex.append("move")
     if bt == "ChangeCharacter": ex.append("change")
     if projs: ex.append("projectile")
+    if bt == "ChangeCharacter": summons = []   # SummonedCharacters is the character it turns into, not a summon
     if summons: ex.append("summon")
     if areas: ex.append("area")
     if items: ex.append("item")
     leap_bombs = charge and bool(items)          # Piper: the damage is the bombs left at the start point, not on the target
-    if _num(s, "Damage") > 0 and not leap_bombs and bt not in ("ChangeCharacter", "ProjectileShield"): ex.append("damage")
+    heals_only = any(_num(r, "HealOwnPercent") > 0 for r in pl)   # Poco: the skill Damage is the heal, enemies are not hit
+    if ((_num(s, "Damage") > 0 or any(_num(r, "Damage") > 0 for r in alog)) and not leap_bombs and not heals_only
+            and bt not in ("ChangeCharacter", "ProjectileShield")): ex.append("damage")
     if _num(s, "ChargePushback") > 0 or any(_num(r, "PushbackStrength") > 0 for r in pl + alog): ex.append("push")
     if (_num(s, "HealSelfOnActivationPower") > 0 or any(_num(r, "HealOwnPercent") > 0 for r in pl)
             or any(r.get("Type") in ("Heal", "Hot", "HealRegen", "HealAndDamage", "HotAndDot") for r in alog)): ex.append("heal")
@@ -124,7 +129,11 @@ def expected(name):
             "Attack: summon" if bt == "Attack" and summons else "Attack: area" if bt == "Attack" and areas and not projs else
             "Attack: item" if bt == "Attack" and items else "Attack: projectile" if bt == "Attack" else bt)
     cr = _num(s, "CastingRange") * 100
-    return {"skill": sk_name, "type": bt, "kind": kind, "range": cr if cr > 0 else 2600.0, "charge": charge, "expect": ex,
+    ring = max((( _num(r, "InnerRadius") + _num(r, "Radius")) / 2 for r in alog
+                if _num(r, "InnerRadius") > 0 and _num(r, "InnerRadiusDamagePercent") == 0), default=0.0)
+    if cr <= 0 and not projs and alog and not charge:   # no aim range, the effect is an area at the brawler: the target stands inside it
+        cr = max((_num(r, "Radius") for r in alog), default=0.0)
+    return {"skill": sk_name, "type": bt, "kind": kind, "range": cr if cr > 0 else 2600.0, "charge": charge, "ring": ring, "expect": ex,
             "projectiles": projs, "summons": summons, "areas": areas, "items": items, "notes": notes}
 
 
@@ -352,7 +361,9 @@ class Auditor:
             d = float(np.clip(DIST_F[min(j.attempt, 1)] * inf["range"], DIST_MIN, DIST_MAX))
             if j.attempt and len(dirs) == 1: d = float(np.clip(d * 0.6, DIST_MIN, DIST_MAX))
             tx, ty = x + dx * d, y + dy * d
-            sd = min(1.0, (d + TILE if inf["charge"] else d) / inf["range"])
+            if inf.get("ring") and inf["range"] > inf["ring"]:   # no damage inside InnerRadius (Kaze): land past the target
+                d = float(np.clip(inf["range"] - inf["ring"], DIST_MIN, DIST_MAX))
+            sd = min(1.0, (d + TILE if inf["charge"] else d + inf.get("ring", 0)) / inf["range"])
             aim = float(np.degrees(np.arctan2(dy, dx)))
             geo[j] = dict(d=round(d), aim=aim, super_dist=round(sd, 3), spot=[round(x), round(y)])
             pos[s] = (int(x), int(y)); pos[t] = (int(tx), int(ty))
@@ -542,9 +553,11 @@ def main():
     ap.add_argument("--no-retry", action="store_true", help="no second attempt for non-works brawlers")
     ap.add_argument("--out", default=os.environ.get("SIM_WORK", "work"), help="folder of super_audit.json / .md")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--watch", type=int, default=WATCH, help="ticks watched after the fire (default %d)" % WATCH)
     ap.add_argument("--host-args", default="", help="extra game host arguments, e.g. '--native-charge 0'")
     a = ap.parse_args()
     if a.check: return _check()
+    globals()["WATCH"] = a.watch
     import env_v5
     roster = env_v5.heroes()
     names = [x for x in a.only.split(",") if x] or roster
