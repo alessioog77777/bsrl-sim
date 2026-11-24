@@ -133,7 +133,25 @@ typedef struct {
     int32_t pl_char[NBE_MAXP], pl_skin[NBE_MAXP];
     int32_t div_reserved[4];          /* [0] sim+0x134 (cards flag: star powers / gadgets in player configs), [1] bit i = player i
                                          has a gadget object (player+0x190), [2] bit i = player i's config has a star power card */
+    /* gadget round (bsrl-sim issue #3, appended): the gadget state of the host's own gadget activation. The shipped libg's
+     * activation 0xb27c58 (reached by input kind 8, NbeAction.fire 3) is a bare ret, so the uses and the cooldown are the
+     * host's, kept per player for the battle. A host without it leaves everything 0 (gad_valid 0): every gadget reads as
+     * not usable and the policy's gadget class stays masked (bsrl-sim obs_v5 self 3). Per player index: */
+    int32_t gad_valid;                /* 1 = written by a host with gadget activation (every response) */
+    int32_t gad_card[NBE_MAXP];       /* cards.csv data id of the player's gadget (0 = none) */
+    int32_t gad_kind[NBE_MAXP];       /* NBE_GAD_* activation the host runs for it; NBE_GAD_NONE = not implemented (not usable) */
+    int32_t gad_charges[NBE_MAXP];    /* uses left this battle */
+    int32_t gad_cd[NBE_MAXP];         /* ticks until it can be used again (0 = now) */
+    int32_t gad_used[NBE_MAXP];       /* activations so far this battle */
 } NbeResp;
+/* NbeResp.gad_kind: what an activation does (one re-implementation per kind, from the gadget's own data rows) */
+#define NBE_GAD_NONE 0
+#define NBE_GAD_DASH 1        /* moves the brawler (displacement along the aim) */
+#define NBE_GAD_HEAL 2        /* restores hp */
+#define NBE_GAD_SHIELD 3      /* damage reduction / shield for a while */
+#define NBE_GAD_SPAWN 4       /* spawns an object (summon, turret, item, area) */
+#define NBE_GAD_PROJECTILE 5  /* fires a projectile (along the aim) */
+#define NBE_GAD_STATUS 6      /* a timed status on self or others (speed, slow, stun, ...) */
 
 typedef struct {
     uint32_t magic, version, total_size, hdr_size;

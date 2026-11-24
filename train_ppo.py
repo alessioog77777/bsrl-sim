@@ -150,6 +150,7 @@ def main():
     ap.add_argument("--eval-n", type=int, default=99, help="instances that play the evals (the rest keep training; fewer than --n was slower overall, see README)")
     ap.add_argument("--opp-slots", type=int, default=3); ap.add_argument("--opp-hold", type=int, default=2)
     ap.add_argument("--pfsp-p", type=float, default=2.0)
+    ap.add_argument("--gadgets", type=int, default=0, help="1 = players carry a gadget, the policy sees it ready (self 3) and may use it (issue #3; needs a host with gadget activation)")
     a = ap.parse_args()
     if a.smoke: a.n, a.rollout, a.chunks, a.bc_updates, a.eval_episodes, a.evalb_episodes, a.hours = 2, 2048, 64, 1, 4, 4, 0.2
     torch.manual_seed(a.seed); np.random.seed(a.seed)
@@ -184,6 +185,10 @@ def main():
     bc = lambda: upd < a.bc_updates
 
     def battle_fn(rng, i):
+        cfg = battle_cfg(rng, i)
+        return E.with_gadgets(cfg, rng) if a.gadgets else cfg   # MAEnv's rng: rng_b's draws stay the same
+
+    def battle_cfg(rng, i):
         tag = {"loc": loc, "chr": [a.brawler] * 10, "team_size": 1, "groups": [0] * 10}
         cfg = {"div": D.make_div(location=loc, chr=tag["chr"]), "tag": tag, "end": "agents"}
         if eval_queue and not bc() and i >= a.n - a.eval_n:
@@ -250,7 +255,7 @@ def main():
                 for aid in env.dropped: pending.pop(aid, None); hid.pop(aid, None)
                 env.dropped = []
                 if not len(ids): continue
-                tq = time.perf_counter(); o = ob.build(obs["vec"], obs["grid"], env.last_meta, ids); tm[1] += time.perf_counter() - tq
+                tq = time.perf_counter(); o = ob.build(obs["vec"], obs["grid"], env.last_meta, ids, gadget=env.gadget(ids) if a.gadgets else None); tm[1] += time.perf_counter() - tq
                 s = np.concatenate([o["self"], env.cond(ids)], 1); h = np.stack([hid.get(int(x), z) for x in ids])
                 pv = priv(env, ids); B = len(ids); kind = np.array([t["kind"] for t in env.last_tags])
                 isev = np.char.startswith(kind, "eval"); opp = np.array([int(x) & 15 in t.get("opp", ()) for x, t in zip(ids, env.last_tags)], bool)
@@ -359,7 +364,7 @@ def main():
                    "ticks": mean([r["ticks"] for r in ok]), "storm_death": mean([r["storm_death"] for r in ok]),
                    "hit_rate": round(sum(r["terms"]["hits"] for r in recent) / max(1.0, sum(r["terms"]["shots"] for r in recent)), 4),
                    "attack_frac": mean([r["attack_steps"] / max(1, r["steps"]) for r in recent]),
-                   "move_hist": np.bincount(acts[:, 0], minlength=17)[:17].tolist(), "fire_hist": np.bincount(acts[:, 1], minlength=3)[:3].tolist(),
+                   "move_hist": np.bincount(acts[:, 0], minlength=17)[:17].tolist(), "fire_hist": np.bincount(acts[:, 1], minlength=len(O.FIRE))[:len(O.FIRE)].tolist(),
                    "aim_hist": np.bincount(fired[:, 2] // 15, minlength=24)[:24].tolist()}
             for k in sorted({r["tag"]["kind"] for r in ok}): row["rank_" + k] = mean([r["rank"] for r in ok if r["tag"]["kind"] == k])
             row["pfsp"] = {os.path.basename(p)[:-3]: [round(pfr(p), 2), pf.get(os.path.basename(p), [0, 0])[1]] for p in pool}

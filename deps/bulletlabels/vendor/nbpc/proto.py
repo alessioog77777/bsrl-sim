@@ -79,7 +79,15 @@ class Resp(C.Structure):
         # 31 theme), per player the active loadout's character / skin data ids
         ("div_valid", C.c_int32), ("div_location", C.c_int32), ("div_theme", C.c_int32), ("div_cl_location", C.c_int32),
         ("div_variation", C.c_int32), ("div_err", C.c_int32), ("pl_char", C.c_int32 * MAXP), ("pl_skin", C.c_int32 * MAXP),
-        ("div_reserved", C.c_int32 * 4)]
+        ("div_reserved", C.c_int32 * 4),
+        # gadget round (bsrl-sim issue #3, appended): the host's own gadget activation state (libg's is compiled out); all 0
+        # (gad_valid 0) with a host without it. Per player: cards.csv id, GAD_* kind (0 = not implemented), uses left,
+        # ticks of cooldown left, activations so far
+        ("gad_valid", C.c_int32), ("gad_card", C.c_int32 * MAXP), ("gad_kind", C.c_int32 * MAXP),
+        ("gad_charges", C.c_int32 * MAXP), ("gad_cd", C.c_int32 * MAXP), ("gad_used", C.c_int32 * MAXP)]
+
+
+GAD_NONE, GAD_DASH, GAD_HEAL, GAD_SHIELD, GAD_SPAWN, GAD_PROJECTILE, GAD_STATUS = range(7)   # Resp.gad_kind (nbenv_proto.h NBE_GAD_*)
 
 
 class Hdr(C.Structure):

@@ -4,7 +4,7 @@
     python -m obs_v5 --live     # + 1 instance, 300 decisions: real MAEnv observations through the builder
 
     ob = ObsV5()                                     # one per MAEnv
-    o = ob.build(obs["vec"], obs["grid"], env.last_meta, ids)
+    o = ob.build(obs["vec"], obs["grid"], env.last_meta, ids, gadget=env.gadget(ids))   # gadget: optional (self 3)
     o["self"] (B, 8)   hp fraction, ammo 0-1, super / gadget / hypercharge ready, in bush, own velocity x, y
     o["ent"]  (B, 39, 16)  present | class one-hot (ENT) | dx, dy (10 tiles, x right / y down) | vx, vy (tiles/tick) | hp fraction
     o["grid"] (B, 25, 25) uint8  seg class id (SEG) per tile around the player, UNKNOWN outside the camera view
@@ -13,8 +13,12 @@
 Source = the host's state2 vector + grid after nbpc.fair (already camera- and bush-limited). Needs the rl-round
 host `nbhost_rl` (enemy features 14 / 15 = summon / on my team, self 18 = hypercharge fraction, grid channel 0 =
 tiles.csv row + 1); with an older host teammates read as enemies and the tiles are wrong.
-shortcut: area effects have no radius / kind (one class per side), the host dumps no gadget state (self 3 stays 0), and faded_bush / power_box tiles are
-render states the tile map does not have; add them to snap2 / encode.c when the policy needs them.
+shortcut: area effects have no radius / kind (one class per side), and faded_bush / power_box tiles are render states the
+tile map does not have; add them to snap2 / encode.c when the policy needs them.
+Gadget (v5.3, issue #3): self 3 = the gadget can be used now (a charge left, no cooldown), passed in as `gadget` (B,) from
+the host's gadget state (env_v5.Env.gadget; 0 = no gadget, a host that publishes none, or a gadget type the host cannot
+activate yet). The fire head has the classes FIRE; a class with a FIRE_READY column is only allowed while that self column
+is set (model.mask_fire), so with self 3 = 0 a policy acts exactly as before the gadget class existed.
 shortcut: no box size (the sim has none; a per-class constant adds nothing to the one-hot); add with the agent adapter.
 """
 import functools, os, sys
@@ -28,6 +32,12 @@ SEG = ("floor", "indestructible", "destructible_wall", "fragile_wall", "bush", "
 UNKNOWN = len(SEG)
 ENT = ("enemy", "teammate", "enemy_summon", "teammate_summon", "power_box", "power_cube", "enemy_projectile",
        "teammate_projectile", "enemy_area_effect", "teammate_area_effect")
+# The observation / action contract of exported policies; bump on any change of a shape, a class list, the slot layout or
+# cond. v5.2 -> v5.3: the fire head gained "gadget" (a 4th class, gated by self 3).
+OBS_VERSION = "v5.3"
+FIRE = ("none", "attack", "super", "gadget")     # fire head classes = NbeAction.fire codes 0-3 (host env.c apply_actions)
+FIRE_READY = (None, None, 2, 3)                  # self column that must be >= 0.5 for the class to be allowed (model.mask_fire)
+FIRE_AIM = (False, True, True, True)             # the aim head counts for the class (the host takes the gadget's aim as its direction)
 SLIDERS = ("bush_camp", "collect", "protect", "retreat", "kite", "peek", "focus", "push", "third_party", "bush_control")
 N_SELF, N_ENT, F_ENT, G = 8, F.EN_K + F.PJ_K + F.BX_K + F.IT_K, 1 + len(ENT) + 5, 25
 XY, VEL, HP = 1 + len(ENT), 3 + len(ENT), 5 + len(ENT)
@@ -93,11 +103,13 @@ def _tile_lut():
     return lut
 
 
-def from_state2(vec, grid, meta):
-    """fair state2 vec (B, 436), grid (B, 6, 25, 25), meta (B, 5) = x, y, tick, W, H (MAEnv.last_meta) -> clean obs"""
+def from_state2(vec, grid, meta, gadget=None):
+    """fair state2 vec (B, 436), grid (B, 6, 25, 25), meta (B, 5) = x, y, tick, W, H (MAEnv.last_meta), gadget (B,) the
+    gadget can be used now (env_v5.Env.gadget; None = 0) -> clean obs"""
     B = len(vec)
     s = np.zeros((B, N_SELF), np.float32)
     s[:, 0] = vec[:, 0]; s[:, 1] = np.minimum(vec[:, 2], 1.0); s[:, 2] = vec[:, 5] >= 1.0; s[:, 5] = vec[:, 8]
+    if gadget is not None: s[:, 3] = np.asarray(gadget, np.float32).reshape(B) >= 0.5
     s[:, 4] = vec[:, 18] >= 1.0
     s[:, 6:8] = vec[:, 12:14] * (40 / 300)
     ent = np.zeros((B, N_ENT, F_ENT), np.float32)
@@ -179,11 +191,12 @@ class ObsV5:
                 for k in list(self.ep)[:2048]: del self.ep[k]
         return e
 
-    def build(self, vec, grid, meta, ids, cmd=None):
+    def build(self, vec, grid, meta, ids, cmd=None, gadget=None):
         """cmd (B, 2) tiles / tick (sim_plan A2, train_fast --cmd-vel): own velocity = the commanded move, as the agent gets
         it live (BSRL brain / play_live: move direction x brawler speed); entity velocities then carry the same error
-        (live: matched position difference + commanded own velocity). Noisy path only."""
-        o = from_state2(vec, grid, meta)
+        (live: matched position difference + commanded own velocity). Noisy path only. gadget (B,): from_state2's (self 3;
+        like the rest of self it reaches the policy with the episode's latency)."""
+        o = from_state2(vec, grid, meta, gadget)
         if self.noise is None or not len(ids):
             return o
         r, B = self.rng, len(ids)
@@ -285,6 +298,9 @@ def _check():
     o = from_state2(vec, grid, meta)
     assert o["self"].shape == (2, N_SELF) and o["ent"].shape == (2, N_ENT, F_ENT) and o["grid"].shape == (2, G, G)
     assert np.allclose(o["self"][0], [0.5, 2 / 3, 1, 0, 1, 0, 40 / 300, 0])
+    og = from_state2(vec, grid, meta, gadget=np.array([1, 0]))   # self 3 = gadget ready, nothing else changes
+    assert og["self"][0, 3] == 1 and og["self"][1, 3] == 0 and np.array_equal(np.delete(og["self"], 3, 1), np.delete(o["self"], 3, 1))
+    assert len(FIRE) == len(FIRE_READY) == len(FIRE_AIM) and FIRE[:3] == ("none", "attack", "super") and FIRE_READY[3] == 3
     e = o["ent"][0]; cls = lambda k: ENT[int(e[k, 1:1 + len(ENT)].argmax())]
     got = [(k, cls(k)) for k in np.nonzero(e[:, 0])[0]]
     assert got == [(0, "enemy"), (1, "teammate"), (2, "enemy_summon"), (3, "teammate_summon"), (9, "teammate_projectile"),

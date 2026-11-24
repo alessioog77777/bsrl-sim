@@ -948,8 +948,12 @@ static void fire_input(void *sim, int pidx, uint8_t *ch, int super, double deg, 
     int X, Y; client_pos(pidx, ch, &X, &Y); fire_input_at(sim, pidx, ch, super, deg, dist, X, Y);
 }
 /* diversity round: gadget input (kind 8 -> 0xc2cef4 -> 0xb27c58(player+0x190, char, x, y, 0)); the aim as a displacement of
- * 1000 u (like a relative attack input). NOTE: 0xb27c58 is a bare ret in this libg: the input reaches the game, nothing happens. */
+ * 1000 u (like a relative attack input). NOTE: 0xb27c58 is a bare ret in this libg: the input reaches the game, nothing happens.
+ * gadget round: a gadget with a host implementation (gadget.c) is activated there instead. */
+int gadget_use(void *sim, int i, uint8_t *ch, double deg, int tick); void gadget_publish(NbeResp *r, int tick);
+void gadget_clear(void); void gadget_reset_player(int i, int has_object);
 static void gadget_input(void *sim, int pidx, uint8_t *ch, double deg) {
+    if (gadget_use(sim, pidx, ch, deg, I32(sim, 0x10))) return;
     double r = deg * M_PI / 180; apply_input(sim, pidx, 8, jround(1000 * cos(r)), jround(1000 * sin(r)), NULL);
 }
 /* rl round (tests): fire the character's skill instance idx (char +0x458 array, +0x464 count; instance +0 = SkillData) like an attack */
@@ -1186,7 +1190,7 @@ static void div_publish(void *sim) {   /* RESET response: read the battle back f
     R->div_variation = I32(sim, 0x104);
     R->div_reserved[0] = U8(sim, 0x134);   /* the builder's "cards" flag (global 0x12eefd4): 0 = player configs get no star power /
                                               gadget / overcharge cards (0xc27d64) */
-    int np; void **ps = players(sim, &np);
+    int np; void **ps = players(sim, &np); gadget_clear();
     for (int i = 0; i < NBE_MAXP; i++) {
         R->pl_char[i] = R->pl_skin[i] = 0;
         if (i >= np || !ps[i]) continue;
@@ -1194,6 +1198,7 @@ static void div_publish(void *sim) {   /* RESET response: read the battle back f
         void *skin = PTR(ps[i], 0x1d8); if (!skin && ld) skin = ld[4];
         R->pl_char[i] = ld ? data_id(ld[0]) : 0; R->pl_skin[i] = data_id(skin);
         if (PTR(ps[i], 0x190)) R->div_reserved[1] |= 1 << i;
+        gadget_reset_player(i, PTR(ps[i], 0x190) != NULL);   /* gadget round */
         if (ld && ld[1] && PTR(ld[1], 0x08)) R->div_reserved[2] |= 1 << i;
     }
 }
@@ -1331,6 +1336,8 @@ static void publish(void *sim, uint32_t seq, int status, const char *err) {
     R->reserved[5] = g_lead_n; { extern int g_swaps_count(void); if (!(g_publish_defer && g_cl_capstep)) R->reserved[6] = g_swaps_count() - 1; }   /* expertbot round: eglSwapBuffers count (aligns nbgl ID-buffer dumps) instead of g_lead_skip */ R->seed_applied = E.seed_applied; R->reserved[0] = E.gas_latched; R->reserved[1] = E.gas_phase; R->reserved[2] = E.gas_j; { void *cb = E.battle ? PTR(E.battle, 0x28) : NULL; R->reserved[3] = (!g_env_simonly && cb) ? I32(cb, 0x4c) : -1; } R->seed_plus1 = I32(B(0x12f40c0), 0) && (uint64_t)(*(int64_t *)B(0x12f40c0) - *(int64_t *)B(0x12f40b8)) > 15;
     R->steps_in_frame = E.steps_in_frame; R->frame = E.frame;
     fill_players(sim);
+    if (E.cur.type == NBE_CMD_RESET) div_publish(sim);   /* diversity round (before gadget_publish: it sets up the gadgets) */
+    gadget_publish(R, I32(sim, 0x10));                   /* gadget round */
     R->njumps = 0; for (int i = 0; i < E.njobs && i < NBE_MAXP; i++) { int *j = R->jumps[R->njumps++]; j[0] = E.jobs[i].id; j[1] = E.jobs[i].t; j[2] = E.jobs[i].T; j[3] = E.jobs[i].x1; j[4] = E.jobs[i].y1; }
     R->ncubes = 0; for (int i = 0; i < E.ncube && i < NBE_MAXP; i++) { R->cubes[R->ncubes][0] = E.cube_id[i]; R->cubes[R->ncubes++][1] = E.cube_n[i]; }
     R->cam_valid = 0;
@@ -1366,7 +1373,6 @@ static void publish(void *sim, uint32_t seq, int status, const char *err) {
     }
     R->map_written = 0;
     if ((E.cur_flags & NBE_F_MAP) || E.cur.type == NBE_CMD_RESET) { int wh[2]; R->map_hash = snap_map(sim, MAPB, NBE_MAP_CAP, wh); R->map_w = wh[0]; R->map_h = wh[1]; R->map_written = 1; }
-    if (E.cur.type == NBE_CMD_RESET) div_publish(sim);   /* diversity round */
     R->rec_n = (E.cur_flags & NBE_F_REC) ? g_rec_n : 0; R->rec_lost = g_rec_lost;
     R->us_state = (int)((tnow() - t0) * 1e6);
     R->us_step = (int)((tnow() - E.t_step0) * 1e6);

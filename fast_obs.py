@@ -41,8 +41,8 @@ class FastObsV5(O.ObsV5):
                 for k in list(self.ep)[:2048]: self.unfree.append(self.ep.pop(k)[9])
         return e
 
-    def build(self, vec, grid, meta, ids, cmd=None):
-        o = from_state2(vec, grid, meta)
+    def build(self, vec, grid, meta, ids, cmd=None, gadget=None):
+        o = from_state2(vec, grid, meta, gadget)
         if self.noise is None or not len(ids):
             return o
         r, B = self.rng, len(ids)

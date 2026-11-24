@@ -31,6 +31,9 @@ Changes made to nirkt's code, all recorded in `host/`:
 - `host/training_round.patch`: team groups, summons and area effects in the observation, per-instance map folders,
   teammate respawn.
 - `host/fair_view.patch`: camera view window (measured trapezoid, per-episode zoom, teammates never bush-hidden).
+- `host/gadgets.patch` (issue #3, a diff on top of the two above): per-player gadget state in the response (`NbeResp`
+  `gad_*`, mirrored in `nbpc/proto.py`) and the host's own gadget activation in `native/loader/gadget.c`, which
+  `env.c` `gadget_input` tries first. No gadget kind is implemented yet, so every gadget still reads as not usable.
 - `maenv.py` and `fair.py` copied from `deps/nbrl-env/py/nbpc` into `deps/bulletlabels/vendor/nbpc`, so one `nbpc`
   package holds the host side and the environment side.
 - The game download link removed from `deps/bulletlabels/setup.sh` (this repo's `setup.sh` downloads it instead).
@@ -52,5 +55,6 @@ generated maps, default `work/`), `SIM_VENV`.
 - **Slow start.** One boot takes 60-90 s. Batch your checks into one run.
 - **A generated map crashes its instance (exit 139).** Layouts with a payload-track tile crash at boot.
   `env_v5.use_genmaps` skips them.
-- **The fire head never uses gadgets or hypercharge.** The host cannot trigger them, so actions are none / attack /
-  super.
+- **The fire head never uses gadgets or hypercharge.** The game build compiles gadget activation out, and the host
+  activates only the kinds `native/loader/gadget.c` implements (none yet), so the gadget class stays masked. Hypercharge
+  has no fire class yet (issue #4). `python -m gadget_check` shows which kinds the built host publishes.

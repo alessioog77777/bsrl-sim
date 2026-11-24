@@ -11,7 +11,7 @@ Same math as model.act_stacked (HISTORY 68: one forward for learner / eval copy 
   one matmul, index tensors kept on the GPU = no hidden host syncs): far fewer ops than vmap (dispatch-bound on ROCm);
 * rows are grouped and padded on the CPU into ONE pinned float32 block = one upload;
 * sampling = Gumbel-max on log_softmax (the distribution of torch Categorical.sample, without its validation
-  overhead); log-prob masking as models4.dist_logp_ent (aim only when firing, distance only for a super);
+  overhead); log-prob masking as model.dist_logp_ent (aim only for an aiming fire class, distance only for a super);
 * the outputs (action, logp, value, next h) come back as ONE (N, 6 + HID) download.
 
     python -m fast_act      # allclose check vs model.act_stacked + timing (GPU shared with a live run = inflated)
@@ -21,13 +21,13 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import obs_v5 as O
-from model import Policy, HID, PRIV, _CAND, _FOE, mask_super, lead, hero_index, F_IN, HMAX
+from model import Policy, HID, PRIV, _CAND, _FOE, mask_fire, lead, hero_index, F_IN, HMAX, N_FX, _SUPER
 
 NS = O.N_SELF + O.N_COND
 _W = [NS, O.N_ENT * O.F_ENT, O.G * O.G, PRIV, HID]      # block layout: s | ent | grid | priv | h
 _OFF = np.cumsum([0] + _W)
 OBS_W = int(_OFF[4])                                     # what a worker writes per row (all but h)
-_HEADS = ["pi", "v", "free", "free_score"]               # 28 | 1 | 360 | 1 outputs
+_HEADS = ["pi", "fire_x", "v", "free", "free_score"]     # 28 | N_FX | 1 | 360 | 1 outputs
 
 
 class StackedActor:
@@ -51,7 +51,7 @@ class StackedActor:
             sd = [dict(n.named_parameters()) for n in nets]
             P = {k: torch.stack([d[k].detach() for d in sd]) for k in sd[0]}
             d = P["pi.weight"].shape[-1]; c1, vp1 = P["cand.0.weight"], P["vp.0.weight"]
-            # one matmul for every linear that reads cat[x, h]: pi | v | free | free_score | cand.0 (x part) | vp.0 (x part)
+            # one matmul for every linear that reads cat[x, h]: pi | fire_x | v | free | free_score | cand.0 (x part) | vp.0 (x part)
             P["headW"] = torch.cat([P[n + ".weight"] for n in _HEADS] + [c1[..., :d], vp1[..., :d]], 1).transpose(1, 2).contiguous()
             P["headb"] = torch.cat([P[n + ".bias"] for n in _HEADS] + [P["cand.0.bias"], P["vp.0.bias"]], 1)[:, None]
             P["candE"], P["vpP"] = c1[..., d:].transpose(1, 2).contiguous(), vp1[..., d:].transpose(1, 2).contiguous()
@@ -90,8 +90,8 @@ class StackedActor:
         r, z = torch.sigmoid(ir + hr), torch.sigmoid(iz + hz); h = (1 - z) * torch.tanh(i_n + r * h_n) + z * h
         xc = torch.cat([x, h], -1)
         # heads (Policy.heads: nirkt's PointerAim + value + the critic's priv branch)
-        pi, v, free, fsc, cx, vx = torch.split(torch.baddbmm(P["headb"], xc, P["headW"]), [28, 1, 360, 1, 128, P["vpP"].shape[-1]], -1)
-        mv, fi, di = torch.split(pi, [17, 3, 8], -1)
+        pi, fx, v, free, fsc, cx, vx = torch.split(torch.baddbmm(P["headb"], xc, P["headW"]), [28, N_FX, 1, 360, 1, 128, P["vpP"].shape[-1]], -1)
+        mv, fi, di = torch.split(pi, [17, 3, 8], -1); fi = torch.cat([fi, fx], -1)
         c = ent.index_select(2, self.cand); K = c.shape[2]
         here = (c[..., 0] > 0.5) & (c.index_select(3, self.foe).sum(-1) > 0.5)
         o = F.relu(cx[:, :, None] + torch.bmm(c.reshape(G, Bm * K, -1), P["candE"]).view(G, Bm, K, -1))
@@ -103,7 +103,7 @@ class StackedActor:
         comp = torch.cat([bump, torch.log_softmax(free, -1)[:, :, None]], 2)
         aim = torch.logsumexp(mix[..., None] + comp, 2)
         v = v[..., 0] + lin(F.relu(torch.baddbmm(vx, pv, P["vpP"])), "vp.2")[..., 0]
-        return (mv, mask_super(fi, X[..., :NS]), aim, di), v, h
+        return (mv, mask_fire(fi, X[..., :NS]), aim, di), v, h
 
     def layout(self, gidx):
         """(B,) group per row -> used groups, rows per group (padded), flat destination row of each input row"""
@@ -132,15 +132,19 @@ class StackedActor:
         return out[:, :4].astype(np.int64), out[:, 4].copy(), out[:, 5].copy(), np.ascontiguousarray(out[:, 6:])
 
 
+_AIM = {}   # device -> obs_v5.FIRE_AIM as a float tensor (kept on the device: no upload per call)
+
+
 def sample(logits):
-    """Gumbel-max sample per head + masked log-prob (models4.dist_logp_ent's rule) -> (N, 4) long, (N,)"""
+    """Gumbel-max sample per head + masked log-prob (model.dist_logp_ent's rule) -> (N, 4) long, (N,)"""
     lps, acts = [], []
     for lg in logits:
         ls = F.log_softmax(lg.float(), -1)
         a = (ls - torch.empty_like(ls).exponential_().log()).argmax(-1)
         acts.append(a); lps.append(ls.gather(-1, a[:, None])[:, 0])
-    fire = acts[1]
-    lp = lps[0] + lps[1] + (fire > 0) * lps[2] + (fire == 2) * lps[3]
+    fire = acts[1]; dev = fire.device
+    if dev not in _AIM: _AIM[dev] = torch.as_tensor(O.FIRE_AIM, dtype=torch.float32, device=dev)
+    lp = lps[0] + lps[1] + _AIM[dev][fire] * lps[2] + (fire == _SUPER) * lps[3]
     return torch.stack(acts, -1), lp
 
 
@@ -187,8 +191,11 @@ def _check(B=70, G=4, iters=100):
     from model import act_stacked, dist_logp_ent
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu"); torch.manual_seed(0); rng = np.random.default_rng(0)
     nets = [Policy().to(dev).eval() for _ in range(G)]
-    for n in nets: torch.nn.init.normal_(n.vp[2].weight, std=0.1); torch.nn.init.normal_(n.free.weight, std=0.05); torch.nn.init.normal_(n.pi.weight, std=0.1)
+    for n in nets:
+        torch.nn.init.normal_(n.vp[2].weight, std=0.1); torch.nn.init.normal_(n.free.weight, std=0.05); torch.nn.init.normal_(n.pi.weight, std=0.1)
+        torch.nn.init.normal_(n.fire_x.weight, std=0.3); torch.nn.init.normal_(n.fire_x.bias, std=0.3)   # the gadget class live
     s, ent, grid, h, pv = _rand_batch(B, rng); gidx = rng.choice(G, B, p=[0.55, 0.2, 0.15, 0.1] if G == 4 else None)
+    s[:, 3] = rng.random(B) < 0.5                                     # gadget ready on half the rows (the rest: masked)
     s[:, O.N_SELF + 3] = np.abs(s[:, O.N_SELF + 3])                   # projectile speed > 0: lead columns live
     for k, n in enumerate(nets):                                      # stage 2 parts non-zero: hero rows (net 3 has none), lead weights
         if k < 3: n.add_heroes(s[k * 20:k * 20 + 30, O.N_SELF:O.N_SELF + 13])
@@ -197,6 +204,9 @@ def _check(B=70, G=4, iters=100):
     d = compare(nets, gidx, s, ent, grid, h, pv, actor)
     print("fast_act vs act_stacked (random weights): max |d|", {k: "%.1e" % x for k, x in d.items()})
     assert ok(d), d
+    gad = O.FIRE.index("gadget"); fa = np.concatenate([actor(nets, gidx, s, ent, grid, h, pv)[0][:, 1] for _ in range(20)])
+    ready = np.tile(s[:, 3] > 0.5, 20)
+    assert (fa == gad).any() and not (fa[~ready] == gad).any(), "gadget sampled only while self 3 (gadget ready) is set"
     with torch.no_grad(): nets[0].pi.bias += 0.5                  # a weight change must reach the cached stack
     d = compare(nets, gidx, s, ent, grid, h, pv, actor); assert ok(d), ("stale cache", d)
     lgt = torch.tensor([[0.0, 1.0, -1.0, 2.0]], device=dev).expand(200000, 4)   # sampler = Categorical.sample in distribution

@@ -20,6 +20,7 @@ everything. Game files are not included: you supply them.
 | `train_ppo.py` | Behaviour cloning from the native AI, then PPO with a KL anchor, league / self-play, evals, replays. |
 | `train_fast.py` | Same trainer with environment collection split over worker processes (shared memory). |
 | `scorecard.py` | Skill metrics of a run from its logs: placement, win rate, trade, hit rate, aim lead, cube and gas stats. |
+| `gadget_check.py` | One-boot check of gadget activation: loadout reaches the host, each implemented kind's effect, uses and cooldown spent. |
 | `live_check.py` | One-boot check of the host round: team reward, area effects, generated maps, teammate respawn, HUD mask. |
 | `test_fast.py` | Equality and timing of the fast paths against the reference paths on real battles. |
 | `apply_noise.py` | Writes a measured detector-noise report into `obs_v5.NOISE` (with sanity limits). |
@@ -28,7 +29,7 @@ everything. Game files are not included: you supply them.
 | `env.sh` | Environment variables for the host, nirkt's packages and the work folder. |
 | `setup.sh` | One-command setup: host build, venv, game files (SETUP.md). |
 | `deps/` | nirkt's `bulletlabels` and the `py/` + `train/` parts of `nbrl-env`, with this project's changes applied. |
-| `host/training_round.patch`, `host/fair_view.patch` | Record of this project's changes to nirkt's host and camera rules (already applied in `deps/`). |
+| `host/training_round.patch`, `host/fair_view.patch`, `host/gadgets.patch` | Record of this project's changes to nirkt's host and camera rules (already applied in `deps/`). |
 | `pro_strategies.md` | Community Showdown habits and what each means for the observation / reward. |
 
 ## Requirements
@@ -76,9 +77,11 @@ cd $SIM_WORK/runs && python -m http.server 8766      # dashboard: http://localho
 
 - Comments cite numbered entries of the project's private decision log (`HISTORY N`). They explain why a value is
   what it is; the log itself is not published.
-- The fire head is none / attack / super: gadgets and hypercharge cannot be triggered on this host.
+- The fire head is none / attack / super / gadget. The gadget class is masked unless the host activates that gadget's
+  kind (`gadget.c`, none implemented yet) and a use is left (`obs_v5` self 3). Hypercharge cannot be triggered yet.
+  Training with gadget loadouts is `--gadgets 1` (off by default).
 - Observation layout changes must be mirrored by anything that consumes exported policies. `obs_v5` carries the
-  version (`v5.2`) that exported policies are checked against.
+  version (`v5.3`) that exported policies are checked against.
 
 ## Licence
 

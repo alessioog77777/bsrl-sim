@@ -71,6 +71,7 @@ def parse(argv=None):
     ap.add_argument("--eval-team", type=int, default=1, help="team size of the eval battles (1 = solo, as before)")
     ap.add_argument("--gen", type=int, default=0, help="1 = instances boot generated layouts (env_v5.use_genmaps), played with --p-gen")
     ap.add_argument("--p-gen", type=float, default=0.5)
+    ap.add_argument("--gadgets", type=int, default=0, help="1 = players carry a gadget, the policy sees it ready (self 3) and may use it (issue #3; needs a host with gadget activation)")
     a = ap.parse_args(argv)
     if a.smoke: a.n, a.rollout, a.chunks, a.bc_updates, a.eval_episodes, a.evalb_episodes, a.hours = a.smoke_n, 2048, 64, 1, 4, 4, 0.2
     a.workers = max(1, min(a.n, a.workers or (a.n + 1) // 2))
@@ -106,7 +107,11 @@ def worker(w, lo, hi, a, loc, out, conn, shm, init):
             for p in range(10): u.setdefault(g[p] or 100 + p, []).append(p)
             return [u[k] for k in rng_b.permutation(sorted(u))]
 
-        def battle_fn(rng, i):                          # train_ppo.battle_fn; state from the main process
+        def battle_fn(rng, i):
+            cfg = battle_cfg(rng, i)
+            return E.with_gadgets(cfg, rng) if a.gadgets else cfg   # MAEnv's rng: rng_b's draws stay the same
+
+        def battle_cfg(rng, i):                         # train_ppo.battle_fn; state from the main process
             li, i = i, lo + i; bc = st["bc"]
             tag = {"loc": locs[0], "chr": [a.brawler] * 10, "team_size": 1, "groups": [0] * 10}
             cfg = {"div": D.make_div(location=tag["loc"], chr=tag["chr"]), "tag": tag, "end": "agents"}
@@ -158,7 +163,8 @@ def worker(w, lo, hi, a, loc, out, conn, shm, init):
             obs, ids, tr = env.poll(min_ready=min(a.min_ready or (hi - lo), hi - lo), max_wait=a.max_wait)
             t1 = time.perf_counter(); B = len(ids); msg = {"B": B}
             if B:
-                o = ob.build(obs["vec"], obs["grid"], env.last_meta, ids, cmd=env.cmd_vel(ids) if a.cmd_vel else None)
+                o = ob.build(obs["vec"], obs["grid"], env.last_meta, ids, cmd=env.cmd_vel(ids) if a.cmd_vel else None,
+                             gadget=env.gadget(ids) if a.gadgets else None)
                 X[:B, :_OFF[1]] = np.concatenate([o["self"], env.cond(ids)], 1); X[:B, _OFF[1]:_OFF[2]] = o["ent"].reshape(B, -1)
                 X[:B, _OFF[2]:_OFF[3]] = o["grid"].reshape(B, -1); X[:B, _OFF[3]:_OFF[4]] = FO.priv_fast(env, ids)
                 kind = [t["kind"] for t in env.last_tags]; isev = np.char.startswith(np.array(kind), "eval")
@@ -395,7 +401,7 @@ def main(argv=None):
                "ticks": mean([r["ticks"] for r in ok]), "storm_death": mean([r["storm_death"] for r in ok]),
                "hit_rate": round(sum(r["terms"]["hits"] for r in recent) / max(1.0, sum(r["terms"]["shots"] for r in recent)), 4),
                "attack_frac": mean([r["attack_steps"] / max(1, r["steps"]) for r in recent]),
-               "move_hist": np.bincount(acts[:, 0], minlength=17)[:17].tolist(), "fire_hist": np.bincount(acts[:, 1], minlength=3)[:3].tolist(),
+               "move_hist": np.bincount(acts[:, 0], minlength=17)[:17].tolist(), "fire_hist": np.bincount(acts[:, 1], minlength=len(O.FIRE))[:len(O.FIRE)].tolist(),
                "aim_hist": np.bincount(fired[:, 2] // 15, minlength=24)[:24].tolist()}
         for k in sorted({r["tag"]["kind"] for r in ok}): row["rank_" + k] = mean([r["rank"] for r in ok if r["tag"]["kind"] == k])
         row["pfsp"] = {os.path.basename(p)[:-3]: [round(pfr(p), 2), pf.get(os.path.basename(p), [0, 0])[1]] for p in pool}
