@@ -60,6 +60,12 @@ Changes made to nirkt's code, all recorded in `engine/patches/`:
   game builds it as the brawler's third skill instance) it takes the super's place while hypercharged (`hyper.c`
   `swap_ulti` / `hyper_unswap`). Meg's mech takes Meg's card. `NbeResp` `hyp_supers` / `hyp_super_id` count the supers cast
   while hypercharged (`python -m super_audit --hyper`).
+- `supers.patch` (issue #6, a diff on top of `gadgets.patch`): supers whose effect the client libg compiles out, in
+  `native/loader/superfix*.c` (status-effect store, areas, summons; `NB_SUPERFIX=0` turns it off).
+- `status_movement.patch` (issue #19, a diff on top of `supers.patch`): speed boosts and slows from statuses in the mover
+  (`env.c` `rec_move`), damage boost / reduce in `my_root`, stuns (projectile `StunLengthMS`, stun and silence areas,
+  Bo's stun trap) through libg's stun counter, silence, `CcImmunity`, and Draco's weapon swap on mount
+  (`native/loader/superfix_cc.c`; `NB_SUPERFIX_CC=0` turns the stuns, silence and swap off). `python -m status_check`.
 - `maenv.py` and `fair.py` copied from nbrl-env's `py/nbpc` into bulletlabels' `vendor/nbpc` (now `engine/py/nbpc`),
   so one `nbpc` package holds the host side and the environment side.
 - The game download link removed from bulletlabels' `setup.sh` (`engine/setup.sh`) (this repo's `setup.sh` downloads it instead).
