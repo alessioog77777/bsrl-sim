@@ -156,6 +156,9 @@ typedef struct {
     int32_t hyp_left[NBE_MAXP];       /* ticks of hypercharge left (0 = not active) */
     int32_t hyp_used[NBE_MAXP];       /* activations so far this battle */
     int32_t hyp_damage_pct[NBE_MAXP], hyp_speed_pct[NBE_MAXP], hyp_shield_pct[NBE_MAXP];   /* buffs while active (characters.csv) */
+    /* hypercharged supers (appended): supers cast while hypercharged so far, and the SkillData data id the last one used
+     * (the brawler's OverchargedUltimateSkill where characters.csv has one, else its UltimateSkill) */
+    int32_t hyp_supers[NBE_MAXP], hyp_super_id[NBE_MAXP];
 } NbeResp;
 /* NbeResp.gad_kind: what an activation does (one re-implementation per kind, from the gadget's own data rows) */
 #define NBE_GAD_NONE 0

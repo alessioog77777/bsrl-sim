@@ -90,7 +90,9 @@ class Resp(C.Structure):
         # with a host without it. Per player: equipped card id (0 = none), ticks active left (0 = off), activations so far,
         # the buffs while active (percent: damage dealt +, move speed +, damage taken -). Charge / max: Player.reserved[0] / [1]
         ("hyp_valid", C.c_int32), ("hyp_card", C.c_int32 * MAXP), ("hyp_left", C.c_int32 * MAXP), ("hyp_used", C.c_int32 * MAXP),
-        ("hyp_damage_pct", C.c_int32 * MAXP), ("hyp_speed_pct", C.c_int32 * MAXP), ("hyp_shield_pct", C.c_int32 * MAXP)]
+        ("hyp_damage_pct", C.c_int32 * MAXP), ("hyp_speed_pct", C.c_int32 * MAXP), ("hyp_shield_pct", C.c_int32 * MAXP),
+        # hypercharged supers (appended): supers cast while hypercharged so far, the SkillData data id the last one used
+        ("hyp_supers", C.c_int32 * MAXP), ("hyp_super_id", C.c_int32 * MAXP)]
 
 
 GAD_NONE, GAD_DASH, GAD_HEAL, GAD_SHIELD, GAD_SPAWN, GAD_PROJECTILE, GAD_STATUS = range(7)   # Resp.gad_kind (nbenv_proto.h NBE_GAD_*)

@@ -126,7 +126,7 @@ xychart-beta
 | `train_ppo.py` | Behaviour cloning from the native AI, then PPO with a KL anchor, league / self-play, evals, replays; live value / aux head targets and readouts. `python -m train_ppo --check` |
 | `train_fast.py` | Same trainer with environment collection split over worker processes (shared memory). |
 | `scorecard.py` | Skill metrics of a run from its logs: placement, win rate, trade, hit rate, aim lead, cube and gas stats; behaviour per slider preset (pass rules vs balanced) and per-slider effect slopes. `python scorecard.py --check` |
-| `super_audit.py` | Per-brawler super audit: fires every brawler's super at a target and records what happened (works / partial / unverified / no effect / not fired / crash); checklist in issue #6. `python -m super_audit [--n 2] [--only A,B]`, `--check` |
+| `super_audit.py` | Per-brawler super audit: fires every brawler's super at a target and records what happened (works / partial / unverified / no effect / not fired / crash); checklist in issue #6; `--hyper` audits the hypercharged supers (hypercharge first, expects the hypercharged super's own effects). `python -m super_audit [--n 2] [--only A,B] [--hyper]`, `--check` |
 | `scenarios.py` | Hard-scenario eval set: 7 seeded situations (gas endgame, third party, assassin rush, low HP with an enemy close, cube-rich enemy at low HP, teammate under fire, bush memory) x 2 maps x 2 brawler picks x 4 layouts, set up by teleports and a forced storm, each with episode scores and a pass rule. Trainer `--eval-scenarios 1` (every `--scenario-every`-th eval) -> `scenarios.jsonl`, replays in `replays/scn/` (viz: failures first). `python -m scenarios --check`, `python -m scenarios --ckpt X --n 2` |
 | `gadget_check.py` | One-boot check of gadget activation: the loadout reaches the host, each implemented kind's effect, uses and cooldown spent, fire 3 while not ready spends nothing, `Env.gadget` agrees with the host. `python -m gadget_check`, `--check` |
 | `hyper_check.py` | One-boot check of hypercharge: the card reaches the host, charging from hits, fire 4 activates only at a full charge with the card, +speed / +damage / shield while active, the end after 5 s and normal speed after it, `Env.hyper` agrees with the host. `python -m hyper_check`, `--check` |
@@ -200,8 +200,10 @@ cd $SIM_WORK/runs && python -m http.server 8766      # dashboard: http://localho
 - The fire head is none / attack / super / gadget / hypercharge. The gadget class is masked unless the host activates
   that gadget's kind (`gadget.c`, none implemented yet) and a use is left (`obs_v5` self 3). The hypercharge class is
   masked unless the brawler has its card, the charge is full and it is not active (`hyper.c`, `obs_v5` self 4); active,
-  it gives the brawler's speed, damage and shield buffs for 5 s, but the hypercharged super is not implemented (the
-  super stays the normal one). Training with gadget loadouts is `--gadgets 1`, with hypercharge `--hyper 1` (both off by default).
+  it gives the brawler's speed, damage and shield buffs for 5 s, and its skills are the hypercharged ones: the game's own
+  skill code runs the tables' `Overcharged*` columns (the client build's "is hypercharged" check always said no), and the
+  seven brawlers with a separate hypercharged super (`characters.csv` `OverchargedUltimateSkill`: Chester, Mandy,
+  Larry & Lawrie, Ollie, Trunk, Mina, Meg's mech) cast that one. Training with gadget loadouts is `--gadgets 1`, with hypercharge `--hyper 1` (both off by default).
 - Observation layout changes must be mirrored by anything that consumes exported policies. `obs_v5` carries the
   version (`obs_v5.OBS_VERSION`, now `v5.8`; saved in every checkpoint) that exported policies are checked against.
 

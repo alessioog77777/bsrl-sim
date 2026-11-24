@@ -45,6 +45,12 @@ Changes made to nirkt's code, all recorded in `engine/patches/`:
   put in the player config by `offline.c`), activation by `NbeAction.fire` 4 through libg's own activation, and in
   `native/loader/hyper.c` the parts the client build lacks: the drain to 0 over 5 s, the end, and the speed / damage /
   shield buffs from `characters.csv` (`env.c` `rec_move` / `my_root`). State in `NbeResp` `hyp_*`, mirrored in `nbpc/proto.py`.
+- `hypercharged_supers.patch` (a diff on top of `hypercharge.patch`): libg's `Character::isOvercharged` (0xb35bf0, a
+  `return false` in the client build) answers true while a brawler's hypercharge is on, so the game's own skill code uses
+  the `Overcharged*` columns of `skills.csv`; where `characters.csv` has an `OverchargedUltimateSkill` (7 brawlers; the
+  game builds it as the brawler's third skill instance) it takes the super's place while hypercharged (`hyper.c`
+  `swap_ulti` / `hyper_unswap`). Meg's mech takes Meg's card. `NbeResp` `hyp_supers` / `hyp_super_id` count the supers cast
+  while hypercharged (`python -m super_audit --hyper`).
 - `maenv.py` and `fair.py` copied from nbrl-env's `py/nbpc` into bulletlabels' `vendor/nbpc` (now `engine/py/nbpc`),
   so one `nbpc` package holds the host side and the environment side.
 - The game download link removed from bulletlabels' `setup.sh` (`engine/setup.sh`) (this repo's `setup.sh` downloads it instead).
