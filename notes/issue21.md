@@ -34,3 +34,7 @@ Setup: pytorch.org and the qemu source download are blocked by the proxy here: t
 - 5 min run after excluding wiped waiting players (no body) and DROP_R 1300: 1548 of 1647 falls left exactly
   min(k/3+1, 5 or 2) cubes (94 %); misses are mostly 0 seen (likely picked up within the step) or 2 seen (a box's cube nearby).
 - Without the mirror (main), every death should drop exactly 1 cube (+0x874 = 0; from the static read, not measured on main).
+
+## State
+- PR #26 open (not merged), commit pushed on claude/project-thread-a2aisf, subscribed to its activity.
+- Not done from #21: storm numbers, event modifiers, WallSpawn shape from Radius, bush-grow mapping.
