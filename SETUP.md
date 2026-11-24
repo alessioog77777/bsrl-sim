@@ -40,7 +40,9 @@ Changes made to nirkt's code, all recorded in `engine/patches/`:
   area effects' data id in item feature 5 (obs_v5 looks up radius and kind), power cubes lost at a team knock-out.
 - `gadgets.patch` (issue #3, a diff on top of the three above): per-player gadget state in the response (`NbeResp`
   `gad_*`, mirrored in `nbpc/proto.py`) and the host's own gadget activation in `native/loader/gadget.c`, which
-  `env.c` `gadget_input` tries first. No gadget kind is implemented yet, so every gadget still reads as not usable.
+  `env.c` `gadget_input` tries first. It implements dash gadgets (the native charge mover, through `env.c`
+  `env_dash_start`) and heal-over-time gadgets (Bibi, Byron; ticked from `env.c` `pre_snapshot`), with 3 uses per
+  battle and the game's own cooldown. Every other gadget still reads as not usable.
 - `maenv.py` and `fair.py` copied from nbrl-env's `py/nbpc` into bulletlabels' `vendor/nbpc` (now `engine/py/nbpc`),
   so one `nbpc` package holds the host side and the environment side.
 - The game download link removed from bulletlabels' `setup.sh` (`engine/setup.sh`) (this repo's `setup.sh` downloads it instead).
@@ -60,8 +62,9 @@ downloaded game build, default `work/`), `SIM_VENV`.
 - **Variables come out empty.** `env.sh` must have LF line endings (CRLF breaks every variable). From Windows, pass
   scripts to `wsl.exe ... bash -s` on stdin.
 - **Slow start.** One boot takes 60-90 s. Batch your checks into one run.
-- **The fire head never uses gadgets or hypercharge.** The game build compiles gadget activation out, and the host
-  activates only the kinds `native/loader/gadget.c` implements (none yet), so the gadget class stays masked. Hypercharge
+- **The fire head never uses most gadgets or hypercharge.** The game build compiles gadget activation out, and the
+  host activates only the kinds `native/loader/gadget.c` implements (dash and heal over time), so for every other
+  gadget the class stays masked. Hypercharge
   has no fire class yet (issue #4). `python -m gadget_check` shows which kinds the built host publishes.
 - **`gadget_check` says the host publishes no gadget state.** `setup.sh` builds the host only when
   `native/loader/nbhost_rl` is missing: after a change in `engine/native/loader`, delete it and rerun

@@ -11,8 +11,8 @@
 The observations carry the identity columns (who = env_v5.Env.last_who, recorded per poll; obs v5.6).
 Intents are on (--intent-scale, default 0.25; p_steer / p_rand_intent 1): the policy input s carries real intent blocks
 (env_v5.Env.intents, shared by both paths), so the intent columns of s go through both actors too.
-Gadget (obs v5.7): self 3 = env_v5.Env.gadget OR a random --gadget-p share of the rows (recorded per poll; the host
-implements no gadget kind yet, so Env.gadget alone is all 0), so the gadget class (fire_x) is sampled by both actors and
+Gadget (obs v5.7): self 3 = env_v5.Env.gadget OR a random --gadget-p share of the rows (recorded per poll; these battles
+have no gadget loadouts, so Env.gadget alone is all 0), so the gadget class (fire_x) is sampled by both actors and
 its fire code 3 reaches the host.
 """
 import argparse, time

@@ -196,7 +196,7 @@ cd $SIM_WORK/runs && python -m http.server 8766      # dashboard: http://localho
 - Generated layouts (`--gen`) were made for the vision models' training data and are not used for RL; their
   generator is not in this repository.
 - The fire head is none / attack / super / gadget. The gadget class is masked unless the host activates that gadget's
-  kind (`gadget.c`, none implemented yet) and a use is left (`obs_v5` self 3). Hypercharge cannot be triggered yet.
+  kind (`gadget.c`: dash and heal over time so far) and a use is left (`obs_v5` self 3). Hypercharge cannot be triggered yet.
   Training with gadget loadouts is `--gadgets 1` (off by default).
 - Observation layout changes must be mirrored by anything that consumes exported policies. `obs_v5` carries the
   version (`obs_v5.OBS_VERSION`, now `v5.7`; saved in every checkpoint) that exported policies are checked against.
