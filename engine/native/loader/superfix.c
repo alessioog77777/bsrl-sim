@@ -63,6 +63,7 @@ static long g_ndelayed;
 static void on_area_tick(uint64_t *ctx) {   /* enter hook on 0xb28c0c, ctx[0] = area */
     uint8_t *a = (uint8_t *)ctx[0];
     if (!g_superfix || !mode() || !a) return;
+    extern void superfix_status_area(uint8_t *) __attribute__((weak)); if (superfix_status_area) superfix_status_area(a);   /* type 36 */
     uint8_t *d = ((getp_t)B(0xb6a384))(a), *sim = ((getp_t)B(0xb6a378))(a);
     if (!d || !sim || I32(d, 0x118) != 8 || a[0xfc]) return;
     int el = I32(sim, 0x10) - I32(a, 0xd0);                 /* ticks since the spawn apply (0xc26bd8 = sim +0x10) */

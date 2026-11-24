@@ -38,6 +38,7 @@ CORR = 8                                 # corridor length in tiles from the sho
 SPACING = 13                             # tiles between spot centres (3900 u: a long super past its target stays clear)
 WATCH = 50                               # ticks watched after the fire (2.5 s at 20 ticks/s; regen starts 3 s after a hit)
 STEP = 2                                 # ticks per env step while watching
+POST_HIT = 0                             # --post-hit: tick after the fire at which the target shoots the shooter again (0 off)
 DIST_F = (0.6, 0.35)                     # target distance per attempt, as a fraction of the super's CastingRange
 DIST_MIN, DIST_MAX = 450, (CORR - 1) * TILE
 MOVE_MIN, PUSH_MIN, HEAL_MIN = 300, 100, 100   # units / units / HP: above walk jitter, setup rounding and regen ticks
@@ -425,13 +426,24 @@ class Auditor:
                         if min(np.hypot(row[3] - m["tx0"], row[4] - m["ty0"]), np.hypot(row[3] - m["x0"], row[4] - m["y0"])) < 2000:
                             m["foreign_near"] = True
             if n >= WATCH: break
-            r = stp(); n += STEP
+            if POST_HIT and n >= POST_HIT and not any("ph_hp0" in M[j] for j, _, _ in run):   # shield / status supers: hit again
+                acts = dict(idle)
+                for j, s, t in run:
+                    M[j]["ph_hp0"] = int(r.pl[s].hp); M[j]["ph_hp_min"] = int(r.pl[s].hp); M[j]["ph_tick"] = n
+                    acts[t] = (-1, 1, (geo[j]["aim"] + 180.0) % 360, 0.0)
+                r = stp(acts, 1); n += 1
+            else:
+                r = stp(); n += STEP
+            for j, s, t in run:
+                if "ph_hp0" in M[j]: M[j]["ph_hp_min"] = min(M[j]["ph_hp_min"], int(r.pl[s].hp))
         out = []
         for j, s, t in run:
             m = M[j]
             m["consumed"] = bool(m["filled"] and m["sc_min"] < m["super_max"] / 2)
             m["damage"] = max(m["thp0"] - m["thp_min"], m.get("dd", 0))
             m["heal"] = m["hp_max"] - m["hp0"]
+            m["pre_hit"] = m["max_hp"] - m["hp0"]                     # the target's shot before the super
+            if "ph_hp0" in m: m["post_hit"] = m["ph_hp0"] - m["ph_hp_min"]   # its shot POST_HIT ticks after the fire
             for k in ("projectiles", "summons", "items"): m[k] = sorted(m[k].values())
             m["areas"] = sorted(m["areas"].values(), key=lambda a: a["name"])
             out.append((j, m))
@@ -558,10 +570,12 @@ def main():
     ap.add_argument("--out", default=os.environ.get("SIM_WORK", "work"), help="folder of super_audit.json / .md")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--watch", type=int, default=WATCH, help="ticks watched after the fire (default %d)" % WATCH)
+    ap.add_argument("--post-hit", type=int, default=0, help="the target shoots the shooter again this many ticks after the fire "
+                    "(pre_hit / post_hit HP in the json: shields, damage reduction); 0 = off")
     ap.add_argument("--host-args", default="", help="extra game host arguments, e.g. '--native-charge 0'")
     a = ap.parse_args()
     if a.check: return _check()
-    globals()["WATCH"] = a.watch
+    globals()["WATCH"] = a.watch; globals()["POST_HIT"] = a.post_hit
     import env_v5
     roster = env_v5.heroes()
     names = [x for x in a.only.split(",") if x] or roster
