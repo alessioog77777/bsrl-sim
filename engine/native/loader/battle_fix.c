@@ -86,7 +86,12 @@ static uint64_t my_init(ARGS8) { if (mode()) { ensure((uint8_t *)a0); bar_fix_se
 static uint64_t my_ser(ARGS8) { if (mode()) ensure((uint8_t *)a0); return o_ser(FWD8); }
 static uint8_t g_scratch[0x200] __attribute__((aligned(16)));
 static uint64_t my_pred(ARGS8) { if (!a0 && mode()) { a0 = (uint64_t)g_scratch; g_guard[0]++; } return o_pred(FWD8); }
-static uint64_t my_die(ARGS8) { uint64_t r = o_die(FWD8); if (!r && a0 && mode()) { r = a0; g_guard[1]++; } return r; }
+uint64_t superfix_change_character(void *old, void *data) __attribute__((weak));   /* superfix_moves.c: the new character */
+static uint64_t my_die(ARGS8) {
+    uint64_t nc = superfix_change_character && mode() ? superfix_change_character((void *)a0, (void *)a1) : 0;
+    uint64_t r = o_die(FWD8);   /* the shipped stub retires the old character (HP 0) and returns NULL */
+    if (nc) return nc;
+    if (!r && a0 && mode()) { r = a0; g_guard[1]++; } return r; }
 
 void battle_fix_install(void) {
     hook_bl(g_libg, 0xb64954, ability_writer);

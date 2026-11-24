@@ -33,6 +33,15 @@
  * every living enemy character within its radius is hit once for the scaled damage through the damage root. A
  * BlinkReturn skill (type 23, the swapped-in DaredevilUltiReturn) teleports back to where the last Blink started.
  *
+ * ChangeCharacter (Bonnie's CannonGirlSmall, Moe's DiggerDrill, Meg's MechaDude ulti, type 11 via 0xb7bb58; also the
+ * end of the CannonGirl / Digger charge): the shipped 0xb4ffec(char, new data) is a stub that kills the old character
+ * and returns NULL; battle_fix.c already replaces it (my_die) so a NULL does not crash the caller. battle_fix calls
+ * superfix_change_character (weak) first: it builds the new character the way the hero spawner 0xc2806c does (factory
+ * 0xb5dd08, add 0xb63198, player / team ids, 0xb59de0 with the player's hero entry, skin 0xc70d2c, components 0xb58068)
+ * but without placement, spawn protection or super reset, at the old character's position and facing; the HP fraction
+ * carries over (the mech, UniqueProperty 2, starts full); the player's hero id +0x10 is pointed at it so the env's
+ * player-to-character lookup and input follow the new form. The stub then retires the old character as before.
+ *
  * The per-tick work runs from the character tick 0xb3ae74 (enter hook, per character; only characters with a job do
  * anything). NB_SUPERFIX=0 turns every part off (superfix_install does not call this file's install). */
 #include "nbhost.h"
@@ -231,9 +240,46 @@ static void blink_start(uint64_t *ctx) {   /* enter 0xb4ffe0(char, tx, ty, areaL
                             type, I32(ch, 8), x0, y0, lx, ly, tx, ty, aLeave, aEnter, r, aEnter ? I32(aEnter, 0x118) : -1, dmg, hits);
 }
 
+/* ======================= ChangeCharacter: the new character for battle_fix.c's hook on 0xb4ffec */
+static long g_change, g_change_skip;
+uint64_t superfix_change_character(uint8_t *old, uint8_t *nd) {   /* the new character, or 0 (battle_fix keeps the old) */
+    if (!mode() || !old || !nd || VTOF(old) != VT_CHAR || !PTR(old, 0x20)) { g_change_skip++; return 0; }
+    uint8_t *pl = ((uint8_t *(*)(void *))B(0xb6a718))(old), *sim = sim_of(old);
+    void *cfg = pl ? ((getp_t)B(0xc41460))(pl) : NULL;               /* the player's hero entry (spawner's x3) */
+    if (!pl || !sim || !cfg) { g_change_skip++; return 0; }
+    uint8_t *nc = ((uint8_t *(*)(void *))B(0xb5dd08))(nd);          /* factory: alloc 0xf18 + character ctor */
+    if (!nc) { g_change_skip++; return 0; }
+    U8(nc, 3741) = U8(old, 3741);
+    ((void (*)(void *, void *))B(0xb63198))(PTR(old, 0x20), nc);   /* add to the object manager (spawner order) */
+    I32(nc, 128) = I32(old, 128); I32(nc, 132) = I32(old, 132); I32(nc, 136) = I32(old, 136);   /* player, team, ... */
+    U8(nc, 1129) = U8(old, 1129);
+    ((void (*)(void *, void *, int))B(0xb59de0))(nc, cfg, 0);       /* level, HP, skills, cards */
+    I32(nc, 1260) = I32(sim, 0x10);
+    ((void (*)(void *))B(0xb5a638))(nc);
+    void *sc = PTR(pl, 472);                                         /* skin as the spawner's caller picks it (0xc27940) */
+    if (!sc) { void **hs = PTR(pl, 48); int hi = I32(pl, 64); sc = hs && hi >= 0 && hs[hi] ? PTR(hs[hi], 32) : NULL; }
+    PTR(nc, 24) = sc ? ((void *(*)(void *, void *, int))B(0xc70d2c))(sc, nd, 0) : PTR(old, 24);
+    I32(nc, 1824) = I32(old, 1824);
+    /* no placement 0xc2ca08, spawn protection or super reset (spawn-only): the new form stands where the old one was */
+    ((void (*)(void *, int, int, int))B(0xb6a61c))(nc, I32(old, 0x38), I32(old, 0x3c), 0);
+    I32(nc, 800) = I32(old, 800);                                    /* facing */
+    ((void (*)(void *))B(0xb58068))(nc);                             /* the data's Components (Brawler_MechaDude) */
+    int hp = I32(old, 0x3c4), mhp = I32(old, 0x3c8), up = ((geti_t)B(0xab3d04))(nd);
+    if (up != 2 && hp > 0 && mhp > 0) {   /* the HP fraction carries over; the mech (UniqueProperty 2) and a form after a death start full */
+        long v = (long)I32(nc, 0x3c8) * hp / mhp; I32(nc, 0x3c4) = v < 1 ? 1 : (int)v;
+    }
+    I32(pl, 0x10) = I32(nc, 8);   /* the player's hero id (env player_char_id, the input path); +0x1e4 is the possession link
+                                     (Willow): a character whose possession timer +3284 is 0 clears it at once (0xb40f30) */
+    g_change++;
+    if (g_superfix_dbg) LOG("[superfix] change character %d (data %p hp %d/%d) -> %d (data %p hp %d/%d) at %d,%d\n", I32(old, 8),
+                            PTR(old, 0x10), hp, mhp, I32(nc, 8), nd, I32(nc, 0x3c4), I32(nc, 0x3c8), I32(nc, 0x38), I32(nc, 0x3c));
+    return (uint64_t)nc;
+}
+
 /* ======================= per character tick (enter 0xb3ae74) */
 static void on_char_tick(uint64_t *ctx) {
-    uint8_t *ch = (uint8_t *)ctx[0]; if (!ch || !mode() || (!g_nfj && !g_nww)) return;
+    uint8_t *ch = (uint8_t *)ctx[0];
+    if (!ch || !mode() || (!g_nfj && !g_nww)) return;
     for (int i = 0; i < g_nfj; i++) if (g_fj[i].ch == ch) {
         if (I32(ch, 8) != g_fj[i].id) { g_fj[i--] = g_fj[--g_nfj]; continue; }   /* object reused */
         flyjump_tick(&g_fj[i]);
@@ -255,9 +301,10 @@ void superfix_moves_install(void) {
     else LOG("[superfix] moves: 0xb5a704 is not the Ww stub: left out\n");
     if (*(uint32_t *)B(0xb4ffe0) == RET_INSN) { hook_enter(g_libg, 0xb4ffe0, blink_start); n |= 4; }
     else LOG("[superfix] moves: 0xb4ffe0 is not the teleport stub: left out\n");
-    LOG("[superfix] moves installed:%s%s%s\n", n & 1 ? " flyjump" : "", n & 2 ? " ww" : "", n & 4 ? " blink" : "");
+    LOG("[superfix] moves installed:%s%s%s%s\n", n & 1 ? " flyjump" : "", n & 2 ? " ww" : "", n & 4 ? " blink" : "", " change");
 }
 void superfix_moves_status(void) {
-    LOG("[superfix] moves: flyjump %ld starts, %ld landings (%ld fallback); ww %ld starts, %ld hits; blink %ld (%ld back), %ld hits\n",
-        g_fj_start, g_fj_land, g_fj_fallback, g_ww_start, g_ww_hits, g_blink, g_blink_back, g_blink_hits);
+    LOG("[superfix] moves: flyjump %ld starts, %ld landings (%ld fallback); ww %ld starts, %ld hits; blink %ld (%ld back), %ld hits; "
+        "change character %ld (%ld left to battle_fix)\n", g_fj_start, g_fj_land, g_fj_fallback, g_ww_start, g_ww_hits, g_blink,
+        g_blink_back, g_blink_hits, g_change, g_change_skip);
 }
