@@ -1507,7 +1507,8 @@ static void fill_players(void *sim) {
 typedef struct { int W, H; uint8_t *wall, *water, *bush, *tile; } EncMap;
 typedef struct { int id, x, y; } PrevPos;
 typedef struct { const int32_t *pl, *ch, *pj, *it; int npl, nch, npj, nit, tick; const int32_t (*cubes)[2]; int ncubes;
-                 const int32_t (*jumps)[5]; int njumps; const PrevPos *prev; int nprev, prev_tick; int hyper[16], hmax[16]; } EncState;
+                 const int32_t (*jumps)[5]; int njumps; const PrevPos *prev; int nprev, prev_tick; int hyper[16], hmax[16];
+                 int invis[16]; } EncState;
 void enc_map_build(EncMap *m, const int32_t *tiles, int W, int H);
 int enc_encode(const EncMap *m, const EncState *s, int pidx, float *vec, float *grid);
 static EncMap g_emap; static uint32_t g_emap_hash; static PrevPos g_prev[4096]; static int g_nprev, g_prev_tick = -1, g_prev_valid;
@@ -1551,6 +1552,33 @@ static void emulate_client_flags(void *sim, int32_t *a) {
     for (int k = 0; k < nit; k++) { int32_t *r = it + k * 12; r[8] = INVIEW(r[3], r[4]); }
     #undef INVIEW
 }
+/* issue #19: how far an invisible brawler is seen from (0 = not invisible), per player index, for the encoder. The status
+ * aggregate char +0x97c (superfix_status.c: 1 normal / 2 attacks_dont_reveal, 3 full) and Leon's super (a skill with
+ * BehaviorType Invisibility, SkillData +0x1a8 == 3, while its instance runs, +8 > 0; BreakInvisibilityOnAttack: an attack
+ * of his (weapon instance running) ends it until the super is over). */
+#define INVIS_SEE 1200          /* NinjaUlti SeeInvisibilityDistance; the status rows name no distance */
+#define INVIS_FULL (1 << 28)    /* "full": not seen at any distance */
+static int g_inv_broken[NBE_MAXP];
+static int invis_reach(uint8_t *ch, int pi) {
+    int lvl = I32(ch, 0x97c), skill = 0;
+    uint8_t **sk = PTR(ch, 0x458); int n = I32(ch, 0x464);
+    for (int k = 1; sk && k < n && k < 4; k++) if (sk[k] && I32(sk[k], 8) > 0) {
+        uint8_t *d = ((uint8_t *(*)(void *, int))B(0xb7adfc))(sk[k], 0);
+        if (d && I32(d, 0x1a8) == 3) skill = 1;
+    }
+    if (!skill) g_inv_broken[pi] = 0;
+    else if (sk && n > 0 && sk[0] && I32(sk[0], 8) > 0) g_inv_broken[pi] = 1;
+    if (skill && g_inv_broken[pi]) skill = 0;
+    return lvl >= 3 ? INVIS_FULL : (lvl > 0 || skill) ? INVIS_SEE : 0;
+}
+static int g_invis[16];
+/* every step, observation or not, so that an attack between two observed steps still ends Leon's invisibility */
+static void invis_update(void *sim) {
+    memset(g_invis, 0, sizeof g_invis);
+    int np; void **ps = players(sim, &np);
+    for (int i = 0; i < np && i < 16 && i < NBE_MAXP; i++) if (ps[i]) { uint8_t *ch = obj_by_id(sim, player_char_id(ps[i]));
+        if (ch && VTOF(ch) == VT_CHAR && I32(ch, 0x3c4) > 0) g_invis[i] = invis_reach(ch, i); else g_inv_broken[i] = 0; }
+}
 static void write_obs(void *sim, uint32_t mask) {
     enc_map_update(sim);
     const int32_t *a = ST; EncState s; memset(&s, 0, sizeof s);
@@ -1559,6 +1587,7 @@ static void write_obs(void *sim, uint32_t mask) {
     s.cubes = (const int32_t (*)[2])R->cubes; s.ncubes = R->ncubes; s.jumps = (const int32_t (*)[5])R->jumps; s.njumps = R->njumps;
     if (g_prev_valid) { s.prev = g_prev; s.nprev = g_nprev; s.prev_tick = g_prev_tick; }
     { int np; void **ps = players(sim, &np); for (int i = 0; i < np && i < 16; i++) if (ps[i]) { s.hyper[i] = I32(ps[i], 0x98); s.hmax[i] = I32(ps[i], 0x9c); } }   /* rl round */
+    memcpy(s.invis, g_invis, sizeof s.invis);   /* issue #19 (invis_update) */
     int written = 0;
     for (int p = 0; p < NBE_MAXP; p++) if ((mask >> p) & 1) {
         float *v = OBSB + p * (NBE_OBS_VEC + NBE_OBS_GRID);
@@ -1610,6 +1639,7 @@ static void publish(void *sim, uint32_t seq, int status, const char *err) {
             for (int k = 0; k < 40 && n < (int)sizeof buf - 24; k++) n += snprintf(buf + n, sizeof buf - n, " %+.5g", f[k]);
             LOG("%s\n", buf); }
     }
+    invis_update(sim);
     R->state_ints = 0; R->obs_written = 0;
     if (E.cur_flags & (NBE_F_STATE | NBE_F_OBS)) {
         void *cm = client_mgr();

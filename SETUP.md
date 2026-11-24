@@ -66,6 +66,10 @@ Changes made to nirkt's code, all recorded in `engine/patches/`:
   (`env.c` `rec_move`), damage boost / reduce in `my_root`, stuns (projectile `StunLengthMS`, stun and silence areas,
   Bo's stun trap) through libg's stun counter, silence, `CcImmunity`, and Draco's weapon swap on mount
   (`native/loader/superfix_cc.c`; `NB_SUPERFIX_CC=0` turns the stuns, silence and swap off). `python -m status_check`.
+- `obs_invisibility.patch` (issue #19, obs v5.9, a diff on top of `status_movement.patch`): the observation encoder
+  (`native/loader/encode.c`) leaves out an invisible enemy brawler farther than its reveal distance (1200; "full"
+  invisibility: any distance) from the enemy rows and grid channel 5; `env.c` `invis_reach` reads the status
+  aggregate and Leon's super (broken by his attack).
 - `maenv.py` and `fair.py` copied from nbrl-env's `py/nbpc` into bulletlabels' `vendor/nbpc` (now `engine/py/nbpc`),
   so one `nbpc` package holds the host side and the environment side.
 - The game download link removed from bulletlabels' `setup.sh` (`engine/setup.sh`) (this repo's `setup.sh` downloads it instead).

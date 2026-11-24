@@ -56,6 +56,8 @@ typedef struct {
     const int32_t (*jumps)[5]; int njumps;      /* [char id, t, T, x1, y1] */
     const PrevPos *prev; int nprev, prev_tick;  /* previous dump's character positions (velocities) */
     int hyper[16], hmax[16];                    /* rl round: hypercharge charge / max per player index */
+    int invis[16];                              /* issue #19: per player index, the distance within which its invisible
+                                                 * brawler is seen (0 = not invisible) */
 } EncState;
 
 static int floordiv(int a, int b) { int q = a / b; if ((a % b != 0) && ((a < 0) != (b < 0))) q--; return q; }
@@ -74,6 +76,12 @@ static int is_brawler(const EncState *s, const int32_t *r) {
     return r[0] == ((p[3] && p[3] != (int32_t)0x80000000) ? p[3] : p[2]);
 }
 static int team_of(const EncState *s, int pidx) { for (int i = 0; i < s->npl; i++) if (s->pl[i * P2] == pidx) return s->pl[i * P2 + 1]; return -1000 - pidx; }
+/* issue #19: an invisible enemy brawler farther than its reveal distance is not in the observation (rows, grid ch5),
+ * as the real client does not draw it; teammates always are */
+static int unseen(const EncState *s, const int32_t *r, int myteam, double mx, double my) {
+    int p = r[2]; if (p < 0 || p >= 16 || s->invis[p] <= 0 || team_of(s, p) == myteam) return 0;
+    double dx = r[3] - mx, dy = r[4] - my; return dx * dx + dy * dy > (double)s->invis[p] * s->invis[p];
+}
 static int cubes_of(const EncState *s, int id) { for (int i = 0; i < s->ncubes; i++) if (s->cubes[i][0] == id) return s->cubes[i][1]; return 0; }
 static int jumping(const EncState *s, int id) { for (int i = 0; i < s->njumps; i++) if (s->jumps[i][0] == id) return 1; return 0; }
 static double super_frac(const EncState *s, int pidx) {
@@ -138,6 +146,7 @@ int enc_encode(const EncMap *m, const EncState *s, int pidx, float *vec, float *
         const int32_t *r = s->ch + k * C2;
         int br = is_brawler(s, r);
         if (r[18] != 0 || r[1] == BOX_ID || r[2] < 0 || r[6] <= 0 || (br && r[2] == pidx)) continue;
+        if (br && unseen(s, r, myteam, mx, my)) continue;
         double dx = (r[3] - mx) / R_SCALE, dy = (r[4] - my) / R_SCALE, ex, ey; vel_of(s, r[0], &ex, &ey);
         int etx = floordiv(r[3], TILE), ety = floordiv(r[4], TILE), ea = r[13] > 0 ? r[13] : 0, ec = cubes_of(s, r[0]); if (ec > 10) ec = 10;
         double v[16] = {1.0, dx, dy, ex / 40.0, ey / 40.0, (double)r[6] / (r[7] > 1 ? r[7] : 1), r[6] / 10000.0, ea / 3000.0,
@@ -207,7 +216,7 @@ int enc_encode(const EncMap *m, const EncState *s, int pidx, float *vec, float *
     }
     for (int k = 0; k < s->nch; k++) {
         const int32_t *r = s->ch + k * C2;
-        if (!is_brawler(s, r) || r[2] == pidx || r[6] <= 0) continue;
+        if (!is_brawler(s, r) || r[2] == pidx || r[6] <= 0 || unseen(s, r, myteam, mx, my)) continue;
         int gx = floordiv(r[3], TILE) - tx + half, gy = floordiv(r[4], TILE) - ty + half;
         if (gx >= 0 && gx < GRID && gy >= 0 && gy < GRID) grid[5 * 625 + gy * 25 + gx] += 1.0f;
     }

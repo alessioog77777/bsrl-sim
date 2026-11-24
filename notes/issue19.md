@@ -32,6 +32,13 @@ Branch `claude/project-thread-2z4j2e`, on main fac4e76 (includes #18's superfix 
 - Stunned brawlers send no input (host gadgets would otherwise still fire); silenced ones no super / gadget /
   hypercharge.
 
+- Invisibility in the observation (obs v5.9): encode.c drops an invisible enemy brawler beyond 1200 u ("full": any
+  distance) from the enemy rows and grid ch5; env.c invis_update runs every step (not only on observed steps) so an
+  attack between two observations still ends Leon's super invisibility. Status levels: 1 normal, 2 attacks_dont_reveal,
+  3 full (status rows name no distance; 1200 = NinjaUlti SeeInvisibilityDistance for all). Not changed: env_v5.fair_vis
+  (rewards / intents) and the local client flag r[19]; state2.encode (nirkt's Python reference, test_encode) has no
+  invisibility input.
+
 ## Open
 - RequireLineOfSight and stun area shapes other than circles are ignored (range = 0xb2b298).
 - Draco's ammo while mounted is the new instance's (full); Taunt / Fear / LifeSteal / reload statuses not modelled.

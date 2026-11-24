@@ -22,7 +22,10 @@ Source = the host's state2 vector + grid after nbpc.fair (already camera- and bu
 host `nbhost_rl` (enemy features 14 / 15 = summon / on my team, self 18 = hypercharge fraction, grid channel 0 =
 tiles.csv row + 1, item feature 5 of an area effect / bomb = its data id - 16999999); with an older host teammates read as
 enemies, the tiles are wrong and area effects have no radius / kind. The grid follows the live map (live_state host: a
-destroyed wall or bush reads as the open tile it became).
+destroyed wall or bush reads as the open tile it became). Invisibility (v5.9, issue #19): the host's encoder leaves out
+an invisible enemy brawler (a status's Invisibility, Leon's super until he attacks) farther than 1200 units, or at any
+distance for "full" invisibility, from the enemy rows and grid channel 5, as the real client does not draw it; before
+v5.9 invisible enemies were always in the observation. No shape change.
 Identity (v5.6): `who` (B, N_ENT, 3) int = per row the owner player (-1 none), its brawler's id_lut row (-1) and its side
 (WHO_FOE 0 / WHO_MATE 1 / WHO_ME 2), from env_v5.Env.last_who (the host's state dump, matched to the rows by position).
 Clean: every row with an owner is known. Noisy (NOISE id_*, per episode = per battle): a player's identity is known or
@@ -66,8 +69,9 @@ SLIDERS = ("bush_camp", "collect", "protect", "retreat", "kite", "peek", "focus"
 # v5.3: + 4 area-effect columns (RAD, HARM, HELP, SLOW) at the end of each entity row; v5.4: slider 7 push -> aggressive,
 # + sliders leash / gas_safe at the end of cond (COND_SLIDERS); v5.5: + the intent block (N_INT) at the end of s;
 # v5.7: the fire head gained "gadget" (a 4th class, gated by self 3; no input shape change); v5.8: + "hypercharge" (a 5th,
-# gated by self 4 = the host's "can activate now", no longer the state2 fraction being full; no input shape change)
-OBS_VERSION = "v5.8"
+# gated by self 4 = the host's "can activate now", no longer the state2 fraction being full; no input shape change);
+# v5.9: invisible enemies are left out beyond their reveal distance (host encode.c; no shape change)
+OBS_VERSION = "v5.9"
 FIRE = ("none", "attack", "super", "gadget", "hypercharge")   # fire head classes = NbeAction.fire codes 0-4 (host env.c apply_actions)
 FIRE_READY = (None, None, 2, 3, 4)               # self column that must be >= 0.5 for the class to be allowed (model.mask_fire)
 FIRE_AIM = (False, True, True, True, False)      # the aim head counts for the class (the host takes the gadget's aim as its
@@ -532,7 +536,7 @@ def _check():
     assert len(FIRE) == len(FIRE_READY) == len(FIRE_AIM) and FIRE[:3] == ("none", "attack", "super") and FIRE_READY[3] == 3
     oh = from_state2(vec, grid, meta, hyper=np.array([0, 1]))    # self 4 from the host's state, not the fraction
     assert oh["self"][0, 4] == 0 and oh["self"][1, 4] == 1 and np.array_equal(np.delete(oh["self"], 4, 1), np.delete(o["self"], 4, 1))
-    assert FIRE[4] == "hypercharge" and FIRE_READY[4] == 4 and not FIRE_AIM[4] and OBS_VERSION == "v5.8"
+    assert FIRE[4] == "hypercharge" and FIRE_READY[4] == 4 and not FIRE_AIM[4] and OBS_VERSION == "v5.9"
     e = o["ent"][0]; cls = lambda k: ENT[int(e[k, 1:1 + len(ENT)].argmax())]
     got = [(k, cls(k)) for k in np.nonzero(e[:, 0])[0]]
     assert got == [(0, "enemy"), (1, "teammate"), (2, "enemy_summon"), (3, "teammate_summon"), (9, "teammate_projectile"),
@@ -615,7 +619,7 @@ def _check():
     assert pv.shape == (len(PRESETS), len(SLIDERS)) and pv.min() >= 0 and pv.max() <= 2 and (preset_vec("balanced") == 1).all()
     assert preset_vec("bush_camper")[SLIDERS.index("bush_camp")] == 2 and len({tuple(r) for r in pv}) == len(PRESETS)
     assert N_INT == 11 and len(INTENTS) == 8 and INTENTS[0] == "none" and N_S == N_SELF + N_COND + N_INT == 49 and S_INT == 38
-    assert (I_XY, I_RAD, I_LEFT) == (7, 9, 10) and OBS_VERSION == "v5.8"
+    assert (I_XY, I_RAD, I_LEFT) == (7, 9, 10) and OBS_VERSION == "v5.9"
     assert (F_ENT_V55, ID0, ID_KNOWN, LOS, F_ENT) == (20, 20, 33, 34, 36)
     _check_id(vec, grid, meta)
     print("obs_v5 ok (%s): %d brawlers, %d thrown, %d melee, cond %d, intent %d, s %d, ent %dx%d" % (

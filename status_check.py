@@ -1,5 +1,6 @@
-"""Live check of status effects and movement (issue #19) that super_audit cannot see: speed boosts, slows, stuns and
-Draco's mount. One boot, one battle on super_audit.MAP (storm off, every native AI off), scenes in a row:
+"""Live check of status effects and movement (issue #19) that super_audit cannot see: speed boosts, slows, stuns,
+Draco's mount and Leon's invisibility in the observation. One boot, one battle on super_audit.MAP (storm off, every native
+AI off), scenes in a row:
   1. walk speed: Max, Draco and a target walk WALK steps along a clear corridor; each speed must be within SPEED_TOL of
      its table Speed (the reference for the scenes below);
   2. Max's super (SpeedyUltiArea: SpeedyUltiAreaSpeedBoost, +300 u/s for 80 ticks) then a walk: faster by >= BOOST_MIN;
@@ -9,10 +10,13 @@ Draco's mount. One boot, one battle on super_audit.MAP (storm off, every native 
   4. Frank's super (HammerDudeUltiProjectile, StunLengthMS 2000 = 40 ticks) hits a target, which then tries to walk and to
      attack: it moves less than STUN_MOVE and fires nothing, and walks again once the stun is over;
   5. Draco's super (MountUp): mounted he walks faster (DragonRiderUltiSpeed +20 %) and his attack fires another
-     projectile than before the mount (the weapon swap to DragonRiderDragonWeapon).
+     projectile than before the mount (the weapon swap to DragonRiderDragonWeapon);
+  6. Leon's super (NinjaUlti, Invisibility, SeeInvisibilityDistance 1200): in the observation of an enemy 2000 units away
+     his cell of grid channel 5 (enemy brawlers) is set before the super, empty while invisible, set again after he
+     attacks (BreakInvisibilityOnAttack); an enemy 600 units away sees him throughout (obs v5.9, host encode.c).
 python -m status_check            python -m status_check --check   (no host: the judging rules)
---host-args '--env-arg ...' passes extra host arguments; NB_SUPERFIX_CC=0 / NB_SUPERFIX=0 in the environment turn the
-host parts off (every scene but the first then fails)."""
+--host-args '--env-arg ...' passes extra host arguments; NB_SUPERFIX=0 in the environment turns the host parts off
+(scenes 2-5 then fail), NB_SUPERFIX_CC=0 the stuns and Draco's swap (scenes 4, 5)."""
 import argparse, math, sys, time
 import numpy as np
 import super_audit as SA
@@ -22,7 +26,7 @@ WALK = 8                  # env steps of 2 ticks per walk measurement (0.8 s)
 SPEED_TOL = 0.12          # plain walk vs the table Speed (the joystick target and the step boundary cost a little)
 BOOST_MIN, SLOW_MIN = 150, 150   # u/s: Max's +300 and Spike's -400, with room for the measurement
 STUN_MOVE = 120           # units a stunned target may still move (the stop lands within the hit's tick)
-NAMES = ["Speedy", "Cactus", "HammerDude", "DragonRider"]   # shooters 0-3; targets 5-9
+NAMES = ["Speedy", "Cactus", "HammerDude", "DragonRider", "Ninja"]   # shooters 0-4; targets 5-9
 TARGET = SA.FILLER
 SPEED = {"Speedy": 820, "DragonRider": 720, "ShotgunGirl": 770}   # characters.csv Speed (u/s)
 
@@ -54,6 +58,15 @@ def judge_stun(hit, moved, fired, moved_after):
     return bad
 
 
+def judge_invis(far0, far1, far2, near1):
+    bad = []
+    if not far0: bad.append("Leon not seen from 2000 u before his super")
+    if far1: bad.append("Leon seen from 2000 u while invisible")
+    if not near1: bad.append("Leon not seen from 600 u while invisible")
+    if not far2: bad.append("Leon still unseen from 2000 u after he attacked")
+    return bad
+
+
 def judge_mount(v, v0, proj0, proj1):
     bad = judge_faster(v, v0, "Draco mounted", need=0.12 * v0)
     if not proj0 or not proj1: bad.append("Draco's attack fired nothing (before %s, mounted %s)" % (sorted(proj0), sorted(proj1)))
@@ -68,9 +81,10 @@ class Run:
         self.inst, self.P = inst, P
         self.idle = {i: (-1, 0, 0.0, 0.0) for i in range(10)}
 
-    def step(self, acts=None, ticks=2):
+    def step(self, acts=None, ticks=2, obs_mask=0):
         a = dict(self.idle); a.update(acts or {})
-        return self.inst.step(actions=a, ticks=ticks, flags=self.P.F_STATE, native_mask=0)
+        return self.inst.step(actions=a, ticks=ticks, flags=self.P.F_STATE | (self.P.F_OBS if obs_mask else 0), native_mask=0,
+                              obs_mask=obs_mask)
 
     def place(self, pos):
         self.inst.setup(positions={i: (int(x), int(y)) for i, (x, y) in pos.items()}, ai_off=list(range(10)), unprotect=list(range(10)))
@@ -92,6 +106,16 @@ class Run:
     def proj_kinds(self, i):
         st = SA.parse_state(self.inst.state_bytes())
         return set() if st is None else {int(p[1]) for p in st["pj"] if int(p[2]) == i}
+
+    def sees(self, obs, other):
+        """is player other's cell of grid channel 5 set in player obs's observation (this step)"""
+        P = self.P
+        r = self.step(obs_mask=1 << obs)
+        assert (int(r.obs_written) >> obs) & 1, "no observation written for player %d" % obs
+        g = self.inst.obs_f32.reshape(P.MAXP, P.OBS_VEC + P.OBS_GRID)[obs, P.OBS_VEC:].reshape(6, 25, 25)
+        o, t = r.pl[obs], r.pl[other]
+        gx, gy = int(t.x // TILE) - int(o.x // TILE) + 12, int(t.y // TILE) - int(o.y // TILE) + 12
+        return bool(0 <= gx < 25 and 0 <= gy < 25 and g[5, gy, gx] > 0)
 
     def fire(self, s, aim, sd=1.0, kind=2):
         if kind == 2: self.inst.setup(super_fill=[s]); self.step(ticks=1)
@@ -176,6 +200,20 @@ def main():
         print("status_check: Draco mounted %.0f u/s (unmounted %.0f); projectiles before %s, mounted %s" %
               (vm, v["DragonRider"], sorted(k0), sorted(k1)), flush=True)
         fails["Draco mount"] = judge_mount(vm, v["DragonRider"], k0, k1)
+
+        # 6. Leon on spot 4, enemies 7 (2000 u along the corridor) and 8 (600 u)
+        p, (dx, dy), d = at(4, 4); aim = float(np.degrees(np.arctan2(dy, dx)))
+        R.place({4: p, 7: (p[0] + dx * 2000, p[1] + dy * 2000), 8: (p[0] + dx * 600, p[1] + dy * 600)})
+        far0 = R.sees(7, 4)
+        R.fire(4, aim)
+        for _ in range(3): R.step()
+        far1, near1 = R.sees(7, 4), R.sees(8, 4)
+        R.fire(4, aim + 90, kind=1)   # an attack away from both
+        for _ in range(3): R.step()
+        far2 = R.sees(7, 4)
+        print("status_check: Leon seen from 2000 u before / during / after attacking %s %s %s, from 600 u during %s" %
+              (far0, far1, far2, near1), flush=True)
+        fails["Leon invisible"] = judge_invis(far0, far1, far2, near1)
     finally:
         inst.close()
     bad = 0
@@ -193,6 +231,7 @@ def _check():
     assert judge_stun(True, 0, 2, 900) and judge_stun(True, 0, 0, 50)
     assert not judge_mount(860, 720, {1}, {2}) and judge_mount(730, 720, {1}, {2}) and judge_mount(860, 720, {1}, {1})
     assert judge_mount(860, 720, set(), {2})
+    assert not judge_invis(True, False, True, True) and judge_invis(True, True, True, True) and judge_invis(True, False, False, True)
     print("status_check judging ok")
 
 
