@@ -169,8 +169,9 @@ static int brawler_owner(void *sim, uint8_t *c) {   /* player index whose curren
 }
 /* hypercharge round (bsrl-sim issue #4): hyper.c */
 void hyper_clear(void); void hyper_reset_player(int i, void *p); int hyper_active(void *p); int hyper_use(int i, void *p, uint8_t *ch);
-int hyper_tick_player(void *p, uint8_t *ch, int alive); int hyper_damage(void *pa, int ai, void *pv, int vi, int d);
+int hyper_tick_player(int i, void *p, uint8_t *ch, int alive); int hyper_damage(void *pa, int ai, void *pv, int vi, int d);
 int hyper_speed(int i, void *p, uint8_t *ch); void hyper_publish(NbeResp *r, void **ps, int np);
+void hyper_install(void); void *hyper_super_data(int i, uint8_t *ch, void *sd); void hyper_unswap(int i, uint8_t *ch);
 static void *owner_player(void *sim, void *c, int *idx) {   /* the player whose current brawler c is (NULL: none) */
     *idx = -1; if (!sim || !c || VTOF(c) != VT_CHAR) return NULL;
     int np; void **ps = players(sim, &np); *idx = brawler_owner(sim, c); return *idx >= 0 ? ps[*idx] : NULL;
@@ -881,9 +882,10 @@ static void client_pos(int i, uint8_t *ch, int *x, int *y) {
 static void hyper_tick(void *sim) {   /* hypercharge round: drain / end (hyper.c); an ended one re-sends the move at normal speed */
     int np; void **ps = players(sim, &np);
     for (int i = 0; i < np && i < NBE_MAXP; i++) {
-        if (!ps[i] || !hyper_active(ps[i])) continue;
+        if (!ps[i]) continue;
         uint8_t *c = obj_by_id(sim, player_char_id(ps[i])); if (c && VTOF(c) != VT_CHAR) c = NULL;
-        if (hyper_tick_player(ps[i], c, c && I32(c, 0x3c4) > 0 && !waiting(i))) E.sent_valid[i] = 0;
+        if (hyper_active(ps[i]) && hyper_tick_player(i, ps[i], c, c && I32(c, 0x3c4) > 0 && !waiting(i))) E.sent_valid[i] = 0;
+        hyper_unswap(i, c);   /* the normal super back after a hypercharged one (hyper.c) */
     }
 }
 void env_tick_leave(void *sim) {   /* after a completed outer tick: showdownTick + afterState */
@@ -966,6 +968,7 @@ int g_fire_delay = 1;
  * the aim and builds the input at application time from the sim position. */
 static void fire_input_now(void *sim, int pidx, uint8_t *ch, int super, double deg, double dist, int X, int Y) {
     uint8_t *sd = super ? SKILL_SUPER(ch) : SKILL_ATTACK(ch); if (!sd) return;   /* 0xb35c00 / 0xb38fe8 return the SkillData */
+    if (super) sd = hyper_super_data(pidx, ch, sd);   /* hypercharge round: counts the hypercharged supers (hyper.c) */
     int type = I32(sd, 0x1ac), kind = (type - 2u < 4u) ? KIND_BY_TYPE[(type - 2) * 4] : 0;
     /* diversity round: the aim point at the skill's own range (SkillData CastingRange 0xb0d948, tiles x 100): Piper's 30 / 26
      * give exactly the former constants 3000 / 2600; other brawlers' lobs / placed summons land at their range */
@@ -2053,6 +2056,7 @@ void env_install(void) {
     o_b29350 = hook_replace(g_libg, 0xb29350, my_b29350);   /* diversity round: null-owner guard */
     o_alive = hook_replace(g_libg, 0xc42ae8, my_alive);
     o_dispatch = hook_replace(g_libg, 0xb47084, my_dispatch);
+    hyper_install();   /* hypercharge round: Character::isOvercharged (hyper.c) */
     if (!g_env_simonly) {
         /* client-mode crash fix (T4/T5): 0xdc1ec0 walks a slot table of weak pointers (x19+0xd0); when lock() 0x11a51c0 fails
          * for an entry that was not yet marked expired (freed concurrently, seen during a reset's loading screen: SIGSEGV
