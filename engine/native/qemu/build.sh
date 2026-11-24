@@ -2,7 +2,7 @@
 # Builds native/qemu/bin/qemu-aarch64-nb: QEMU 8.2.2 (downloaded from download.qemu.org, checksum verified) + patches/*.patch,
 # aarch64-linux-user only, nothing installed system-wide. ~5 min, ~1.5 GB temporary disk.
 # The patches make the emulated game ~2x faster with the same game state bit for bit; they are switched on at run time by
-# vendor/nbpc/instance.py (QEMU_NB_XPAGE=1 QEMU_NB_INLINE=1 QEMU_CPU=max,pauth-impdef=on):
+# py/nbpc/instance.py (QEMU_NB_XPAGE=1 QEMU_NB_INLINE=1 QEMU_CPU=max,pauth-impdef=on):
 #   0001 jump cache 16 bits + AArch64-friendly hash      0002 cross-page goto_tb chaining in user mode (QEMU_NB_XPAGE)
 #   0003 inline jump-cache probe for indirect branches (QEMU_NB_INLINE) + tcg_gen_goto_ptr
 # Without this build the frame generator falls back to the system qemu-aarch64 (apt install qemu-user): same frames, ~2x slower.

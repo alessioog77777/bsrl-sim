@@ -1,0 +1,8 @@
+numpy>=1.26,<2.3
+scipy>=1.11
+pillow>=10
+zstandard>=0.22
+flatbuffers>=23
+texture2ddecoder>=1.0.4
+# nbrl-env (py/ and train/, nirkt/nbrl-env @ 7ff57bc) was tested with numpy==1.26.4, pillow==12.1.1; torch is installed by
+# the top-level setup.sh (see TORCH_INDEX_URL).

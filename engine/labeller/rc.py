@@ -4,7 +4,7 @@ Layout (relative to the repo root):
   game/                 the unpacked game APK (setup.sh): game/lib/arm64-v8a/libg.so, game/assets/...
   labeller/             the labeller (this folder) + labeller/fixes/ (per-type rules, run in name order)
   framegen/             the frame generator (posecap.py drives the game)
-  vendor/               small helper modules (game launcher nbpc/, state decoder state2.py, battle reader dumps.py)
+  py/                   small helper modules (game launcher nbpc/, state decoder state2.py, battle reader dumps.py)
   native/               the game host (loader), the GL host with the ID pass (glhost), qemu patches, boot payloads
   data/                 tables the labeller reads (decoded effect emitters, clip kinds, ...)
 
@@ -18,7 +18,7 @@ LIBDIR = os.path.join(GAME, 'lib', 'arm64-v8a')
 LIBG = os.path.join(LIBDIR, 'libg.so')
 DATA = os.path.join(REPO, 'data')
 NATIVE = os.path.join(REPO, 'native')
-VENDOR = os.path.join(REPO, 'vendor')
+VENDOR = os.path.join(REPO, 'py')
 
 
 def _first(*paths):

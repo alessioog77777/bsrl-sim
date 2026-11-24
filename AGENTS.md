@@ -5,8 +5,9 @@ the repo root and is run as `python -m <module>` from the root after `source env
 
 ## Before you change anything
 - Read README.md (file map, setup) and the docstring at the top of the file you touch. The docstrings are the spec.
-- `deps/` is nirkt's code (README "Credits"), not under this repo's licence. Keep changes there small, and record every
-  one in `host/*.patch` (a diff against nirkt's pinned commit) so the two stay separable.
+- `engine/` is nirkt's code (README "Credits", `engine/NOTICE.md`), not under this repo's licence. Keep changes there
+  small, and record every one in `engine/patches/*.patch` (a diff on top of the earlier patches, paths relative to
+  `engine/`) so the two stay separable. This repo's own code is the flat modules at the root.
 - `./setup.sh` builds everything (SETUP.md); `source env.sh` before any module. Without the host built, only the
   self-checks that skip the game data run (`scorecard.py --check`, `apply_noise.py --test`).
 - No game files, binaries, checkpoints, datasets or run outputs go into git (`.gitignore`).

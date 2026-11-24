@@ -115,7 +115,9 @@ installing it).
 | `bl.py` | the command line |
 | `labeller/` | the labeller: `idlabels.py` (core), `fixes/*.py` (per-type rules, run in name order), `export.py`, `classes.py` |
 | `framegen/` | the frame generator: `posecap.py` drives one battle through the game host |
-| `vendor/` | small helpers: the game launcher (`nbpc/`), state decoding (`state2.py`), battle reader (`dumps.py`) |
+| `py/` | small helpers: the game launcher (`nbpc/`), state decoding (`state2.py`), battle reader (`dumps.py`); in bsrl-sim also nbrl-env's `py/` scripts (`models4.py`, ...) |
+| `train/` | in bsrl-sim: nbrl-env's `train/` (an example training loop) |
+| `patches/` | in bsrl-sim: the record of bsrl-sim's changes to this code (`NOTICE.md`) |
 | `native/` | the game host (`loader/`), the GL host with the ID pass (`glhost/`), qemu patches, boot payloads, prebuilt binaries |
 | `data/` | tables the labeller reads, the skin list, the label decisions |
 | `docs/` | `LABEL_RULES.md` |
