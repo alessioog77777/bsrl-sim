@@ -1,0 +1,224 @@
+"""Live check of the charge supers' extras (issue #5) that super_audit cannot see: wall breaking, Damian's arena edge and
+Berry's paint. One boot, one battle on super_audit.MAP (storm off, every native AI off), four scenes in a row:
+  1. Bull charges along a lane whose fourth tile is a destructible wall: the wall tile opens (live map, F_MAP) and Bull
+     ends past it;
+  2. El Primo lands on an open tile next to a destructible wall: that wall tile opens;
+  3. Damian charges at a target; once the arena is up, the target is put just inside its edge: it is knocked back toward
+     the centre (EdgeCrossing);
+  4. Berry, hurt by one shot, paints a lane through his target: the target keeps losing HP after the charge (HotAndDot
+     damage) and Berry, hurt by Crow's super just before and walking back into his paint, gains HP (HotAndDot heal)
+     within the 3 s before regen starts.
+Wall lanes come from the map reference (tiles.csv BlocksMovement / IsDestructible; spawn digits count as blocked).
+python -m charge_check            python -m charge_check --check   (no host: the lane finder and the judging rules)"""
+import argparse, sys, time
+import numpy as np
+import super_audit as SA
+
+TILE = SA.TILE
+LANE_OPEN_BEFORE, LANE_OPEN_AFTER = 3, 4   # Bull: open tiles before the wall, open tiles after it
+PRIMO_RUN = 4                              # El Primo: open tiles behind the landing tile
+EDGE_IN = 100                              # Damian: the target goes this far inside the arena's 1500 u edge
+PUSH_IN_MIN = 200                          # ... and must end at least this much farther in (one knockback is 420 u)
+WATCH = 40                                 # ticks after a fire (2 s)
+NAMES = ["BullDude", "Luchador", "Gladiator", "Painter", "Crow"]   # shooters 0-4; Crow hurts Berry
+TARGET = SA.FILLER
+
+
+# ------------------------------------------------------------------ map
+def grid(location=SA.MAP):
+    """(H, W) array of 'o' open, 'd' destructible blocking, 'x' other blocking (spawn digits too)"""
+    from nbpc import diversity as D
+    ids, rows = D.map_reference(location); H, W = len(rows), len(rows[0])
+    t = D.table("tiles.csv").items()
+    blk = {i for _, (i, r) in t if r.get("BlocksMovement") == "true"}
+    des = {i for _, (i, r) in t if r.get("BlocksMovement") == "true" and r.get("IsDestructible") == "true"}
+    g = np.full((H, W), "o"); ids = np.asarray(ids).reshape(H, W); raw = np.array([list(r) for r in rows])
+    g[np.isin(ids, list(blk))] = "x"; g[np.isin(ids, list(des))] = "d"; g[np.char.isdigit(raw)] = "x"
+    return g
+
+
+def _cells(g, x, y, dx, dy, a, b):   # [(cell, side, side)] for x + k*dx, k in a..b; None when it leaves the map
+    H, W = g.shape; out = []
+    for k in range(a, b + 1):
+        cx, cy = x + k * dx, y + k * dy
+        if not (1 <= cx < W - 1 and 1 <= cy < H - 1): return None
+        out.append((g[cy, cx], g[cy + dx, cx + dy], g[cy - dx, cx - dy]))
+    return out
+
+
+def find_lane(g):
+    """Bull: (x, y, dx, dy) tile of the start with LANE_OPEN_BEFORE open tiles (k 0..2), a destructible wall at k 3 and
+    LANE_OPEN_AFTER open tiles after it; no unbreakable tile beside the lane (Bull's 200 u break radius reaches them)"""
+    H, W = g.shape; n = LANE_OPEN_BEFORE + 1 + LANE_OPEN_AFTER
+    for y in range(H):
+        for x in range(W):
+            for dx, dy in ((1, 0), (0, 1), (-1, 0), (0, -1)):
+                c = _cells(g, x, y, dx, dy, 0, n - 1)
+                if not c: continue
+                mid = [k[0] for k in c]
+                if mid[:LANE_OPEN_BEFORE] != ["o"] * LANE_OPEN_BEFORE or mid[LANE_OPEN_BEFORE] != "d": continue
+                if mid[LANE_OPEN_BEFORE + 1:] != ["o"] * LANE_OPEN_AFTER: continue
+                if any("x" in k[1:] for k in c) or any(k[1] != "o" or k[2] != "o" for k in c[:LANE_OPEN_BEFORE]): continue
+                return x, y, dx, dy
+    return None
+
+
+def find_landing(g):
+    """El Primo: (x, y, dx, dy) open landing tile with a destructible wall at +1 and PRIMO_RUN open tiles behind it"""
+    H, W = g.shape
+    for y in range(H):
+        for x in range(W):
+            for dx, dy in ((1, 0), (0, 1), (-1, 0), (0, -1)):
+                c = _cells(g, x, y, dx, dy, -PRIMO_RUN, 1)
+                if not c: continue
+                mid = [k[0] for k in c]
+                if mid[-1] == "d" and mid[:-1] == ["o"] * (PRIMO_RUN + 1) and all(k[1] == "o" and k[2] == "o" for k in c[:-1]):
+                    return x, y, dx, dy
+    return None
+
+
+def centre(tx, ty): return (tx + 0.5) * TILE, (ty + 0.5) * TILE
+
+
+# ------------------------------------------------------------------ judging
+def judge_wall(before, after, x0, x1, wall_xy, blocks):
+    """before / after live tile ids of the wall cell; x0 / x1 the charger's progress along the lane (tiles) before and
+    after; wall_xy its progress at the wall -> failures"""
+    bad = []
+    if before not in blocks: bad.append("the wall tile was open before the charge (%d)" % before)
+    if after in blocks: bad.append("the wall tile still blocks after the charge (%d)" % after)
+    if x1 is not None and x1 < wall_xy: bad.append("the charger stopped before the wall (%.1f < %.1f tiles)" % (x1, wall_xy))
+    return bad
+
+
+def judge_edge(d_put, d_end):
+    return [] if d_end <= d_put - PUSH_IN_MIN else ["target not pushed back in: %.0f u from the centre -> %.0f" % (d_put, d_end)]
+
+
+def judge_paint(target_loss, heal, pre_damaged):
+    bad = []
+    if target_loss <= 0: bad.append("the target lost no HP standing in the paint after the charge")
+    if pre_damaged and heal <= 0: bad.append("Berry gained no HP in his paint")
+    return bad
+
+
+# ------------------------------------------------------------------ live
+class Run:
+    def __init__(self, inst):
+        from nbpc import proto as P
+        self.inst, self.P = inst, P
+        self.idle = {i: (-1, 0, 0.0, 0.0) for i in range(10)}
+
+    def step(self, acts=None, ticks=2, map_=False):
+        P = self.P; a = dict(self.idle); a.update(acts or {})
+        return self.inst.step(actions=a, ticks=ticks, flags=P.F_STATE | (P.F_MAP if map_ else 0), native_mask=0)
+
+    def place(self, pos):
+        self.inst.setup(positions={i: (int(x), int(y)) for i, (x, y) in pos.items()}, ai_off=list(range(10)), unprotect=list(range(10)))
+        for _ in range(3): r = self.step()
+        return r
+
+    def fire(self, s, aim, sd, watch=WATCH):
+        self.inst.setup(super_fill=[s]); self.step(ticks=1)
+        r = self.step({s: (-1, 2, aim, sd)}, 1); n = 1
+        while n < watch: r = self.step(); n += 2
+        return r
+
+    def tiles(self):
+        r = self.step(map_=True); return self.inst.map_tiles().reshape(r.map_h, r.map_w)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--check", action="store_true", help="self-check of the lane finder and the judging (no host)")
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--host-args", default="", help="extra game host arguments, e.g. '--native-charge 2'")
+    a = ap.parse_args()
+    if a.check: return _check()
+    from nbpc import diversity as D
+    from nbpc.instance import Instance
+    g = grid(); lane, land = find_lane(g), find_landing(g)
+    if not lane or not land: sys.exit(f"{SA.MAP}: no wall lane ({lane}) or landing ({land}) on the map")
+    spots = SA.find_spots(SA.MAP)
+    blocks = {i for _, (i, r) in D.table("tiles.csv").items() if r.get("BlocksMovement") == "true"}
+    info = {n: SA.expected(n) for n in NAMES}
+    inst = Instance(0, tag="cc", extra_args=a.host_args.split()); t0 = time.time(); inst.start(); inst.wait_ready()
+    print("charge_check: host ready in %.0f s" % (time.time() - t0), flush=True)
+    fails = {}
+    try:
+        names = NAMES + [TARGET] * (10 - len(NAMES))   # shooters 0-4, targets 5-9
+        inst.reset(93500000 + a.seed, gas=0, flags=0, native_mask=0, obs_mask=0, div=D.make_div(location=SA.MAP, chr=names))
+        R = Run(inst); R.step(ticks=10)
+        ref = np.asarray(D.map_reference(SA.MAP)[0]).reshape(g.shape); live = R.tiles()
+        same = float(np.mean(live == ref)) if live.shape == ref.shape else 0.0
+        if same < 0.9: sys.exit("charge_check: the live map does not match the map reference (%.0f %% equal)" % (100 * same))
+        R.place({i: spots[i][:2] for i in range(10)})   # everyone on a clear spot of their own; a scene moves only its pair
+
+        # 1. Bull's lane
+        x, y, dx, dy = lane; sx, sy = centre(x, y); wx, wy = x + 3 * dx, y + 3 * dy; tx, ty = centre(x + 6 * dx, y + 6 * dy)
+        R.place({0: (sx, sy), 9: (tx, ty)})
+        before = int(R.tiles()[wy, wx]); aim = float(np.degrees(np.arctan2(dy, dx)))
+        r = R.fire(0, aim, min(1.0, (7 * TILE) / info["BullDude"]["range"]))
+        prog = ((r.pl[0].x - sx) * dx + (r.pl[0].y - sy) * dy) / TILE if r.pl[0].alive else None
+        fails["Bull wall lane"] = judge_wall(before, int(R.tiles()[wy, wx]), 0, prog, 3, blocks)
+
+        # 2. El Primo's landing
+        x, y, dx, dy = land; lx, ly = centre(x, y); sx, sy = lx - PRIMO_RUN * TILE * dx, ly - PRIMO_RUN * TILE * dy
+        R.place({1: (sx, sy), 8: (lx + 100 * dx, ly + 100 * dy)})
+        before = int(R.tiles()[y + dy, x + dx]); aim = float(np.degrees(np.arctan2(dy, dx)))
+        R.fire(1, aim, min(1.0, (PRIMO_RUN * TILE + 100) / info["Luchador"]["range"]))
+        fails["El Primo landing wall"] = judge_wall(before, int(R.tiles()[y + dy, x + dx]), 0, None, 0, blocks)
+
+        # 3. Damian's arena edge (spot 0, corridor 0)
+        (sx, sy, dirs) = spots[0]; dx, dy = dirs[0]; tx, ty = sx + dx * 1200, sy + dy * 1200
+        R.place({2: (sx, sy), 5: (tx, ty)})
+        r = R.fire(2, float(np.degrees(np.arctan2(dy, dx))), min(1.0, 1500 / info["Gladiator"]["range"]), watch=20)
+        cx, cy = r.pl[2].x, r.pl[2].y
+        R.place({5: (cx - dx * (1500 - EDGE_IN), cy - dy * (1500 - EDGE_IN)), 2: (cx, cy)})
+        d_put = 1500.0 - EDGE_IN   # the push starts within the placement steps, so the requested distance counts
+        for _ in range(10): r = R.step()
+        fails["Damian arena edge"] = judge_edge(d_put, float(np.hypot(r.pl[5].x - cx, r.pl[5].y - cy)))
+
+        # 4. Berry's paint (spot 1)
+        (sx, sy, dirs) = spots[1]; dx, dy = dirs[0]; tx, ty = sx + dx * 900, sy + dy * 900; aim = float(np.degrees(np.arctan2(dy, dx)))
+        # pre-damage: Crow's super lands on Berry from 900 u behind him (a normal attack does not land in this harness)
+        R.place({3: (sx, sy), 6: (tx, ty), 4: (sx - dx * 900, sy - dy * 900)})
+        R.fire(4, aim, min(1.0, 1000 / info["Crow"]["range"]), watch=24)
+        r = R.place({4: spots[4][:2]}); pre = r.pl[3].alive and r.pl[3].hp < r.pl[3].max_hp
+        r = R.fire(3, aim, 1.0, watch=18)   # the charge is over (2500 u at 3000 u/s ~ 17 ticks)
+        thp = r.pl[6].hp; hp_low = r.pl[3].hp
+        back = int(round(((aim + 180) % 360) / 22.5)) % 16
+        for _ in range(5): r = R.step({3: (back, 0, 0.0, 0.0)})   # Berry walks back into his paint
+        for _ in range(10): r = R.step(); hp_low = min(hp_low, r.pl[3].hp)
+        print("charge_check: Berry hp %d -> %d after his paint, target lost %d after the charge" % (hp_low, r.pl[3].hp, thp - r.pl[6].hp), flush=True)
+        fails["Berry paint"] = judge_paint(thp - r.pl[6].hp if r.pl[6].alive else thp, r.pl[3].hp - hp_low, pre)
+        if not pre: print("charge_check: Berry's pre-damage missed: heal not checked", flush=True)
+    finally:
+        inst.close()
+    bad = 0
+    for k, v in fails.items():
+        print("%-22s %s" % (k, "ok" if not v else "FAIL: " + "; ".join(v))); bad += bool(v)
+    print("charge_check: %d of %d scenes ok" % (len(fails) - bad, len(fails)))
+    sys.exit(1 if bad else 0)
+
+
+def _check():
+    g = np.full((12, 14), "o"); g[0, :] = g[-1, :] = "x"; g[:, 0] = g[:, -1] = "x"
+    g[5, 5] = "d"                                         # a wall in an open field
+    x, y, dx, dy = find_lane(g)
+    assert g[y + 3 * dy, x + 3 * dx] == "d" and all(g[y + k * dy, x + k * dx] == "o" for k in (0, 1, 2, 4, 5, 6, 7)), (x, y, dx, dy)
+    g2 = g.copy(); g2[4, :] = "x"; g2[6, :] = "x"         # unbreakable rows beside the only east-west lane
+    l2 = find_lane(g2); assert l2 is None or l2[2] == 0, l2   # any lane left runs north-south
+    x, y, dx, dy = find_landing(g)
+    assert g[y + dy, x + dx] == "d" and all(g[y - k * dy, x - k * dx] == "o" for k in range(PRIMO_RUN + 1))
+    assert find_landing(np.full((8, 8), "o")) is None and find_lane(np.full((8, 8), "x")) is None
+    B = {1}
+    assert judge_wall(1, 0, 0, 5.0, 3, B) == [] and len(judge_wall(1, 1, 0, 5.0, 3, B)) == 1
+    assert len(judge_wall(0, 0, 0, 5.0, 3, B)) == 1 and len(judge_wall(1, 0, 0, 2.0, 3, B)) == 1 and judge_wall(1, 0, 0, None, 0, B) == []
+    assert judge_edge(1400, 1000) == [] and judge_edge(1400, 1350)
+    assert judge_paint(200, 100, True) == [] and len(judge_paint(0, 0, True)) == 2 and judge_paint(200, 0, False) == []
+    print("charge_check ok: lane finder, landing finder, judging")
+
+
+if __name__ == "__main__":
+    main()

@@ -14,6 +14,9 @@ Intents are on (--intent-scale, default 0.25; p_steer / p_rand_intent 1): the po
 Gadget (obs v5.7): self 3 = env_v5.Env.gadget OR a random --gadget-p share of the rows (recorded per poll; these battles
 have no gadget loadouts, so Env.gadget alone is all 0), so the gadget class (fire_x) is sampled by both actors and
 its fire code 3 reaches the host.
+Hypercharge (obs v5.8): every battle equips the hypercharge cards (env_v5.with_hyper) and self 4 = env_v5.Env.hyper OR a
+random --hyper-p share of the rows (recorded per poll), so the hypercharge class is sampled by both actors and its fire
+code 4 reaches the host (activating it where the charge is full).
 """
 import argparse, time
 import numpy as np
@@ -30,6 +33,7 @@ def main():
     ap.add_argument("--base", default="", help="league checkpoint ('' = another fresh Policy)"); ap.add_argument("--seed", type=int, default=3)
     ap.add_argument("--intent-scale", type=float, default=0.25, help="intents on (> 0): real intent blocks in s")
     ap.add_argument("--gadget-p", type=float, default=0.5, help="share of rows with self 3 (gadget ready) set on top of Env.gadget")
+    ap.add_argument("--hyper-p", type=float, default=0.3, help="share of rows with self 4 (hypercharge ready) set on top of Env.hyper")
     a = ap.parse_args()
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu"); rng_b = np.random.default_rng(a.seed); loc = "Survival604"
     made = []
@@ -47,7 +51,7 @@ def main():
 
     def battle_fn(rng, i):
         tag = {"loc": loc, "chr": ["Sniper"] * 10, "team_size": 1, "groups": [0] * 10}
-        cfg = {"div": D.make_div(location=loc, chr=tag["chr"]), "tag": tag, "end": "agents", "seed": int(rng_b.integers(10_000_000, 2 ** 31 - 1))}
+        cfg = E.with_hyper({"div": D.make_div(location=loc, chr=tag["chr"]), "tag": tag, "end": "agents", "seed": int(rng_b.integers(10_000_000, 2 ** 31 - 1))})
         if rng_b.random() < 0.6:
             opp = sorted(rng_b.choice(10, int(rng_b.integers(0, 8)), replace=False).tolist())
             return {**cfg, "ctl": list(range(10)), "tag": {**tag, "kind": "sp", "opp": opp, "slot": int(rng_b.integers(2)), "snap": "x"}}
@@ -58,7 +62,7 @@ def main():
     env = E.Env(a.n, battle_fn, ticks=2, fair=True, max_ticks=4000, verbose=True, seed=a.seed, tag="fasteq%d" % a.seed)
     ob_live = FO.FastObsV5(seed=a.seed); actor = FA.StackedActor(dev); hid = {}; z = np.zeros(HID, np.float32)
     rec, dmax, t_priv = [], {"fwd": 0, "fwd_allclose_ratio": 0, "logp": 0, "v": 0, "h": 0}, np.zeros(2); rows = 0; n_int = 0; n_id = 0
-    n_gr = n_ga = 0; g_rng = np.random.default_rng(a.seed + 1)
+    n_gr = n_ga = n_hr = n_ha = n_hy = 0; g_rng = np.random.default_rng(a.seed + 1)
     try:
         while len(rec) < a.polls:
             obs, ids, tr = env.poll(min_ready=a.n, max_wait=0.004)
@@ -66,8 +70,9 @@ def main():
                 if done: hid.pop(aid, None)
             if not len(ids): env.send([], []); continue
             gd = np.maximum(env.gadget(ids), g_rng.random(len(ids)) < a.gadget_p).astype(np.float32)
-            rec.append((obs["vec"].copy(), obs["grid"].copy(), env.last_meta.copy(), ids.copy(), env.last_who.copy(), gd))
-            o = ob_live.build(obs["vec"], obs["grid"], env.last_meta, ids, who=env.last_who, gadget=gd)
+            hr = env.hyper(ids); n_hy += int(hr.sum()); hy = np.maximum(hr, g_rng.random(len(ids)) < a.hyper_p).astype(np.float32)
+            rec.append((obs["vec"].copy(), obs["grid"].copy(), env.last_meta.copy(), ids.copy(), env.last_who.copy(), gd, hy))
+            o = ob_live.build(obs["vec"], obs["grid"], env.last_meta, ids, who=env.last_who, gadget=gd, hyper=hy)
             tq = time.perf_counter(); p0 = priv(env, ids); t1 = time.perf_counter(); p1 = FO.priv_fast(env, ids); t2 = time.perf_counter()
             assert np.array_equal(p0, p1), "priv"
             t_priv += [t1 - tq, t2 - t1]
@@ -79,6 +84,8 @@ def main():
             A, lp, v, h2 = actor(nets, gidx, s, o["ent"], o["grid"], h, p1); rows += len(ids)
             gad = A[:, 1] == O.FIRE.index("gadget"); n_ga += int(gad.sum()); n_gr += int((s[:, 3] > 0.5).sum())
             assert not (gad & (s[:, 3] < 0.5)).any(), "gadget sampled while self 3 is off"
+            hyp = A[:, 1] == O.FIRE.index("hypercharge"); n_ha += int(hyp.sum()); n_hr += int((s[:, 4] > 0.5).sum())
+            assert not (hyp & (s[:, 4] < 0.5)).any(), "hypercharge sampled while self 4 is off"
             for x, hh in zip(ids, h2): hid[int(x)] = hh
             env.send(ids, A)
     finally:
@@ -93,14 +100,17 @@ def main():
     print("identity (obs v5.6): %d entity rows with a known brawler (Env.last_who + the identity noise)" % n_id); assert n_id > 0
     print("gadget (obs v5.7): %d rows with self 3 set, %d gadget actions sent (none while self 3 was off)" % (n_gr, n_ga))
     assert not a.gadget_p or n_ga > 0
+    print("hypercharge (obs v5.8): %d rows with self 4 set (%d of them ready on the host), %d activations sent (none while self 4 was off)"
+          % (n_hr, n_hy, n_ha))
+    assert not a.hyper_p or n_ha > 0
     print("priv == priv_fast on every poll; per poll %.3f ms -> %.3f ms" % tuple(t_priv / len(rec) * 1e3))
     # observations on the recorded polls: same seed, bit-equal; timing
     res = {}
     for name, ob in (("ObsV5", O.ObsV5(seed=11)), ("FastObsV5", FO.FastObsV5(seed=11))):
         outs, t = [], 0.0
-        for vec, grid, meta, ids, who, gd in rec:
+        for vec, grid, meta, ids, who, gd, hy in rec:
             x = (vec.copy(), grid.copy(), meta.copy(), ids)
-            tq = time.perf_counter(); outs.append(ob.build(*x, who=who, gadget=gd)); t += time.perf_counter() - tq
+            tq = time.perf_counter(); outs.append(ob.build(*x, who=who, gadget=gd, hyper=hy)); t += time.perf_counter() - tq
         res[name] = (outs, t / len(rec) * 1e3)
     bad = [i for i, (x, y) in enumerate(zip(res["ObsV5"][0], res["FastObsV5"][0])) if not FO.same(x, y)]
     print("observations: %d recorded polls, %d differ (bit-equality); build per poll ObsV5 %.2f ms -> FastObsV5 %.2f ms (mean B %.1f)"

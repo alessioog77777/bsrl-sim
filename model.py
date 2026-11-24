@@ -2,7 +2,7 @@
 
     net = Policy(); logits, v, h = net(s, ent, grid, h)      # one decision; s = cat[self (8), cond (30), intent (11)], h (B, HID)
     logits, v = net.seq(s, ent, grid, h0)                     # (N, L, ...) chunks from stored h0 -> flat (N * L) outputs
-    logits = move 17 | fire 4 (obs_v5.FIRE: none / attack / super / gadget) | aim 360 (pointer over visible enemies / boxes
+    logits = move 17 | fire 5 (obs_v5.FIRE: none / attack / super / gadget / hypercharge) | aim 360 (pointer over visible enemies / boxes
              + free) | distance 8
 
     python -m model      # self-check (CPU, no game)
@@ -32,6 +32,8 @@ checkpoint loads with fire_x = zeros and its vec.0 column of self 3 (gadget read
 init) zeroed. Each such class is masked while its obs_v5.FIRE_READY self column is off (mask_fire); with those columns
 0 an older checkpoint acts exactly as before. The aim head counts for the classes in obs_v5.FIRE_AIM (gadget: its
 direction), the distance head only for a super (dist_logp_ent, masked_kl).
+Obs v5.8: + the class "hypercharge" (gated by self 4, no aim, no distance) = a second fire_x row; a v5.7 checkpoint's
+one-row fire_x zero-pads (load_state_dict), so the new class starts at logit 0 and is masked while self 4 is off.
 Heads the actor never runs (NONACT; fast_act / act_stacked skip them, old checkpoints load with strict=False and get
 fresh ones; built on their own RNG stream, so Policy() under a given seed has the acting weights it had without them):
 * live value `vl` (trainer --vlive): MLP on the detached cat[x, h], no priv, so it works live (priv does not exist
@@ -514,43 +516,52 @@ def _check_v56(ent, grid, h0):
 
 
 def _check_fire():
-    """v5.7 fire head: the gadget class is masked while self 3 is off; a v5.6 checkpoint (no fire_x) acts exactly as
-    before with self 3 off and can learn the gadget once it is ready; log-prob masking (aim for the gadget, distance only
-    for a super) and the masked KL; fire_x is the tail of the acting parameters"""
-    torch.manual_seed(2); N, L, G_ = 3, 4, O.FIRE.index("gadget")
-    s = torch.randn(N, L, O.N_S); s[..., 2] = 1.0; s[..., 3] = 0.0                          # super ready, gadget not
+    """v5.7 / v5.8 fire head: the gadget class is masked while self 3 is off, the hypercharge class while self 4 is off; a
+    v5.6 checkpoint (no fire_x) acts exactly as before with self 3 / 4 off and can learn the gadget once it is ready; a v5.7
+    checkpoint (one fire_x row) loads with the hypercharge row zero-padded; log-prob masking (aim for the gadget, not for
+    the hypercharge, distance only for a super) and the masked KL; fire_x is the tail of the acting parameters"""
+    torch.manual_seed(2); N, L, G_, H_ = 3, 4, O.FIRE.index("gadget"), O.FIRE.index("hypercharge")
+    s = torch.randn(N, L, O.N_S); s[..., 2] = 1.0; s[..., 3] = 0.0; s[..., 4] = 0.0          # super ready, gadget / hypercharge not
     ent = torch.zeros(N, L, O.N_ENT, O.F_ENT); ent[..., 0, 0] = 1; ent[..., 0, 1 + O.ENT.index("enemy")] = 1; ent[..., 0, O.XY] = 0.3
     grid = torch.randint(0, O.UNKNOWN + 1, (N, L, O.G, O.G), dtype=torch.uint8); h0 = torch.zeros(N, HID)
     assert list(acting_params(Policy()))[-2:] == ["fire_x.weight", "fire_x.bias"] and not Policy().vec[0].weight[:, _GADGET].any()
     a = Policy(); nn.init.normal_(a.pi.weight, std=0.1)
     with torch.no_grad(): a.vec[0].weight[:, _GADGET].normal_(0, 1.0)                     # as an old run left it (never trained)
     lg = a.seq(s, ent, grid, h0)[0]
-    assert lg[1].shape[-1] == N_FIRE == 4 and (lg[1][:, G_] < -1e8).all(), lg[1][:2]
+    assert lg[1].shape[-1] == N_FIRE == 5 and (lg[1][:, G_] < -1e8).all() and (lg[1][:, H_] < -1e8).all(), lg[1][:2]
     old = {k: v for k, v in a.state_dict().items() if not k.startswith("fire_x")}          # a v5.6 checkpoint
     b = Policy(); nn.init.normal_(b.fire_x.weight, std=1.0); b.load_state_dict(old)       # strict: fire_x filled with zeros
     assert b.fire_x.weight.abs().max() == 0 and b.fire_x.bias.abs().max() == 0 and not b.vec[0].weight[:, _GADGET].any()
     got = b.seq(s, ent, grid, h0)[0]
     assert all(torch.equal(x, y) for x, y in zip(lg, got))
     p3 = torch.softmax(lg[1][:, :3], -1)                                                  # = the 3-class head's distribution
-    assert torch.allclose(torch.softmax(got[1], -1)[:, :3], p3, atol=1e-6) and torch.softmax(got[1], -1)[:, G_].max() < 1e-30
+    assert torch.allclose(torch.softmax(got[1], -1)[:, :3], p3, atol=1e-6) and torch.softmax(got[1], -1)[:, 3:].max() < 1e-30
+    v57 = {k: (v[:1] if k.startswith("fire_x") else v) for k, v in b.state_dict().items()}   # a v5.7 checkpoint: one fire_x row
+    with torch.no_grad(): v57["fire_x.bias"] = v57["fire_x.bias"] + 0.25
+    c = Policy(); c.load_state_dict(v57)                                                 # the hypercharge row zero-padded
+    assert c.fire_x.weight.shape[0] == 2 and c.fire_x.bias[0] == 0.25 and c.fire_x.bias[1] == 0 and not c.fire_x.weight[1].any()
+    sh = s.clone(); sh[..., 4] = 1.0; fh = c.seq(sh, ent, grid, h0)[0][1]                # hypercharge ready: allowed, at logit 0
+    assert (fh[:, H_] == 0).all() and (fh[:, G_] < -1e8).all()
     s2 = s.clone(); s2[..., 3] = 1.0                                                     # gadget ready: the old heads unchanged,
     g2 = b.seq(s2, ent, grid, h0)[0]; fg = g2[1]                                          # the gadget at logit 0
     assert torch.equal(fg[:, :3], got[1][:, :3]) and (fg[:, G_] == 0).all() and all(torch.equal(x, y) for x, y in zip(g2[::2], got[::2]))
     s3 = s2.clone(); s3[..., 2] = 0.0                                                    # super not ready: only super masked
     f3 = b.seq(s3, ent, grid, h0)[0][1]; assert (f3[:, _SUPER] < -1e8).all() and (f3[:, G_] == 0).all()
-    acts = torch.tensor([[1, 0, 10, 5], [1, 1, 10, 5], [1, 2, 10, 5], [1, G_, 10, 5]]).repeat(N * L // 4, 1)
-    lgs = [x[:len(acts)] for x in b.seq(s2, ent, grid, h0)[0]]
+    acts = torch.tensor([[1, 0, 10, 5], [1, 1, 10, 5], [1, 2, 10, 5], [1, G_, 10, 5], [1, H_, 10, 5], [1, 1, 10, 5]]).repeat(N * L // 6, 1)
+    s2h = s2.clone(); s2h[..., 4] = 1.0
+    lgs = [x[:len(acts)] for x in b.seq(s2h, ent, grid, h0)[0]]
     lp, en, _ = dist_logp_ent(lgs, acts)
     ls = [torch.log_softmax(x, -1).gather(-1, acts[:, i:i + 1])[:, 0] for i, x in enumerate(lgs)]
-    want = ls[0] + ls[1] + (acts[:, 1] > 0) * ls[2] + (acts[:, 1] == _SUPER) * ls[3]   # gadget: aim yes, distance no
+    aims = (acts[:, 1] > 0) & (acts[:, 1] != H_)
+    want = ls[0] + ls[1] + aims * ls[2] + (acts[:, 1] == _SUPER) * ls[3]   # gadget: aim yes, distance no; hypercharge: neither
     assert torch.allclose(lp, want, atol=1e-5), (lp, want)
     import models4                                                                       # nirkt's, on the 3-class head
-    l3 = [lgs[0], lgs[1][:, :3], lgs[2], lgs[3]]; a3 = acts.clone(); a3[a3[:, 1] == G_, 1] = 1
+    l3 = [lgs[0], lgs[1][:, :3], lgs[2], lgs[3]]; a3 = acts.clone(); a3[a3[:, 1] >= G_, 1] = 1
     assert all(torch.allclose(x, y) for x, y in zip(dist_logp_ent(l3, a3)[:2], models4.dist_logp_ent(l3, a3)[:2]))
     torch.manual_seed(7); x1 = dist_logp_ent(l3); torch.manual_seed(7); x2 = models4.dist_logp_ent(l3)   # same draws
     assert all(torch.equal(x, y) for x, y in zip(x1, x2))
     assert masked_kl(lgs, lgs).abs().max() < 1e-5 and torch.isfinite(masked_kl(lgs, [x.flip(0) for x in lgs])).all()
-    l4 = [lgs[0], torch.cat([lgs[1][:, :3], torch.full_like(lgs[1][:, :1], -1e9)], -1), lgs[2], lgs[3]]   # gadget masked:
+    l4 = [lgs[0], torch.cat([lgs[1][:, :3], torch.full_like(lgs[1][:, :2], -1e9)], -1), lgs[2], lgs[3]]   # gadget / hypercharge masked:
     l3n = [x.flip(0) for x in l3]; l4n = [l3n[0], torch.cat([l3n[1], l4[1][:, 3:]], -1), l3n[2], l3n[3]]  # = the 3-class KL
     pf = torch.softmax(l3[1].float(), -1); kl = [(torch.softmax(a_, -1) * (torch.log_softmax(a_, -1) - torch.log_softmax(b_, -1))).sum(-1) for a_, b_ in zip(l3, l3n)]
     assert torch.allclose(masked_kl(l4, l4n), kl[0] + kl[1] + (1 - pf[:, 0]) * kl[2] + pf[:, 2] * kl[3], atol=1e-5)
