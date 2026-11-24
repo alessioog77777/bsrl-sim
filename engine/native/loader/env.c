@@ -126,6 +126,9 @@ static struct {
     int charge_level;   /* >0 while a root call with a level-scaled character attacker is in progress */
     long dm_applied, charge_fixes, guard_hits, alive_forced, root_calls, events;
     long hyper_dmg, hyper_moves;   /* hypercharge round: damage hits scaled, moves sped up */
+    long st_moves, st_roots, st_dmg, st_blocked, st_resend;   /* issue #19: moves re-timed / rooted by statuses, hits scaled,
+                                                               * inputs refused (stun / silence), moves re-sent on a change */
+    int st_key[NBE_MAXP];          /* issue #19: last status speed / stun state per player (a change re-sends the move) */
     int in_own_call;    /* 1 = gas, 2 = bomb (our own calls to the damage root) */
     int seed_applied;
 } E;
@@ -173,6 +176,13 @@ static int brawler_owner(void *sim, uint8_t *c) {   /* player index whose curren
 void hyper_clear(void); void hyper_reset_player(int i, void *p); int hyper_active(void *p); int hyper_use(int i, void *p, uint8_t *ch);
 int hyper_tick_player(int i, void *p, uint8_t *ch, int alive); int hyper_damage(void *pa, int ai, void *pv, int vi, int d);
 int hyper_speed(int i, void *p, uint8_t *ch); void hyper_publish(NbeResp *r, void **ps, int np);
+/* issue #19: status effects (superfix_status.c, mirrors its StMods) */
+typedef struct { int spd_bp, spd_ba, spd_rp, spd_ra, dmg_bp, dmg_rp, recv_bp, recv_ba; } StMods;
+int superfix_status_speed(uint8_t *ch, int base) __attribute__((weak));
+int superfix_status_mods(uint8_t *ch, StMods *m) __attribute__((weak));
+int superfix_status_blocked(uint8_t *ch) __attribute__((weak));
+int superfix_status_silenced(uint8_t *ch) __attribute__((weak));
+void superfix_cc_hit(uint8_t *victim, void *attacker, void *src, uint64_t lr) __attribute__((weak));   /* superfix_cc.c: projectile stuns */
 void hyper_install(void); void *hyper_super_data(int i, uint8_t *ch, void *sd); void hyper_unswap(int i, uint8_t *ch);
 static void *owner_player(void *sim, void *c, int *idx) {   /* the player whose current brawler c is (NULL: none) */
     *idx = -1; if (!sim || !c || VTOF(c) != VT_CHAR) return NULL;
@@ -362,6 +372,7 @@ static uint64_t my_root(void *victim, int a1, int dmg, int a3, int a4, void *att
                         int s0, int s1, void *s2, int s3, int s4, int s5, int s6, int s7, int s8, int s9) {
     int mode3 = I32(g_libg->base, 0x12eefb4) == 3;
     E.root_calls++;
+    if (superfix_cc_hit) superfix_cc_hit(victim, attacker, src, (uint64_t)__builtin_return_address(0));
     int saved_level = E.charge_level; E.charge_level = 0;
     if (mode3 && !E.in_own_call && attacker) {   /* agent: entryScale (attackerArg 5) + dmgModelApply */
         int raw = dmg, d = raw, aid = I32(attacker, 8), cubes = cubes_of(aid), lvl = 0;
@@ -384,6 +395,15 @@ static uint64_t my_root(void *victim, int a1, int dmg, int a3, int a4, void *att
             int nd = hyper_damage(pa, ai, pv, vi, dmg);
             if (nd != dmg) { if (a3 == dmg) a3 = nd; dmg = nd; E.hyper_dmg++; }
         }
+    }
+    if (dmg > 0 && superfix_status_mods && E.sim && victim) {   /* issue #19: damage boost / reduce of the attacker's statuses,
+                                                               * damage received boost of the victim's (superfix_status_mods) */
+        StMods ma, mv; int am = attacker && VTOF(attacker) == VT_CHAR && superfix_status_mods(attacker, &ma);
+        int vm = VTOF(victim) == VT_CHAR && superfix_status_mods(victim, &mv);
+        long nd = dmg;
+        if (am && (ma.dmg_bp || ma.dmg_rp)) { int pct = 100 + ma.dmg_bp - ma.dmg_rp; nd = nd * (pct > 0 ? pct : 0) / 100; }
+        if (vm && (mv.recv_bp || mv.recv_ba)) nd = nd * (100 + mv.recv_bp) / 100 + mv.recv_ba;
+        if (nd != dmg) { if (a3 == dmg) a3 = (int)nd; dmg = (int)nd; E.st_dmg++; }
     }
     int vchar = victim && VTOF(victim) == VT_CHAR, before = vchar ? I32(victim, 0x3c4) : 0;
     int ow = vchar && mode3 && resp_on() && E.sim ? brawler_owner(E.sim, victim) : -1;
@@ -790,11 +810,24 @@ static void rec_put(int kind, uint8_t *ch, int a, int b, int c, int d) {
 }
 /* mover 0xb4790c(char, x, y, useSpeed, speed, ..): with useSpeed 0 it moves at the CharacterData speed (0xab31e0); hypercharge
  * round: a hypercharged brawler's move gets the +OverchargeSpeedPercent speed instead (moves with their own speed are left) */
+/* issue #19: and the brawler's statuses (slows, speed boosts, roots, Draco's mount speed: superfix_status_speed) on top of the
+ * hypercharged or the CharacterData speed; a root (speed 0) turns the move into a stop where the character stands (the mover
+ * would divide by 0). A stunned character's moves are refused by the mover itself (0xb38b54). */
+void env_status_counts(long o[5]) { o[0] = E.st_moves; o[1] = E.st_roots; o[2] = E.st_dmg; o[3] = E.st_blocked; o[4] = E.st_resend; }
+static int base_speed(uint8_t *ch) {   /* the CharacterData speed the mover uses with useSpeed 0 (0xab31e0) */
+    void *cd = ((void *(*)(void *))B(0xb6a384))(ch); return cd ? ((int (*)(void *))B(0xab31e0))(cd) : 0;
+}
 static void rec_move(uint64_t *ctx) {
     rec_put(0, (uint8_t *)ctx[0], (int)ctx[1], (int)ctx[2], (int)ctx[6], 0);
     if ((int)ctx[3] == 0 && E.sim) {
-        int i; void *p = owner_player(E.sim, (void *)ctx[0], &i); int sp = p ? hyper_speed(i, p, (uint8_t *)ctx[0]) : 0;
+        uint8_t *ch = (uint8_t *)ctx[0];
+        int i; void *p = owner_player(E.sim, ch, &i); int sp = p ? hyper_speed(i, p, ch) : 0;
         if (sp > 0) { ctx[3] = 1; ctx[4] = (uint64_t)(uint32_t)sp; E.hyper_moves++; }
+        if (superfix_status_speed && VTOF(ch) == VT_CHAR) {
+            int base = sp > 0 ? sp : base_speed(ch), ss = superfix_status_speed(ch, base);
+            if (ss == 0) { ctx[1] = (uint64_t)(uint32_t)I32(ch, 0x38); ctx[2] = (uint64_t)(uint32_t)I32(ch, 0x3c); E.st_roots++; }
+            else if (ss > 0 && ss != base) { ctx[3] = 1; ctx[4] = (uint64_t)(uint32_t)ss; E.st_moves++; }
+        }
     }
 }
 static void rec_stop(uint64_t *ctx) { rec_put(2, (uint8_t *)ctx[0], 0, 0, 0, 0); }
@@ -1255,6 +1288,15 @@ static void apply_actions(void *sim, const NbeCmd *c) {
         uint8_t *ch = obj_by_id(sim, player_char_id(ps[i]));
         if (!ch || VTOF(ch) != VT_CHAR || I32(ch, 0x3c4) <= 0 || waiting(i)) { E.moving[i] = 0; E.sent_valid[i] = 0; continue; }
         const NbeAction *a = &c->act[i];
+        /* issue #19: a stunned brawler (the game's own 0xb38b54 refuses its moves and attacks; host-side gadgets would not ask)
+         * sends nothing; a silenced one no super, gadget or hypercharge. A change of its status speed or stun state re-sends
+         * its move (the mover times a path once, at the move). */
+        int blk = superfix_status_blocked && superfix_status_blocked(ch), sil = superfix_status_silenced && superfix_status_silenced(ch);
+        {   int key = blk ? -2 : superfix_status_speed ? superfix_status_speed(ch, 1000) : -1;
+            if (key != E.st_key[i]) { if (E.sent_valid[i]) E.st_resend++; E.sent_valid[i] = 0; E.st_key[i] = key; } }
+        if (blk) { E.st_blocked += a->fire != 0; E.pf[i].n = 0; continue; }
+        NbeAction q;
+        if (sil && (a->fire == 2 || a->fire == 3 || a->fire == 4)) { E.st_blocked++; q = *a; q.fire = 0; a = &q; }
         if (client_intents(sim, i, ch, a)) continue;
         if (a->move_dir >= 0 && a->move_dir < 16) {
             double r = a->move_dir * M_PI / 8; int tx, ty, cx, cy; client_pos(i, ch, &cx, &cy);
@@ -1503,7 +1545,8 @@ static void fill_players(void *sim) {
 typedef struct { int W, H; uint8_t *wall, *water, *bush, *tile; } EncMap;
 typedef struct { int id, x, y; } PrevPos;
 typedef struct { const int32_t *pl, *ch, *pj, *it; int npl, nch, npj, nit, tick; const int32_t (*cubes)[2]; int ncubes;
-                 const int32_t (*jumps)[5]; int njumps; const PrevPos *prev; int nprev, prev_tick; int hyper[16], hmax[16]; } EncState;
+                 const int32_t (*jumps)[5]; int njumps; const PrevPos *prev; int nprev, prev_tick; int hyper[16], hmax[16];
+                 int invis[16]; } EncState;
 void enc_map_build(EncMap *m, const int32_t *tiles, int W, int H);
 int enc_encode(const EncMap *m, const EncState *s, int pidx, float *vec, float *grid);
 static EncMap g_emap; static uint32_t g_emap_hash; static PrevPos g_prev[4096]; static int g_nprev, g_prev_tick = -1, g_prev_valid;
@@ -1547,6 +1590,33 @@ static void emulate_client_flags(void *sim, int32_t *a) {
     for (int k = 0; k < nit; k++) { int32_t *r = it + k * 12; r[8] = INVIEW(r[3], r[4]); }
     #undef INVIEW
 }
+/* issue #19: how far an invisible brawler is seen from (0 = not invisible), per player index, for the encoder. The status
+ * aggregate char +0x97c (superfix_status.c: 1 normal / 2 attacks_dont_reveal, 3 full) and Leon's super (a skill with
+ * BehaviorType Invisibility, SkillData +0x1a8 == 3, while its instance runs, +8 > 0; BreakInvisibilityOnAttack: an attack
+ * of his (weapon instance running) ends it until the super is over). */
+#define INVIS_SEE 1200          /* NinjaUlti SeeInvisibilityDistance; the status rows name no distance */
+#define INVIS_FULL (1 << 28)    /* "full": not seen at any distance */
+static int g_inv_broken[NBE_MAXP];
+static int invis_reach(uint8_t *ch, int pi) {
+    int lvl = I32(ch, 0x97c), skill = 0;
+    uint8_t **sk = PTR(ch, 0x458); int n = I32(ch, 0x464);
+    for (int k = 1; sk && k < n && k < 4; k++) if (sk[k] && I32(sk[k], 8) > 0) {
+        uint8_t *d = ((uint8_t *(*)(void *, int))B(0xb7adfc))(sk[k], 0);
+        if (d && I32(d, 0x1a8) == 3) skill = 1;
+    }
+    if (!skill) g_inv_broken[pi] = 0;
+    else if (sk && n > 0 && sk[0] && I32(sk[0], 8) > 0) g_inv_broken[pi] = 1;
+    if (skill && g_inv_broken[pi]) skill = 0;
+    return lvl >= 3 ? INVIS_FULL : (lvl > 0 || skill) ? INVIS_SEE : 0;
+}
+static int g_invis[16];
+/* every step, observation or not, so that an attack between two observed steps still ends Leon's invisibility */
+static void invis_update(void *sim) {
+    memset(g_invis, 0, sizeof g_invis);
+    int np; void **ps = players(sim, &np);
+    for (int i = 0; i < np && i < 16 && i < NBE_MAXP; i++) if (ps[i]) { uint8_t *ch = obj_by_id(sim, player_char_id(ps[i]));
+        if (ch && VTOF(ch) == VT_CHAR && I32(ch, 0x3c4) > 0) g_invis[i] = invis_reach(ch, i); else g_inv_broken[i] = 0; }
+}
 static void write_obs(void *sim, uint32_t mask) {
     enc_map_update(sim);
     const int32_t *a = ST; EncState s; memset(&s, 0, sizeof s);
@@ -1555,6 +1625,7 @@ static void write_obs(void *sim, uint32_t mask) {
     s.cubes = (const int32_t (*)[2])R->cubes; s.ncubes = R->ncubes; s.jumps = (const int32_t (*)[5])R->jumps; s.njumps = R->njumps;
     if (g_prev_valid) { s.prev = g_prev; s.nprev = g_nprev; s.prev_tick = g_prev_tick; }
     { int np; void **ps = players(sim, &np); for (int i = 0; i < np && i < 16; i++) if (ps[i]) { s.hyper[i] = I32(ps[i], 0x98); s.hmax[i] = I32(ps[i], 0x9c); } }   /* rl round */
+    memcpy(s.invis, g_invis, sizeof s.invis);   /* issue #19 (invis_update) */
     int written = 0;
     for (int p = 0; p < NBE_MAXP; p++) if ((mask >> p) & 1) {
         float *v = OBSB + p * (NBE_OBS_VEC + NBE_OBS_GRID);
@@ -1606,6 +1677,7 @@ static void publish(void *sim, uint32_t seq, int status, const char *err) {
             for (int k = 0; k < 40 && n < (int)sizeof buf - 24; k++) n += snprintf(buf + n, sizeof buf - n, " %+.5g", f[k]);
             LOG("%s\n", buf); }
     }
+    invis_update(sim);
     R->state_ints = 0; R->obs_written = 0;
     if (E.cur_flags & (NBE_F_STATE | NBE_F_OBS)) {
         void *cm = client_mgr();

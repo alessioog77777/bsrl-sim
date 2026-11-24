@@ -1,0 +1,101 @@
+# area gadgets (bsrl-sim issue #3, a diff on top of gadgets.patch and the later patches): gadget.c's AREA kind, the gadgets
+# that only drop their AreaEffect at the brawler (published as NBE_GAD_SPAWN), spawned with libg's 0xb35c40 after the row's
+# ActivationDelay. Rosa's GrowBush (WallSpawn) and Meeple's RageQuit (HpBasedStun) are left out. Check: python -m super_audit --gadget
+diff --git a/native/loader/gadget.c b/native/loader/gadget.c
+index 84922b1..af980a3 100644
+--- a/native/loader/gadget.c
++++ b/native/loader/gadget.c
+@@ -21,6 +21,15 @@
+  *         (the card texts say "per second for N seconds") for ActiveTicks ticks, at most up to max hp, ended by the
+  *         brawler's death. Byron's ammo cost (ConsumesAmmo) is not applied. The other heal SubTypes need state the host
+  *         does not have (Ash's rage, Meg's mech, Sandy's sleep, area heals) and stay unimplemented.
++ *   AREA  empty Type (+0x24 == 0) with an AreaEffect (AccessoryData +0x70, resolved by createReferences at 0xa92568): the
++ *         gadgets that only drop their area at the brawler (Barley's Slow, Poco's Regen and Cleanse, Tick's Explosion,
++ *         Shade's Spooky, Trunk's Area). Left out: Rosa's GrowBush (a WallSpawn area: spawnfix.c's wall ring would put
++ *         walls where she grows bushes) and Meeple's RageQuit (HpBasedStun: not applied by the client build). Published
++ *         as kind SPAWN; `python -m super_audit --gadget` checks each one's effects. The area is spawned
++ *         at the brawler with the shipped helper 0xb35c40 (create 0xb2aefc, world add 0xb63198, start 0xb29494, the chain
++ *         superfix.c's spawnAreaEffect uses), kind 2 and no extra damage, as at every shipped caller: the area's damage,
++ *         heal, status and wall spawn then come from libg and the earlier rounds (superfix, spawnfix). ActivationDelay
++ *         ticks (Tick: 20) are waited out first, and the area is placed where the brawler is then.
+  * Every other gadget publishes kind NONE (not usable): skill gadgets (Type empty + Skill: the gadget's own skill, fired
+  * through any input kind or installed as the brawler's 4th skill, spawns nothing in this build), next_attack_change, spawn,
+  * shields, ... Each player gets GAD_USES uses per battle and the accessory's cooldown between uses.
+@@ -43,7 +52,7 @@ int env_dash_start(uint8_t *ch, int tx, int ty, int speed);   /* env.c: -> path
+ 
+ #define GAD_USES 3        /* Brawl Stars: 3 gadget uses per battle (the count lives in server code, not in this build) */
+ #define TICKS_PER_S 20    /* 50 ms ticks */
+-enum { ACC_DASH = 2, ACC_HEAL = 8 };   /* accessory +0x24 type enum (0xb2731c's Type parser) */
++enum { ACC_PLAIN = 0, ACC_DASH = 2, ACC_HEAL = 8 };   /* accessory +0x24 type enum (0xb2731c's Type parser; 0 = empty Type) */
+ 
+ typedef int (*AdGet)(void *ad);
+ static int ad_get(void *ad, uint64_t getter) { return ((AdGet)B(getter))(ad); }
+@@ -51,6 +60,8 @@ static int ad_get(void *ad, uint64_t getter) { return ((AdGet)B(getter))(ad); }
+ #define AD_ACTIVE_TICKS 0xa932c8
+ #define AD_CV1 0xa933d0
+ #define AD_CV2 0xa933e0
++#define AD_ACT_DELAY 0xa932b8   /* ActivationDelay (column index at 0x123f000+1952, the getters' pattern) */
++#define AD_AREA 0x70            /* AccessoryData +0x70: AreaEffect -> AreaEffectData (0xa92568 stores it) */
+ 
+ typedef struct Gad Gad;
+ typedef struct {
+@@ -61,9 +72,10 @@ typedef struct {
+ struct Gad {
+     int card, uses, cd, cd_until, used; void *ad; const GadImpl *im;
+     int hot_id, hot_start, hot_end, hot_total, hot_done;   /* heal over time: char id, ticks, hp to give, hp given */
++    int area_id, area_at;                                  /* area: char id, tick to spawn at (0 = none pending) */
+ };
+ static Gad g_gad[NBE_MAXP];
+-static long g_fired[8];
++static long g_fired[8], g_areas, g_areas_lost;
+ 
+ /* ---- DASH */
+ static int dash_classify(void *ad, int type) { return type == ACC_DASH && ad_get(ad, AD_CV1) > 0 && ad_get(ad, AD_CV2) > 0; }
+@@ -97,9 +109,35 @@ static void heal_tick(void *sim, Gad *g, int tick) {
+     if (tick >= g->hot_end) g->hot_end = 0;
+ }
+ 
++/* ---- AREA (at the brawler) */
++#define AREA_WALLSPAWN 15   /* AreaEffectData +0x118 type: spawnfix.c's wall ring would build walls (Sprout / Wally tiles),
++                             * not Rosa's bushes: left out until a bush ring exists */
++#define AREA_HPSTUN 43      /* HpBasedStun (Meeple's RageQuit): the area spawns, but the client build applies neither its stun
++                             * nor its pushback (super_audit --gadget: no push), so the gadget would be a no-op: left out */
++static int area_classify(void *ad, int type) {
++    void *a = type == ACC_PLAIN ? PTR(ad, AD_AREA) : NULL;
++    return a && I32(a, 0x118) != AREA_WALLSPAWN && I32(a, 0x118) != AREA_HPSTUN;
++}
++static void area_spawn(void *sim, Gad *g) {
++    uint8_t *ch = env_obj_by_id(sim, g->area_id); g->area_at = 0;
++    if (!ch || I32(ch, 0x3c4) <= 0 || !PTR(ch, 0x20)) { g_areas_lost++; return; }   /* died during the delay: nothing */
++    void *a = ((void *(*)(void *, void *, int, int, int, int, void *))B(0xb35c40))(ch, PTR(g->ad, AD_AREA), I32(ch, 0x38), I32(ch, 0x3c), 0, 2, NULL);
++    if (a) g_areas++; else g_areas_lost++;
++    if (g_areas + g_areas_lost <= 10) LOG("[gadget] area %p (data type %d) at %d,%d\n", a, I32(PTR(g->ad, AD_AREA), 0x118), I32(ch, 0x38), I32(ch, 0x3c));
++}
++static int area_fire(void *sim, Gad *g, uint8_t *ch, double deg, int tick) {
++    (void)deg;
++    if (I32(ch, 0x3c4) <= 0 || g->area_at) return 0;
++    int delay = ad_get(g->ad, AD_ACT_DELAY);
++    g->area_id = I32(ch, 8); g->area_at = tick + (delay > 0 ? delay : 0);
++    if (delay <= 0) area_spawn(sim, g);
++    return 1;
++}
++
+ static const GadImpl g_impl[] = {
+     {NBE_GAD_DASH, dash_classify, dash_fire},
+     {NBE_GAD_HEAL, heal_classify, heal_fire},
++    {NBE_GAD_SPAWN, area_classify, area_fire},
+     {NBE_GAD_NONE, NULL, NULL}};
+ 
+ void gadget_clear(void) { memset(g_gad, 0, sizeof g_gad); }
+@@ -131,7 +169,10 @@ int gadget_use(void *sim, int i, uint8_t *ch, double deg, int tick) {
+ }
+ 
+ void gadget_tick(void *sim, int tick) {   /* env.c pre_snapshot, once per tick */
+-    for (int i = 0; i < NBE_MAXP; i++) if (g_gad[i].hot_end) heal_tick(sim, &g_gad[i], tick);
++    for (int i = 0; i < NBE_MAXP; i++) {
++        if (g_gad[i].hot_end) heal_tick(sim, &g_gad[i], tick);
++        if (g_gad[i].area_at && tick >= g_gad[i].area_at) area_spawn(sim, &g_gad[i]);
++    }
+ }
+ 
+ void gadget_publish(NbeResp *r, int tick) {   /* every response */

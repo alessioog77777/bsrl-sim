@@ -17,11 +17,18 @@
  *   pct = max(skill shield, +0x954), damage * (100 - pct) / 100), char +0x97c = max Invisibility +0x12c (0 none ..
  *   3 full; libg's reader 0xb3931c and the char update). Pulsating effects (+0xb0 on / +0xb4 off ticks) count only in
  *   their on phases. Nothing else in this libg writes those two words.
- * Not modelled (no client reader found): speed (SpeedBoostPercent +0xf8 / Absolute +0xfc / reduces +0x100 / +0x104: the
- *   move start 0xb4790c times a path with the CharacterData speed 0xab31e0 only), damage boosts (+0x108, +0x114: the damage
- *   percent 0xb4b660 reads char +0x968 / +0x970, whose status mapping is not proven), stuns, silences, boolean attributes
- *   (Kaze's HasStormVision), CancelOn* conditions. Those statuses are stored (so their duration and target are right)
- *   but change nothing. 0xba3274 (called at stop / charge end / respawn) and the other manager stubs are left alone.
+ *   The modifiers no client code reads are read from the store by other host code (issue #19): superfix_status_speed
+ *   (SpeedBoostPercent +0xf8 / Absolute +0xfc, SpeedReducePercent +0x100 / Absolute +0x104) for env.c's mover hook,
+ *   superfix_status_mods (DamageBoostPercent +0x108, DamageReducePercent +0x118, DamageReceivedBoost +0x11c / +0x120) for
+ *   env.c's damage root, and the crowd-control bytes, written here each tick: char +0x984 LosePlayerControl +0x131,
+ *   +0x987 Stasis +0x137, +0x988 Silence +0x138, +0x989 FullStun +0x139, +0x982 CcImmunity +0x12a (immunity clears the
+ *   others and the stun counter +0xe1c). libg's own "can't act" 0xb38b54 (mover and fire abort) reads +0x984, +0x987 and
+ *   +0xe1c; the silence getter 0xb38dec reads +0x988. Stuns from projectiles, areas and Bo's trap: superfix_cc.c.
+ *   Stacking statuses sum once per source (DragonRiderUltiSpeed is re-added every tick), others take the max.
+ * Not modelled: DamageBoostTargetCurrentHealthPercent +0x114, LifeSteal +0x10c, DecreaseReloadTimePercent +0x124,
+ *   Taunt / Fear, boolean attributes (Kaze's HasStormVision), CancelOn* conditions. Those statuses are stored (so their
+ *   duration and target are right) but change nothing. 0xba3274 (called at stop / charge end / respawn) and the other
+ *   manager stubs are left alone.
  *
  * StatusEffect areas (AreaEffectData +0x118 == 36: Max, Jae-Yong, Najia's jars, Kaze's storm, slows ...): the area apply
  * 0xb29494 returns before its status code for type 36 (its type gate) and libg reads StatusEffectSelf +0x88 / Ally +0x90
@@ -50,9 +57,20 @@ typedef int (*geti_t)(void *);
 
 /* StatusEffectData fields (loader 0xba3814) */
 enum { SE_DUR = 0x98, SE_RATE = 0xa0, SE_SRCDEATH = 0xa8, SE_FIRST = 0xab, SE_STACK = 0xac, SE_REFRESH = 0xad,
-       SE_PON = 0xb0, SE_POFF = 0xb4, SE_DMG = 0xb8, SE_HEAL = 0xf0, SE_SHIELD = 0xf4, SE_INVIS = 0x12c };
-/* character aggregates (manager +0xc4 / +0xec) */
-enum { CH_SHIELD = 0x954, CH_INVIS = 0x97c };
+       SE_PON = 0xb0, SE_POFF = 0xb4, SE_DMG = 0xb8, SE_HEAL = 0xf0, SE_SHIELD = 0xf4, SE_INVIS = 0x12c,
+       /* issue #19 (loader 0xba3814, from the column-name strings): ints */
+       SE_SPD_BP = 0xf8, SE_SPD_BA = 0xfc, SE_SPD_RP = 0x100, SE_SPD_RA = 0x104, SE_DMG_BP = 0x108, SE_DMG_RP = 0x118,
+       SE_RECV_BP = 0x11c, SE_RECV_BA = 0x120,
+       /* bytes */
+       SE_CCIMM = 0x12a, SE_LOSECTL = 0x131, SE_STASIS = 0x137, SE_SILENCE = 0x138, SE_FULLSTUN = 0x139 };
+/* character aggregates (manager +0xc4 / +0xec); issue #19: the bytes libg's own checks read. 0xb38b54 ("cannot act": the
+ * mover 0xb4790c and the fire code 0xb48bf4 / 0xb48c9c return early on it) = LosePlayerControl +0x984 || Stasis +0x987 ||
+ * stun ticks +0xe1c > 0 (the character update counts +0xe1c down at 0xb39a5c); the silence getter 0xb38dec (+0x988) blocks
+ * the super at 0xb48bf8; FullStun +0x989 is read at 0xb3b5b8; CcImmunity +0x982. Nothing in the client writes them. The
+ * int aggregates +0x958..+0x978 (speed, damage) have no reader that matters here (the mover never reads speed from them),
+ * so speed and damage are applied by env.c from superfix_status_mods() instead and those ints are left alone. */
+enum { CH_SHIELD = 0x954, CH_INVIS = 0x97c, CH_CCIMM = 0x982, CH_LOSECTL = 0x984, CH_STASIS = 0x987, CH_SILENCE = 0x988,
+       CH_FULLSTUN = 0x989, CH_STUN_TICKS = 0xe1c };
 #define VT_CHAR 0x1209020
 
 typedef struct {
@@ -60,7 +78,7 @@ typedef struct {
 } St;
 #define ST_MAX 512            /* 10 brawlers + summons x a few effects; Draco re-adds a 2-tick status every tick */
 static St g_st[ST_MAX]; static int g_nst;
-static long g_nmount, g_nadd, g_nrefresh, g_nfull, g_nexpire, g_nremove, g_ndmg, g_nheal, g_narea_hits, g_narea_apply;
+static long g_nstun, g_nmount, g_nadd, g_nrefresh, g_nfull, g_nexpire, g_nremove, g_ndmg, g_nheal, g_narea_hits, g_narea_apply;
 
 static int now_tick(void *obj) { uint8_t *sim = ((getp_t)B(0xb6a378))(obj); return sim ? I32(sim, 0x10) : -1; }
 static int data_id(void *d) { return d ? I32(d, 0x20) : -1; }            /* LogicData global id (table * 1e6 + row) */
@@ -156,7 +174,7 @@ static void on_char_update(uint64_t *ctx) {
             if (c[i] && I32(c[i], 0x10) == 21 && I32(c[i], 0x38) > 0 && PTR(c[i], 8) == ch &&
                 (*(void ***)c[i])[0x40 / 8] == (void *)B(0xba0048)) { ((void (*)(void *))B(0xba0048))(c[i]); g_nmount++; }
     }
-    int shield = 0, invis = 0, any = 0;
+    int shield = 0, invis = 0, any = 0, cc = 0, lose = 0, stasis = 0, silence = 0, full = 0;
     for (int i = 0; i < g_nst; i++) {
         St *s = &g_st[i];
         if (s->ch != ch || s->ch_id != I32(ch, 8)) continue;
@@ -177,10 +195,23 @@ static void on_char_update(uint64_t *ctx) {
         int sp = I32(s->data, SE_SHIELD), iv = I32(s->data, SE_INVIS);
         if (sp > shield) shield = sp;
         if (iv > invis) invis = iv;
+        cc |= U8(s->data, SE_CCIMM); lose |= U8(s->data, SE_LOSECTL); stasis |= U8(s->data, SE_STASIS);
+        silence |= U8(s->data, SE_SILENCE); full |= U8(s->data, SE_FULLSTUN);
     }
     (void)any;
-    I32(ch, CH_SHIELD) = shield;   /* nothing in this libg writes these two: ours */
+    I32(ch, CH_SHIELD) = shield;   /* nothing in this libg writes these: ours */
     I32(ch, CH_INVIS) = invis;
+    {   /* issue #19: crowd control. A CcImmunity status keeps LosePlayerControl / FullStun / Silence off and clears the stun
+         * ticks (Mortis's bats, Kenji's hide, Rico's star power ...); Stasis is not crowd control there (it freezes the
+         * character itself). Host-side silences (projectile SilenceDurationMS, Silence areas: superfix_cc.c) add theirs. */
+        extern int superfix_cc_silenced(uint8_t *, int) __attribute__((weak));
+        if (superfix_cc_silenced && superfix_cc_silenced(ch, t)) silence = 1;
+        if (cc) { lose = full = silence = 0; I32(ch, CH_STUN_TICKS) = 0; }
+        if (lose && !U8(ch, CH_LOSECTL) && !stasis && !U8(ch, CH_STASIS) && I32(ch, CH_STUN_TICKS) <= 0) g_nstun++;
+        U8(ch, CH_CCIMM) = cc; U8(ch, CH_LOSECTL) = lose; U8(ch, CH_STASIS) = stasis; U8(ch, CH_SILENCE) = silence;
+        U8(ch, CH_FULLSTUN) = full;
+        extern void superfix_cc_tick(uint8_t *) __attribute__((weak)); if (superfix_cc_tick) superfix_cc_tick(ch);
+    }
     if (g_superfix_dbg) {   /* MountUp (component type 21, char +0xa60 / count +0xa6c): its mount ticks +0x38 (0xb50be8) */
         int nc = I32(ch, 0xa6c); void **c = PTR(ch, 0xa60);
         for (int i = 0; c && i < nc && i < 64; i++) if (c[i] && I32(c[i], 0x10) == 21) {
@@ -202,6 +233,54 @@ static void on_char_update(uint64_t *ctx) {
     }
 }
 
+/* issue #19: speed and damage modifiers of a character's live statuses (in their on phases), for env.c's mover hook
+ * (rec_move) and damage root (my_root). Combined per field like the client's own aggregator 0xba7060 / 0xba78d0 (which the
+ * client only runs on network-decoded statuses): Stacking statuses add up (one per source: the same data re-added by the same
+ * source counts once), the others count with their largest value, and the field is the larger of the two. Returns 0 if the character has no speed or damage modifier. */
+typedef struct { int spd_bp, spd_ba, spd_rp, spd_ra, dmg_bp, dmg_rp, recv_bp, recv_ba; } StMods;
+int superfix_status_mods(uint8_t *ch, StMods *m) {
+    memset(m, 0, sizeof *m);
+    if (!g_superfix || !mode() || !ch || !g_nst) return 0;
+    int t = now_tick(ch); if (t < 0) return 0;
+    static const int off[8] = {SE_SPD_BP, SE_SPD_BA, SE_SPD_RP, SE_SPD_RA, SE_DMG_BP, SE_DMG_RP, SE_RECV_BP, SE_RECV_BA};
+    int sum[8] = {0}, mx[8] = {0}, any = 0, id = I32(ch, 8);
+    for (int i = 0; i < g_nst; i++) {
+        const St *s = &g_st[i];
+        if (s->ch != ch || s->ch_id != id || t >= s->until || !pulse_on(s, t)) continue;
+        int dup = 0;   /* a Stacking status re-added by the same source counts once (Draco's 2-tick mount speed, re-added each tick) */
+        if (U8(s->data, SE_STACK))
+            for (int j = 0; j < i && !dup; j++) dup = g_st[j].ch == ch && g_st[j].ch_id == id && g_st[j].data == s->data &&
+                                                   g_st[j].src_obj == s->src_obj && g_st[j].src_id == s->src_id && t < g_st[j].until;
+        if (dup) continue;
+        for (int k = 0; k < 8; k++) {
+            int v = I32(s->data, off[k]); if (v <= 0) continue;
+            any = 1;
+            if (U8(s->data, SE_STACK)) sum[k] += v; else if (v > mx[k]) mx[k] = v;
+        }
+    }
+    if (!any) return 0;
+    int *o = (int *)m; for (int k = 0; k < 8; k++) o[k] = sum[k] > mx[k] ? sum[k] : mx[k];
+    return 1;
+}
+/* the move speed (units/s) a character with base speed `base` moves at under its statuses, -1 = no speed modifier.
+ * Boosts first (base * (100 + percent) / 100 + absolute), then slows ((...) * (100 - percent) / 100 - absolute), floored at
+ * 0 (SpeedReducePercent 100 = a root: Kenji's hide, Morningstar's root). The order and the floor are this host's choice:
+ * the server code that does it is not in the client build. */
+int superfix_status_speed(uint8_t *ch, int base) {
+    StMods m; if (base <= 0 || !superfix_status_mods(ch, &m)) return -1;
+    if (!m.spd_bp && !m.spd_ba && !m.spd_rp && !m.spd_ra) return -1;
+    long v = (long)base * (100 + m.spd_bp) / 100 + m.spd_ba;
+    int rp = m.spd_rp > 100 ? 100 : m.spd_rp;
+    v = v * (100 - rp) / 100 - m.spd_ra;
+    return v > 0 ? (int)v : 0;
+}
+/* 1 if the character cannot move or attack now (the game's own 0xb38b54 test: lose control, stasis, stun ticks) */
+int superfix_status_blocked(uint8_t *ch) {
+    return ch && (U8(ch, CH_LOSECTL) || U8(ch, CH_STASIS) || I32(ch, CH_STUN_TICKS) > 0);
+}
+int superfix_status_silenced(uint8_t *ch) { return ch && U8(ch, CH_SILENCE); }
+int superfix_status_cc_immune(uint8_t *ch) { return ch && U8(ch, CH_CCIMM); }
+
 /* StatusEffect (type 36) areas, from superfix.c's area tick hook (0xb28c0c) */
 typedef struct { void *a, *d; int start, end, next; } AreaRec;
 #define AR_MAX 128
@@ -210,6 +289,10 @@ typedef void (*apply_t)(void *, void *, int, int, void *, void *, int, int, int,
 void superfix_status_area(uint8_t *a) {
     if (!g_superfix || !mode() || !a) return;
     uint8_t *d = ((getp_t)B(0xb6a384))(a);
+    if (d && (I32(d, 0x118) == 16 || I32(d, 0x118) == 24)) {   /* issue #19: Stun / Silence areas (superfix_cc.c) */
+        extern void superfix_cc_area(uint8_t *, uint8_t *) __attribute__((weak)); if (superfix_cc_area) superfix_cc_area(a, d);
+        return;
+    }
     if (!d || I32(d, 0x118) != 36) return;
     void *self = PTR(d, 0x88), *ally = PTR(d, 0x90), *enemy = PTR(d, 0x98);
     uint8_t *owner = PTR(a, 0x108);
@@ -266,6 +349,6 @@ void superfix_status_install(void) {
 }
 void superfix_status_status(void) {
     LOG("[superfix] status: added %ld, refreshed %ld, full %ld, ended %ld, removed %ld, live %d; damage %ld, heal %ld; "
-        "type-36 area applies %ld, characters hit %ld; MountUp ticks %ld\n", g_nadd, g_nrefresh, g_nfull, g_nexpire, g_nremove, g_nst, g_ndmg, g_nheal,
-        g_narea_apply, g_narea_hits, g_nmount);
+        "type-36 area applies %ld, characters hit %ld; MountUp ticks %ld; lose-control starts %ld\n", g_nadd, g_nrefresh, g_nfull, g_nexpire, g_nremove, g_nst, g_ndmg, g_nheal,
+        g_narea_apply, g_narea_hits, g_nmount, g_nstun);
 }
